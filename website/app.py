@@ -1,0 +1,932 @@
+#!/usr/bin/env python3
+"""Sailing Weather Dashboard backend.
+
+Tiny stdlib-only HTTP server (no Flask/FastAPI installed in the target
+interpreter) that serves:
+  - static frontend files from ./static
+  - a small JSON API backed by the read-only DuckDB weather database
+
+Run with:
+    /home/firescar96/.pyenv/versions/3.11.1/bin/python3 app.py
+
+Listens on http://localhost:8420 by default (override with PORT env var).
+
+IMPORTANT: every DB connection is opened with read_only=True. This process
+never writes to the database, so it never conflicts with the ingestion
+cron jobs that also touch weather.duckdb on their own schedule.
+"""
+import json
+import os
+import sys
+import urllib.parse
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import duckdb
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(HERE, "..", "db", "weather.duckdb")
+STATIC_DIR = os.path.join(HERE, "static")
+PORT = int(os.environ.get("PORT", "8420"))
+
+sys.path.insert(0, os.path.join(HERE, "..", "scripts"))
+from cbi_hours import is_cbi_open
+
+
+def db():
+    """Open a fresh read-only connection. Cheap for this data volume and
+    avoids any question of duckdb connection thread-safety across
+    concurrent requests.
+
+    MUST set session TimeZone to UTC (found 2026-09-11): DuckDB's default
+    session TimeZone is the OS local zone (America/New_York here), and
+    ALL of `now()`'s time-window queries (api_forecast, api_observations,
+    api_flags_history, api_observation_near) compare it directly against
+    valid_time_utc/ts_utc columns that are naive UTC timestamps. Without
+    forcing UTC, now() returned local wall-clock time (e.g. 08:15 EDT)
+    while being compared against UTC-stored columns -- a raw ~4h
+    (EDT) / ~5h (EST) offset baked into every "now +/- N hours" window.
+    This is exactly why model forecast lines extended further back than
+    requested (user-reported 2026-09-11: "trim the models look back time
+    so they don't extend before the graph start") -- the past_hours
+    window was silently ~4h wider than asked. The ingestion side
+    (db/common.py get_connection()) already does this for the same
+    reason; this was the one connection path that didn't."""
+    con = duckdb.connect(DB_PATH, read_only=True)
+    con.execute("SET TimeZone='UTC'")
+    return con
+
+
+def rows_as_dicts(cursor):
+    cols = [d[0] for d in cursor.description]
+    out = []
+    for row in cursor.fetchall():
+        d = {}
+        for c, v in zip(cols, row):
+            if hasattr(v, "isoformat"):
+                v = v.isoformat()
+            d[c] = v
+        out.append(d)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# API handlers -- each takes a dict of query params, returns a JSON-able obj
+# ---------------------------------------------------------------------------
+
+def api_locations(params):
+    con = db()
+    try:
+        cur = con.execute(
+            "SELECT location_id, name, lat, lon, kind FROM locations ORDER BY location_id"
+        )
+        return rows_as_dicts(cur)
+    finally:
+        con.close()
+
+
+def api_current_conditions(params):
+    """Most recent observation value per (location, variable)."""
+    con = db()
+    try:
+        cur = con.execute(
+            """
+            SELECT o.location_id, l.name AS location_name, o.variable, o.value, o.ts_utc, o.source
+            FROM observations o
+            JOIN locations l ON l.location_id = o.location_id
+            QUALIFY row_number() OVER (
+                PARTITION BY o.location_id, o.variable
+                ORDER BY o.ts_utc DESC
+            ) = 1
+            ORDER BY o.location_id, o.variable
+            """
+        )
+        return rows_as_dicts(cur)
+    finally:
+        con.close()
+
+
+def api_flags_latest(params):
+    con = db()
+    try:
+        cur = con.execute(
+            """
+            SELECT location_id, ts_utc, flag_color, source
+            FROM flags
+            QUALIFY row_number() OVER (PARTITION BY location_id ORDER BY ts_utc DESC) = 1
+            """
+        )
+        return rows_as_dicts(cur)
+    finally:
+        con.close()
+
+
+def api_flags_history(params):
+    """Flag color readings for a location over a time window, for chart
+    background shading (see static/app.js loadForecastChart). Only
+    location_id='cbi_dockhouse' has any rows currently -- CBI is the only
+    tracked flag source -- but this endpoint works generically for any
+    location that has flags.
+
+    Anchored to real wall-clock now() (FIXED 2026-09-11), not
+    max(ts_utc) FROM flags -- the same stale-anchor bug already found
+    and fixed in api_forecast(). Flags only get polled hourly and can
+    lag "now" by a few minutes normally, but once the forecast chart's
+    own x-axis switched to anchoring on real now(), a flags-history
+    window anchored on ITS OWN latest reading meant the two could drift
+    out of sync -- e.g. once the forecast window moved to a forward-
+    looking "next 72h" range while the last flag reading was still
+    hours in the past, nearly the entire flag timeline fell outside the
+    chart's visible x-domain (user-reported 2026-09-11: "gaps inbetween
+    the colors and the date range is wrong")."""
+    location = params.get("location")
+    hours = int(params.get("hours", "72"))
+    if not location:
+        return {"error": "location query param is required"}
+    con = db()
+    try:
+        cur = con.execute(
+            """
+            SELECT ts_utc, flag_color
+            FROM flags
+            WHERE location_id = ?
+              AND ts_utc >= now() - (? * INTERVAL '1 hour')
+            ORDER BY ts_utc
+            """,
+            [location, hours],
+        )
+        return rows_as_dicts(cur)
+    finally:
+        con.close()
+
+
+def api_accuracy(params):
+    """Accuracy (MAE/RMSE) per model x lead_bucket for a location+variable."""
+    location = params.get("location")
+    variable = params.get("variable")
+    if not location or not variable:
+        return {"error": "location and variable query params are required"}
+    con = db()
+    try:
+        cur = con.execute(
+            """
+            SELECT model, lead_bucket, n, mae, rmse
+            FROM v_accuracy_by_lead_time
+            WHERE location_id = ? AND variable = ?
+            ORDER BY model, lead_bucket
+            """,
+            [location, variable],
+        )
+        return rows_as_dicts(cur)
+    finally:
+        con.close()
+
+
+def api_accuracy_variables(params):
+    """Which (location, variable) combos actually have accuracy rows, so
+    the frontend only offers selectable options that have real data."""
+    con = db()
+    try:
+        cur = con.execute(
+            """
+            SELECT DISTINCT location_id, variable
+            FROM v_accuracy_by_lead_time
+            ORDER BY location_id, variable
+            """
+        )
+        return rows_as_dicts(cur)
+    finally:
+        con.close()
+
+
+def api_forecast(params):
+    """Latest forecast run per model for a location/variable, restricted
+    to a window around the CURRENT real time (not each model's own
+    init_time_utc, which can be many hours stale -- e.g. ECMWF only
+    updates every 6h and our poll cadence adds further lag, so its
+    latest run's init_time can be 10-15+ hours behind "now" at any given
+    moment). Filtering by init_time_utc +/- hours (the original
+    approach) meant "Last 12h" could silently pull data back 20+ hours
+    for a stale model, or "Next 24h" could already have partly elapsed
+    relative to the real present -- both visible as the forecast lines
+    extending further left/right than the observed-data overlay, which
+    correctly anchors to real now (user-reported 2026-09-11: "the grey
+    chart doesn't go all the way to [the stated relative time]", "time
+    range search is off"). Fixed 2026-09-11: bounds are now computed
+    from the actual current wall-clock time, matching what the frontend
+    axis labels/relative offsets and the observations endpoint already
+    assume.
+    """
+    location = params.get("location")
+    variable = params.get("variable")
+    hours = int(params.get("hours", "72"))
+    past_hours = int(params.get("past_hours", "0"))
+    if not location or not variable:
+        return {"error": "location and variable query params are required"}
+    con = db()
+    try:
+        cur = con.execute(
+            """
+            WITH latest_run AS (
+                SELECT run_id, model, init_time_utc
+                FROM forecast_runs
+                WHERE location_id = ?
+                QUALIFY row_number() OVER (PARTITION BY model ORDER BY init_time_utc DESC) = 1
+            )
+            SELECT lr.model, lr.init_time_utc, fv.valid_time_utc, fv.value
+            FROM forecast_values fv
+            JOIN latest_run lr ON lr.run_id = fv.run_id
+            WHERE fv.variable = ?
+              AND fv.valid_time_utc <= now() + (? * INTERVAL '1 hour')
+              AND fv.valid_time_utc >= now() - (? * INTERVAL '1 hour')
+            ORDER BY lr.model, fv.valid_time_utc
+            """,
+            [location, variable, hours, past_hours],
+        )
+        return rows_as_dicts(cur)
+    finally:
+        con.close()
+
+
+def api_forecast_convergence(params):
+    """For a fixed target valid_time_utc, show how each model's prediction
+    for that same target time changed across successive init runs."""
+    location = params.get("location")
+    variable = params.get("variable")
+    target = params.get("target")  # ISO timestamp string
+    if not location or not variable or not target:
+        return {"error": "location, variable, and target query params are required"}
+    con = db()
+    try:
+        cur = con.execute(
+            """
+            SELECT fr.model, fr.init_time_utc, fv.valid_time_utc, fv.value
+            FROM forecast_values fv
+            JOIN forecast_runs fr ON fr.run_id = fv.run_id
+            WHERE fr.location_id = ?
+              AND fv.variable = ?
+              AND fv.valid_time_utc = ?
+            ORDER BY fr.model, fr.init_time_utc
+            """,
+            [location, variable, target],
+        )
+        return rows_as_dicts(cur)
+    finally:
+        con.close()
+
+
+def api_observation_near(params):
+    """The single nearest real observation to a target timestamp, within
+    a tolerance window -- used by the Forecast Convergence chart to draw
+    a "what actually happened" reference line alongside the models'
+    predictions for that same target time. Previously the convergence
+    chart had NO observed-data overlay at all (user-reported 2026-09-11:
+    "doesnt seem to always include the observable data when available in
+    the past") -- it wasn't intermittent, the feature was simply never
+    built; this fixes that by giving the frontend a value to plot.
+    Tolerance matches v_accuracy_by_lead_time's own forecast-to-
+    observation matching window (+/- 7.5 minutes) for consistency."""
+    location = params.get("location")
+    variable = params.get("variable")
+    target = params.get("target")
+    if not location or not variable or not target:
+        return {"error": "location, variable, and target query params are required"}
+    con = db()
+    try:
+        cur = con.execute(
+            """
+            SELECT ts_utc, value
+            FROM observations
+            WHERE location_id = ? AND variable = ?
+              AND ts_utc BETWEEN ?::TIMESTAMP - INTERVAL '7.5 minutes'
+                              AND ?::TIMESTAMP + INTERVAL '7.5 minutes'
+            ORDER BY abs(epoch(ts_utc) - epoch(?::TIMESTAMP))
+            LIMIT 1
+            """,
+            [location, variable, target, target, target],
+        )
+        rows = rows_as_dicts(cur)
+        return rows[0] if rows else None
+    finally:
+        con.close()
+
+
+def api_observations(params):
+    """Raw historical observations for overlaying on the forecast chart.
+    `hours` here means "how far back from the latest observation", used
+    independently from the forecast's forward-looking window."""
+    location = params.get("location")
+    variable = params.get("variable")
+    hours = int(params.get("hours", "72"))
+    if not location or not variable:
+        return {"error": "location and variable query params are required"}
+    con = db()
+    try:
+        cur = con.execute(
+            """
+            SELECT ts_utc, value
+            FROM observations
+            WHERE location_id = ? AND variable = ?
+              AND ts_utc >= (SELECT max(ts_utc) FROM observations WHERE location_id = ? AND variable = ?) - (? * INTERVAL '1 hour')
+            ORDER BY ts_utc
+            """,
+            [location, variable, location, variable, hours],
+        )
+        return rows_as_dicts(cur)
+    finally:
+        con.close()
+
+
+def api_variables_for_location(params):
+    """Which observation variables exist for a given location (used to
+    grey out / hide selector options that have no data)."""
+    location = params.get("location")
+    if not location:
+        return {"error": "location query param is required"}
+    con = db()
+    try:
+        cur = con.execute(
+            """
+            SELECT DISTINCT variable
+            FROM observations
+            WHERE location_id = ?
+            ORDER BY variable
+            """,
+            [location],
+        )
+        return [r[0] for r in cur.fetchall()]
+    finally:
+        con.close()
+
+
+FLAG_COLORS_ALL = ["red", "yellow", "green", "closed"]
+WIND_BUCKET_WIDTH_KT = 4.0  # historical training data is sparse (~40 flag
+                            # readings total), so buckets need to be wide
+                            # enough for each to have a few examples
+
+
+def _wind_bucket(value):
+    """Buckets a wind speed into a fixed-width band (e.g. 8.3kt -> '8-12kt')
+    for the historical training table below."""
+    lo = int(value // WIND_BUCKET_WIDTH_KT) * WIND_BUCKET_WIDTH_KT
+    return f"{int(lo)}-{int(lo + WIND_BUCKET_WIDTH_KT)}kt"
+
+
+def api_flag_prediction(params):
+    """Bayesian flag-color prediction for CBI, driven by a selectable
+    forecast model's wind-speed forecast.
+
+    This is a SEPARATE panel from the existing Forecast/Accuracy charts
+    (user explicit direction 2026-09-11: "do not ruin or mess up the
+    existing charts... I want additional overlay or a separate chart").
+    It answers a different question than MAE/accuracy does: not "how far
+    off is the model on average" but "given this model's forecast wind
+    at some future hour, what's the probability the flag will be each
+    color at that time" -- i.e. P(flag | wind), computed via Bayes'
+    theorem:
+
+        P(flag=c | wind=w) = P(wind=w | flag=c) * P(flag=c) / P(wind=w)
+
+    Implementation: rather than separately estimating the likelihood and
+    marginal P(wind) (which would require picking a parametric wind
+    distribution), we directly estimate the joint P(wind_bucket, flag)
+    empirically from CBI's own history (matching each flag reading to
+    the nearest real MIT Pavilion wind observation within 20 minutes --
+    MIT is the venue's own on-site sensor, a few hundred meters from the
+    CBI dockhouse on the same basin) and add a symmetric Dirichlet(alpha)
+    prior (Laplace/additive smoothing) over the 4 flag colors within
+    each wind bucket. This IS an explicit Bayesian posterior update
+    (prior=uniform over colors, likelihood=observed per-bucket counts),
+    not just a raw frequency table -- and the smoothing matters a lot
+    here specifically because the training set is small (~40 flag
+    readings as of 2026-09-11), so buckets with 0-2 real examples would
+    otherwise give overconfident all-or-nothing probabilities. alpha=1
+    (add-one smoothing) pulls sparse buckets toward the overall marginal
+    P(flag=c) instead.
+    """
+    model = params.get("model")
+    hours = int(params.get("hours", "48"))
+    location = "cbi_dockhouse"  # the only location with flag data
+    variable = "wind_speed_kt"
+    if not model:
+        return {"error": "model query param is required"}
+    con = db()
+    try:
+        # 1. Forecast wind for the selected model only, forward-looking.
+        forecast_rows = con.execute(
+            """
+            WITH latest_run AS (
+                SELECT run_id, init_time_utc
+                FROM forecast_runs
+                WHERE location_id = ? AND model = ?
+                QUALIFY row_number() OVER (ORDER BY init_time_utc DESC) = 1
+            )
+            SELECT lr.init_time_utc, fv.valid_time_utc, fv.value
+            FROM forecast_values fv
+            JOIN latest_run lr ON lr.run_id = fv.run_id
+            WHERE fv.variable = ?
+              AND fv.valid_time_utc <= now() + (? * INTERVAL '1 hour')
+              AND fv.valid_time_utc >= now()
+            ORDER BY fv.valid_time_utc
+            """,
+            [location, model, variable, hours],
+        )
+        forecast_points = rows_as_dicts(forecast_rows)
+
+        # 2. Historical training pairs: each flag reading matched to the
+        # nearest real MIT Pavilion wind observation within 20 minutes.
+        # (CBI itself has no wind sensor -- only flag-color readings --
+        # so MIT Pavilion, a few hundred meters away on the same basin,
+        # stands in as the real wind ground-truth for training.)
+        training_rows = con.execute(
+            """
+            SELECT f.flag_color,
+                   (SELECT o.value FROM observations o
+                    WHERE o.location_id = 'mit_pavilion' AND o.variable = ?
+                      AND abs(epoch(o.ts_utc) - epoch(f.ts_utc)) <= 1200
+                    ORDER BY abs(epoch(o.ts_utc) - epoch(f.ts_utc))
+                    LIMIT 1) AS wind_kt
+            FROM flags f
+            WHERE f.location_id = ?
+            """,
+            [variable, location],
+        ).fetchall()
+        training_rows = [(color, wind) for (color, wind) in training_rows if wind is not None]
+
+        # 3. Build the joint bucket->color count table, then the Bayesian
+        # posterior P(flag=c | wind_bucket=b) with Dirichlet(alpha=1)
+        # smoothing per bucket.
+        bucket_counts = {}  # bucket -> {color: count}
+        marginal_counts = {c: 0 for c in FLAG_COLORS_ALL}
+        for color, wind in training_rows:
+            if color not in FLAG_COLORS_ALL:
+                continue
+            b = _wind_bucket(wind)
+            bucket_counts.setdefault(b, {c: 0 for c in FLAG_COLORS_ALL})
+            bucket_counts[b][color] += 1
+            marginal_counts[color] += 1
+
+        alpha = 1.0
+        n_colors = len(FLAG_COLORS_ALL)
+
+        def posterior_for_bucket(bucket):
+            counts = bucket_counts.get(bucket, {c: 0 for c in FLAG_COLORS_ALL})
+            total = sum(counts.values()) + alpha * n_colors
+            return {c: round((counts[c] + alpha) / total, 4) for c in FLAG_COLORS_ALL}
+
+        # 4. Attach a probability distribution to every forecast point.
+        # CBI only operates 9am-sunset (per user 2026-09-11); outside
+        # that window it's ALWAYS closed regardless of wind, and during
+        # open hours it should never show any "closed" probability at
+        # all from this wind-based estimate (closed-during-open-hours is
+        # a rare special-case closure the historical wind data can't
+        # meaningfully predict, and letting it leak in just dilutes the
+        # red/yellow/green signal that's actually useful for the times
+        # you'd consider sailing). So: force certainty outside hours,
+        # and zero-out-and-renormalize "closed" during hours.
+        predictions = []
+        for row in forecast_points:
+            wind = row["value"]
+            valid_dt = row["valid_time_utc"]
+            if isinstance(valid_dt, str):
+                valid_dt = datetime.fromisoformat(valid_dt)
+            if valid_dt.tzinfo is None:
+                valid_dt = valid_dt.replace(tzinfo=timezone.utc)
+
+            if not is_cbi_open(valid_dt):
+                # Outside 9am-sunset: always closed, no wind-based estimate.
+                probs = {c: (1.0 if c == "closed" else 0.0) for c in FLAG_COLORS_ALL}
+                bucket = _wind_bucket(wind) if wind is not None else None
+                predictions.append({
+                    "valid_time_utc": row["valid_time_utc"],
+                    "wind_kt": wind,
+                    "wind_bucket": bucket,
+                    "flag_probabilities": probs,
+                    "most_likely_flag": "closed",
+                })
+                continue
+
+            bucket = _wind_bucket(wind) if wind is not None else None
+            probs = posterior_for_bucket(bucket) if bucket is not None else None
+            if probs is not None:
+                # During open hours: drop "closed" entirely and
+                # renormalize the remaining 3 colors so they sum to 1.
+                remaining = {c: probs[c] for c in FLAG_COLORS_ALL if c != "closed"}
+                total_remaining = sum(remaining.values())
+                if total_remaining > 0:
+                    probs = {**{c: round(v / total_remaining, 4) for c, v in remaining.items()}, "closed": 0.0}
+                else:
+                    # degenerate case (shouldn't happen with Dirichlet smoothing,
+                    # but guard anyway): fall back to uniform over the 3 open-hour colors
+                    probs = {**{c: round(1 / 3, 4) for c in remaining}, "closed": 0.0}
+            predictions.append({
+                "valid_time_utc": row["valid_time_utc"],
+                "wind_kt": wind,
+                "wind_bucket": bucket,
+                "flag_probabilities": probs,
+                "most_likely_flag": max(probs, key=probs.get) if probs else None,
+            })
+
+        return {
+            "model": model,
+            "training_sample_size": len(training_rows),
+            "wind_bucket_width_kt": WIND_BUCKET_WIDTH_KT,
+            "marginal_flag_distribution": {
+                c: round(marginal_counts[c] / max(1, sum(marginal_counts.values())), 4)
+                for c in FLAG_COLORS_ALL
+            },
+            "predictions": predictions,
+        }
+    finally:
+        con.close()
+
+
+def api_wind_prediction(params):
+    """Bayesian wind-speed-bucket prediction for locations with real wind
+    observations (NDBC buoy, MIT Pavilion, KBOS/Logan) -- the wind-only
+    counterpart to api_flag_prediction (CBI has no wind sensor, so it
+    uses flag color instead; these locations DO have real observed wind,
+    so they predict P(actual wind bucket | model's forecast wind bucket)
+    instead of a flag color). Deliberately mirrors that endpoint's shape
+    (stacked-probability-by-hour) per user direction 2026-09-11 ("show a
+    very similar graph, but do wind prediction instead").
+
+        P(actual_bucket=b | forecast_bucket=f)
+            = P(forecast_bucket=f | actual_bucket=b) * P(actual_bucket=b) / P(forecast_bucket=f)
+
+    Estimated the same way as the flag panel: build the joint
+    (forecast_bucket, actual_bucket) count table directly from this
+    location's own historical forecast-vs-observation pairs (same
+    nearest-observation-within-7.5min matching used by
+    v_accuracy_by_lead_time), add Dirichlet(alpha=1) smoothing per
+    forecast-bucket row, then look up each future forecast point's
+    bucket in that table to get a probability distribution over what
+    the REAL wind is likely to be -- a genuine uncertainty band around
+    the model's raw number, not just the number itself.
+    """
+    location = params.get("location")
+    model = params.get("model")
+    hours = int(params.get("hours", "48"))
+    variable = "wind_speed_kt"
+    if not location or not model:
+        return {"error": "location and model query params are required"}
+    con = db()
+    try:
+        # 1. Forecast wind for the selected model, forward-looking.
+        forecast_rows = con.execute(
+            """
+            WITH latest_run AS (
+                SELECT run_id, init_time_utc
+                FROM forecast_runs
+                WHERE location_id = ? AND model = ?
+                QUALIFY row_number() OVER (ORDER BY init_time_utc DESC) = 1
+            )
+            SELECT lr.init_time_utc, fv.valid_time_utc, fv.value
+            FROM forecast_values fv
+            JOIN latest_run lr ON lr.run_id = fv.run_id
+            WHERE fv.variable = ?
+              AND fv.valid_time_utc <= now() + (? * INTERVAL '1 hour')
+              AND fv.valid_time_utc >= now()
+            ORDER BY fv.valid_time_utc
+            """,
+            [location, model, variable, hours],
+        )
+        forecast_points = rows_as_dicts(forecast_rows)
+
+        # 2. Historical training pairs: this model's own past forecast
+        # values at this location, matched to the nearest real
+        # observation within 7.5 minutes (same tolerance as
+        # v_accuracy_by_lead_time).
+        training_rows = con.execute(
+            """
+            WITH candidates AS (
+                SELECT
+                    fv.value AS forecast_value,
+                    o.value AS observed_value,
+                    row_number() OVER (
+                        PARTITION BY fv.run_id, fv.valid_time_utc
+                        ORDER BY abs(epoch(fv.valid_time_utc) - epoch(o.ts_utc))
+                    ) AS rn
+                FROM forecast_values fv
+                JOIN forecast_runs fr ON fr.run_id = fv.run_id
+                JOIN observations o
+                    ON o.location_id = fr.location_id
+                   AND o.variable = fv.variable
+                   AND o.ts_utc BETWEEN fv.valid_time_utc - INTERVAL '7.5 minutes'
+                                     AND fv.valid_time_utc + INTERVAL '7.5 minutes'
+                WHERE fr.location_id = ? AND fr.model = ? AND fv.variable = ?
+            )
+            SELECT forecast_value, observed_value FROM candidates WHERE rn = 1
+            """,
+            [location, model, variable],
+        ).fetchall()
+        training_rows = [(f, o) for (f, o) in training_rows if f is not None and o is not None]
+
+        # 3. Build joint forecast_bucket -> {actual_bucket: count}, plus
+        # the marginal distribution of actual buckets, then compute the
+        # Dirichlet(alpha=1)-smoothed posterior per forecast bucket.
+        bucket_counts = {}  # forecast_bucket -> {actual_bucket: count}
+        marginal_counts = {}  # actual_bucket -> count (for degenerate fallback)
+        all_actual_buckets = set()
+        for f_val, o_val in training_rows:
+            fb = _wind_bucket(f_val)
+            ob = _wind_bucket(o_val)
+            all_actual_buckets.add(ob)
+            bucket_counts.setdefault(fb, {})
+            bucket_counts[fb][ob] = bucket_counts[fb].get(ob, 0) + 1
+            marginal_counts[ob] = marginal_counts.get(ob, 0) + 1
+
+        all_actual_buckets = sorted(all_actual_buckets, key=lambda b: int(b.split("-")[0]))
+        alpha = 1.0
+        n_buckets = max(1, len(all_actual_buckets))
+
+        def posterior_for_forecast_bucket(fb):
+            counts = bucket_counts.get(fb, {})
+            total = sum(counts.values()) + alpha * n_buckets
+            return {
+                b: round((counts.get(b, 0) + alpha) / total, 4)
+                for b in all_actual_buckets
+            }
+
+        # 4. Attach a probability distribution (over ACTUAL wind buckets)
+        # to every forecast point.
+        predictions = []
+        for row in forecast_points:
+            forecast_wind = row["value"]
+            fb = _wind_bucket(forecast_wind) if forecast_wind is not None else None
+            probs = posterior_for_forecast_bucket(fb) if (fb is not None and all_actual_buckets) else None
+            predictions.append({
+                "valid_time_utc": row["valid_time_utc"],
+                "forecast_wind_kt": forecast_wind,
+                "forecast_wind_bucket": fb,
+                "actual_wind_probabilities": probs,
+                "most_likely_actual_bucket": max(probs, key=probs.get) if probs else None,
+            })
+
+        return {
+            "location": location,
+            "model": model,
+            "training_sample_size": len(training_rows),
+            "wind_bucket_width_kt": WIND_BUCKET_WIDTH_KT,
+            "actual_wind_buckets": all_actual_buckets,
+            "predictions": predictions,
+        }
+    finally:
+        con.close()
+
+
+WIND_ROSE_DIRECTIONS = 16  # standard 16-point compass rose (22.5-degree sectors)
+WIND_ROSE_SPEED_BINS = [(0, 5), (5, 10), (10, 15), (15, 20), (20, 25), (25, None)]  # kt
+
+
+def _compass_sector(deg, n=WIND_ROSE_DIRECTIONS):
+    """Maps a direction in degrees to one of n compass sectors, each
+    centered on its own heading (sector 0 = N, centered on 0 deg)."""
+    sector_width = 360.0 / n
+    return int(((deg % 360) + sector_width / 2) // sector_width) % n
+
+
+def _speed_bin_label(speed_kt):
+    for lo, hi in WIND_ROSE_SPEED_BINS:
+        if hi is None or speed_kt < hi:
+            if speed_kt >= lo:
+                return f"{lo}-{hi}kt" if hi is not None else f"{lo}kt+"
+    return f"{WIND_ROSE_SPEED_BINS[-1][0]}kt+"
+
+
+def api_wind_rose(params):
+    """Wind rose data: frequency of (direction sector, speed bin) pairs,
+    for OBSERVED wind and (optionally) a selected model's FORECAST wind
+    at the same location, so the two roses can be compared side by side.
+    Only meaningful for locations with real wind_dir_deg/wind_speed_kt
+    observations (user 2026-09-11: "wind rose comparison... but only on
+    places with observed wind data") -- CBI has neither (no wind sensor),
+    so this endpoint is not offered there.
+    """
+    location = params.get("location")
+    model = params.get("model")  # optional; if omitted, observed-only
+    hours = int(params.get("hours", "720"))  # default 30 days of history
+    if not location:
+        return {"error": "location query param is required"}
+    con = db()
+    try:
+        obs_rows = con.execute(
+            """
+            SELECT o_dir.value AS dir_deg, o_spd.value AS speed_kt
+            FROM observations o_dir
+            JOIN observations o_spd
+                ON o_spd.location_id = o_dir.location_id
+               AND o_spd.variable = 'wind_speed_kt'
+               AND o_spd.ts_utc BETWEEN o_dir.ts_utc - INTERVAL '5 minutes' AND o_dir.ts_utc + INTERVAL '5 minutes'
+            WHERE o_dir.location_id = ? AND o_dir.variable = 'wind_dir_deg'
+              AND o_dir.ts_utc >= now() - (? * INTERVAL '1 hour')
+            """,
+            [location, hours],
+        ).fetchall()
+
+        def bucket_rows(rows):
+            grid = {}  # (sector, speed_bin) -> count
+            total = 0
+            for dir_deg, speed_kt in rows:
+                if dir_deg is None or speed_kt is None:
+                    continue
+                sector = _compass_sector(dir_deg)
+                sbin = _speed_bin_label(speed_kt)
+                key = (sector, sbin)
+                grid[key] = grid.get(key, 0) + 1
+                total += 1
+            return grid, total
+
+        obs_grid, obs_total = bucket_rows(obs_rows)
+
+        forecast_grid, forecast_total = {}, 0
+        if model:
+            forecast_rows = con.execute(
+                """
+                WITH latest_run AS (
+                    SELECT run_id
+                    FROM forecast_runs
+                    WHERE location_id = ? AND model = ?
+                    QUALIFY row_number() OVER (ORDER BY init_time_utc DESC) = 1
+                )
+                SELECT fv_dir.value AS dir_deg, fv_spd.value AS speed_kt
+                FROM forecast_values fv_dir
+                JOIN latest_run lr ON lr.run_id = fv_dir.run_id
+                JOIN forecast_values fv_spd
+                    ON fv_spd.run_id = fv_dir.run_id
+                   AND fv_spd.valid_time_utc = fv_dir.valid_time_utc
+                   AND fv_spd.variable = 'wind_speed_kt'
+                WHERE fv_dir.variable = 'wind_dir_deg'
+                """,
+                [location, model],
+            ).fetchall()
+            forecast_grid, forecast_total = bucket_rows(forecast_rows)
+
+        def to_rows(grid, total):
+            out = []
+            for sector in range(WIND_ROSE_DIRECTIONS):
+                for lo, hi in WIND_ROSE_SPEED_BINS:
+                    sbin = f"{lo}-{hi}kt" if hi is not None else f"{lo}kt+"
+                    count = grid.get((sector, sbin), 0)
+                    out.append({
+                        "sector": sector,
+                        "sector_deg": sector * (360.0 / WIND_ROSE_DIRECTIONS),
+                        "speed_bin": sbin,
+                        "count": count,
+                        "frequency": round(count / total, 4) if total else 0.0,
+                    })
+            return out
+
+        return {
+            "location": location,
+            "model": model,
+            "observed": {"total_samples": obs_total, "rows": to_rows(obs_grid, obs_total)},
+            "forecast": {"total_samples": forecast_total, "rows": to_rows(forecast_grid, forecast_total)} if model else None,
+            "speed_bins": [f"{lo}-{hi}kt" if hi is not None else f"{lo}kt+" for lo, hi in WIND_ROSE_SPEED_BINS],
+        }
+    finally:
+        con.close()
+
+
+def api_gust_factor(params):
+    """Gust factor (gust_kt / sustained_kt) time series for a location.
+    A genuinely different signal from raw speed/gust (user 2026-09-11:
+    "gust factor / variability chart... but only on places with observed
+    wind data") -- gusty-but-moderate conditions (high ratio) can be
+    more hazardous to sail in than steady-but-stronger wind (ratio near
+    1.0), and this ratio is invisible in the existing speed-only charts
+    even though both wind_speed_kt and wind_gust_kt are already ingested
+    everywhere that has real wind sensors.
+    """
+    location = params.get("location")
+    hours = int(params.get("hours", "72"))
+    if not location:
+        return {"error": "location query param is required"}
+    con = db()
+    try:
+        rows = con.execute(
+            """
+            SELECT o_spd.ts_utc, o_spd.value AS sustained_kt, o_gst.value AS gust_kt
+            FROM observations o_spd
+            JOIN observations o_gst
+                ON o_gst.location_id = o_spd.location_id
+               AND o_gst.variable = 'wind_gust_kt'
+               AND o_gst.ts_utc = o_spd.ts_utc
+            WHERE o_spd.location_id = ? AND o_spd.variable = 'wind_speed_kt'
+              AND o_spd.ts_utc >= now() - (? * INTERVAL '1 hour')
+              AND o_spd.value > 0
+            ORDER BY o_spd.ts_utc
+            """,
+            [location, hours],
+        ).fetchall()
+        out = []
+        for ts_utc, sustained_kt, gust_kt in rows:
+            if sustained_kt is None or gust_kt is None or sustained_kt <= 0:
+                continue
+            out.append({
+                "ts_utc": ts_utc.isoformat(),
+                "sustained_kt": sustained_kt,
+                "gust_kt": gust_kt,
+                "gust_factor": round(gust_kt / sustained_kt, 3),
+            })
+        return out
+    finally:
+        con.close()
+
+
+ROUTES = {
+    "/api/locations": api_locations,
+    "/api/current-conditions": api_current_conditions,
+    "/api/flags-latest": api_flags_latest,
+    "/api/flags-history": api_flags_history,
+    "/api/flag-prediction": api_flag_prediction,
+    "/api/wind-prediction": api_wind_prediction,
+    "/api/wind-rose": api_wind_rose,
+    "/api/gust-factor": api_gust_factor,
+    "/api/accuracy": api_accuracy,
+    "/api/accuracy-variables": api_accuracy_variables,
+    "/api/forecast": api_forecast,
+    "/api/forecast-convergence": api_forecast_convergence,
+    "/api/observation-near": api_observation_near,
+    "/api/observations": api_observations,
+    "/api/variables-for-location": api_variables_for_location,
+}
+
+
+CONTENT_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".js": "application/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".webmanifest": "application/manifest+json; charset=utf-8",
+}
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        # Slightly quieter default logging
+        print("%s - %s" % (self.address_string(), format % args))
+
+    def _send_json(self, obj, status=200):
+        body = json.dumps(obj, default=str).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_file(self, path):
+        if not os.path.isfile(path):
+            self._send_json({"error": "not found"}, 404)
+            return
+        ext = os.path.splitext(path)[1]
+        ctype = CONTENT_TYPES.get(ext, "application/octet-stream")
+        with open(path, "rb") as f:
+            body = f.read()
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        params = {k: v[0] for k, v in urllib.parse.parse_qs(parsed.query).items()}
+
+        if parsed.path in ROUTES:
+            try:
+                result = ROUTES[parsed.path](params)
+                self._send_json(result)
+            except Exception as e:  # surface errors as JSON, not a stack trace to client
+                self._send_json({"error": str(e)}, 500)
+            return
+
+        # static file serving
+        rel = parsed.path
+        if rel == "/":
+            rel = "/index.html"
+        safe_rel = os.path.normpath(rel).lstrip(os.sep)
+        full_path = os.path.join(STATIC_DIR, safe_rel)
+        # prevent path traversal outside STATIC_DIR
+        if not os.path.abspath(full_path).startswith(os.path.abspath(STATIC_DIR)):
+            self._send_json({"error": "forbidden"}, 403)
+            return
+        self._send_file(full_path)
+
+
+def main():
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    print(f"Sailing Weather Dashboard listening on http://localhost:{PORT}")
+    print(f"DB path: {os.path.abspath(DB_PATH)}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()

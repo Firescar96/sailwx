@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sailing Weather Dashboard</title>
+<link rel="stylesheet" href="/style.css">
+
+<!-- PWA: manifest + icons so this installs with a proper name/icon on a
+     phone home screen instead of a generic browser-tab bookmark. -->
+<link rel="manifest" href="/manifest.json">
+<meta name="theme-color" content="#0b1620">
+<link rel="icon" type="image/png" href="/favicon.png">
+<link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
+<!-- iOS doesn't read manifest.json for "add to home screen" metadata --
+     these meta tags are the only way to get a proper standalone-app feel
+     (no browser chrome) and correct title when launched from iOS. -->
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="SailWx">
+
+<script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
+</head>
+<body>
+<header>
+  <h1><img src="/logo.png" alt="" width="28" height="28" style="vertical-align:middle;margin-right:8px;">Sailing Weather Dashboard</h1>
+  <div class="controls">
+    <label>
+      Location
+      <select id="location-select"></select>
+    </label>
+    <label>
+      Variable
+      <select id="variable-select"></select>
+    </label>
+  </div>
+</header>
+
+<main>
+  <section id="current-conditions" class="panel">
+    <h2>Current Conditions <span class="subtitle">(most recent observation per location)</span></h2>
+    <div id="conditions-grid" class="conditions-grid"></div>
+    <div id="flags-row" class="flags-row"></div>
+  </section>
+
+  <section id="accuracy-panel" class="panel">
+    <h2>Model Accuracy by Lead Time</h2>
+    <p class="subtitle">Mean Absolute Error (MAE) per forecast model, broken out by how far ahead the forecast was made. Lower bars = more accurate at that lead time.</p>
+    <div id="accuracy-chart"></div>
+    <div id="accuracy-empty" class="empty-msg" hidden></div>
+  </section>
+
+  <section id="forecast-panel" class="panel">
+    <h2>Forecast Time Series <span class="subtitle">(most recent run per model)</span></h2>
+    <div class="controls inline">
+      <label>
+        Window
+        <select id="hours-select">
+          <option value="12">Next 12h</option>
+          <option value="24">Next 24h</option>
+          <option value="48">Next 48h</option>
+          <option value="72" selected>Next 72h</option>
+          <option value="120">Next 5 days</option>
+          <option value="168">Next 7 days</option>
+          <option value="240">Next 10 days</option>
+          <option value="336">Next 14 days</option>
+        </select>
+      </label>
+      <label>
+        Also show past
+        <select id="past-hours-select">
+          <option value="0">Off</option>
+          <option value="12">Last 12h</option>
+          <option value="24" selected>Last 24h</option>
+          <option value="48">Last 48h</option>
+          <option value="72">Last 72h</option>
+          <option value="168">Last 7 days</option>
+        </select>
+      </label>
+    </div>
+    <div id="forecast-chart"></div>
+    <div id="forecast-empty" class="empty-msg" hidden>No forecast data available yet for this location/variable.</div>
+  </section>
+
+  <section id="convergence-panel" class="panel">
+    <h2>Forecast Convergence <span class="subtitle">(how predictions for one target time changed across runs)</span></h2>
+    <p class="subtitle">Click a point on the forecast chart above to pick a target time, or use the picker below.</p>
+    <div class="controls inline">
+      <label>
+        Target time (UTC)
+        <input type="datetime-local" id="target-time-input">
+      </label>
+      <button type="button" id="convergence-fetch-btn">Show convergence</button>
+    </div>
+    <div id="convergence-chart"></div>
+    <div id="convergence-empty" class="empty-msg">Pick a target time above, or click a point on the forecast chart.</div>
+  </section>
+
+  <section id="flag-prediction-panel" class="panel">
+    <h2>CBI Flag Prediction <span class="subtitle">(Bayesian: P(flag color | forecast wind), from one selected model)</span></h2>
+    <p class="subtitle">Not the same as the accuracy chart above -- this doesn't measure model error, it estimates "given this model's wind forecast, how likely is each flag color" using CBI's own historical wind-vs-flag pairing, with Bayesian smoothing so sparse wind ranges don't look falsely certain.</p>
+    <div class="controls inline">
+      <label>
+        Model
+        <select id="flag-prediction-model-select"></select>
+      </label>
+      <label>
+        Look ahead
+        <select id="flag-prediction-hours-select">
+          <option value="24">Next 24h</option>
+          <option value="48" selected>Next 48h</option>
+          <option value="72">Next 72h</option>
+          <option value="120">Next 5 days</option>
+        </select>
+      </label>
+    </div>
+    <div id="flag-prediction-chart"></div>
+    <div id="flag-prediction-empty" class="empty-msg" hidden></div>
+  </section>
+
+  <section id="wind-prediction-panel" class="panel" hidden>
+    <h2>Wind Prediction <span class="subtitle">(Bayesian: P(actual wind bucket | forecast wind), from one selected model)</span></h2>
+    <p class="subtitle">Not the same as the accuracy chart above -- instead of "how far off is the model on average", this estimates "given this model's forecast wind, how likely is the REAL wind to fall in each range", using this location's own historical forecast-vs-observed wind pairing, with Bayesian smoothing.</p>
+    <div class="controls inline">
+      <label>
+        Model
+        <select id="wind-prediction-model-select"></select>
+      </label>
+      <label>
+        Look ahead
+        <select id="wind-prediction-hours-select">
+          <option value="24">Next 24h</option>
+          <option value="48" selected>Next 48h</option>
+          <option value="72">Next 72h</option>
+          <option value="120">Next 5 days</option>
+        </select>
+      </label>
+    </div>
+    <div id="wind-prediction-chart"></div>
+    <div id="wind-prediction-empty" class="empty-msg" hidden></div>
+  </section>
+
+  <section id="wind-rose-panel" class="panel" hidden>
+    <h2>Wind Rose <span class="subtitle">(direction + speed frequency: observed vs. forecast)</span></h2>
+    <p class="subtitle">Only shown at locations with real wind direction/speed sensors (not CBI, which has no wind sensor of its own). Compares the historical distribution of observed wind direction/speed against a selected model's own forecast distribution over the same recent period.</p>
+    <div class="controls inline">
+      <label>
+        Compare to model
+        <select id="wind-rose-model-select">
+          <option value="">Observed only</option>
+        </select>
+      </label>
+      <label>
+        History window
+        <select id="wind-rose-hours-select">
+          <option value="168">Last 7 days</option>
+          <option value="336">Last 14 days</option>
+          <option value="720" selected>Last 30 days</option>
+        </select>
+      </label>
+    </div>
+    <div id="wind-rose-chart"></div>
+    <div id="wind-rose-empty" class="empty-msg" hidden></div>
+  </section>
+
+  <section id="gust-factor-panel" class="panel" hidden>
+    <h2>Gust Factor <span class="subtitle">(gust speed &divide; sustained speed)</span></h2>
+    <p class="subtitle">A ratio near 1.0 means steady wind; a high ratio means gusty, variable conditions that can be more hazardous to sail in than steady-but-stronger wind of the same average speed. Only shown at locations with real gust sensor data.</p>
+    <div class="controls inline">
+      <label>
+        Window
+        <select id="gust-factor-hours-select">
+          <option value="24">Last 24h</option>
+          <option value="48" selected>Last 48h</option>
+          <option value="72">Last 72h</option>
+          <option value="168">Last 7 days</option>
+        </select>
+      </label>
+    </div>
+    <div id="gust-factor-chart"></div>
+    <div id="gust-factor-empty" class="empty-msg" hidden></div>
+  </section>
+</main>
+
+<footer>
+  <p>Data source: local DuckDB weather database (read-only). Times shown in UTC.</p>
+</footer>
+
+<script src="/app.js"></script>
+<script>
+  // Registers the service worker so the browser considers this page
+  // "installable" (required for a proper home-screen icon + standalone
+  // launch, not just the manifest alone). Guarded with typeof check --
+  // fails silently and harmlessly on browsers/contexts without SW support
+  // (e.g. plain http:// access rather than https/localhost) instead of
+  // throwing and breaking the rest of the page.
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('/sw.js').catch(err => {
+        console.warn('Service worker registration failed (PWA install may not be available):', err);
+      });
+    });
+  }
+</script>
+</body>
+</html>

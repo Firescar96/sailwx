@@ -1,0 +1,414 @@
+#!/usr/bin/env python3
+"""MIT Sailing Pavilion combined weewx day-graph extractor.
+
+MERGED 2026-09-11 (per user instruction: "combine the functions cleanly
+from both mit scrapers into one") from what were previously two separate
+scripts/cron jobs -- extract_wind.py (wind speed/gust) and
+ingest_mit_graphs.py (pressure/air-temp/water-temp/wind-direction).
+Combining them into a single script/cron job means:
+  - Only ONE DuckDB write-lock acquisition per run instead of two,
+    directly reducing the lock-contention "stuck job" failures that kept
+    recurring this session (both scripts were scheduled at the exact
+    same "0 */4 * * *" minute as each other AND as the forecast
+    ingester, guaranteeing collisions every single run -- see
+    db/common.py's stale-lock detection for the other half of this fix).
+  - Only ONE HTTP fetch round-trip pattern / cron job to monitor instead
+    of two nearly-identical ones.
+  - All 5 graphs (wind, barometer, air-temp, water-temp, wind-dir) share
+    the exact same weewx template geometry (mit_graph_ocr.py) and OCR
+    axis-reading approach; the wind graph's extra edge-trimming/3-vote
+    pixel-resolution logic (extract_wind.py's more careful
+    _column_value_candidates/resolve_reading, added after real accuracy
+    bugs were found) is preserved as-is for wind, while the simpler
+    topmost-match approach (still correct, just less defensive) is kept
+    for the other 4 graphs, matching each script's original logic
+    exactly -- this merge does not change either script's extraction
+    behavior, only where they run.
+
+Runs every 4 hours (see cron job "MIT Pavilion Weather Graph Ingester").
+Each graph shows a rolling 24h window, so a missed run is self-healing:
+the next run's window overlaps and backfills anything missed.
+
+GRAPHS (all 700x196px):
+  - daywind.png           -> wind_speed_kt, wind_gust_kt (line pair, dynamic
+                              axis, 3-candidate-vote + edge-trim + clip
+                              detection -- see extract_wind_graph())
+  - daybarometer.png      -> pressure_hpa   (line, dynamic axis)
+  - dayouttemphilo.png    -> air_temp_f     (line, dynamic axis)
+  - daywatertemphilo.png  -> water_temp_f   (line, dynamic axis)
+  - daywinddir.png        -> wind_dir_deg   (scatter dots, fixed 0-360 axis)
+"""
+import csv
+import os
+import ssl
+import sys
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from io import BytesIO
+
+from PIL import Image
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from mit_graph_ocr import PLOT_X_MAX, PLOT_X_MIN, PLOT_Y_BOTTOM, PLOT_Y_TOP, read_axis_scale, y_to_value
+
+PROJECT_DIR = os.path.expanduser("~/.hermes/projects/sailing-weather")
+sys.path.insert(0, os.path.join(PROJECT_DIR, "db"))
+from common import bulk_insert, get_connection  # noqa: E402
+
+BASE = "https://sailing.mit.edu/weather/"
+LOCATION_ID = "mit_pavilion"
+MPH_TO_KT = 0.868976
+
+DATA_DIR = os.path.join(PROJECT_DIR, "data")
+CSV_PATH = os.path.join(DATA_DIR, "wind_native_res.csv")  # unchanged path/format from extract_wind.py
+
+DARK_GREEN = (48, 160, 48)     # Wind Speed (sustained); also the single line
+                                # color used by barometer/temp/water-temp/wind-dir
+LIGHT_GREEN = (128, 208, 144)  # Gust Speed only
+COLOR_TOLERANCE = 18
+
+SPAN_HOURS = 24
+NATIVE_RESOLUTION_MINUTES = (SPAN_HOURS * 60) / (PLOT_X_MAX - PLOT_X_MIN)  # ~2.27 min
+
+CLIP_ROW_TOLERANCE = 1
+EDGE_TRIM_COLUMNS = 4  # ~9 minutes at ~2.27 min/column, each side (wind graph only)
+
+# graph filename -> (variable name, is_line_graph). is_line_graph=False
+# means "scattered dot markers on a fixed 0-360 axis" (wind direction).
+OTHER_GRAPHS = {
+    "daybarometer.png": ("pressure_hpa", True),
+    "dayouttemphilo.png": ("air_temp_f", True),
+    "daywatertemphilo.png": ("water_temp_f", True),
+    "daywinddir.png": ("wind_dir_deg", False),
+}
+
+ctx = ssl.create_default_context()
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE
+
+
+def fetch_bytes(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "mit-weather-archiver/1.0"})
+    with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
+        return resp.read()
+
+
+def color_match(px_color, target, tol=COLOR_TOLERANCE):
+    return all(abs(px_color[i] - target[i]) <= tol for i in range(3))
+
+
+def columns_to_timestamps(width, end_time, span_hours):
+    start_time = end_time - timedelta(hours=span_hours)
+    return [start_time + (end_time - start_time) * (col / (width - 1) if width > 1 else 0)
+            for col in range(width)]
+
+
+# ---------------------------------------------------------------------------
+# Wind speed/gust extraction (from extract_wind.py, unchanged logic)
+# ---------------------------------------------------------------------------
+
+def _column_value_candidates(px, x, target_color):
+    """3 independent value-candidates (pixel rows) per column/color:
+    topmost, bottommost-of-contiguous-run-near-top, median of all
+    matches -- see resolve_reading for how disagreement is handled."""
+    matches = [y for y in range(PLOT_Y_TOP, PLOT_Y_BOTTOM + 1) if color_match(px[x, y][:3], target_color)]
+    if not matches:
+        return None
+    topmost = matches[0]
+    bottommost_of_run = topmost
+    for y in matches[1:]:
+        if y - bottommost_of_run <= 3:
+            bottommost_of_run = y
+        else:
+            break
+    median_row = matches[len(matches) // 2]
+    return topmost, bottommost_of_run, median_row
+
+
+def resolve_reading(candidates):
+    """Majority vote among the 3 candidates; median fallback on no majority."""
+    if candidates is None:
+        return None
+    counts = {}
+    for c in candidates:
+        counts[c] = counts.get(c, 0) + 1
+    best_count = max(counts.values())
+    winners = [v for v, cnt in counts.items() if cnt == best_count]
+    if len(winners) == 1:
+        return winners[0]
+    return sorted(candidates)[1]
+
+
+def extract_wind_series(img, top_value, bottom_value):
+    """Returns (sustained[], gust[]) lists of (mph_value, is_clipped) or
+    None, per pixel column, edge-trimmed and 3-vote resolved."""
+    px = img.load()
+    width = PLOT_X_MAX - PLOT_X_MIN
+    sustained = [None] * width
+    gust = [None] * width
+
+    for col in range(width):
+        if col < EDGE_TRIM_COLUMNS or col >= width - EDGE_TRIM_COLUMNS:
+            continue
+        x = PLOT_X_MIN + col
+
+        dark_row = resolve_reading(_column_value_candidates(px, x, DARK_GREEN))
+        if dark_row is not None:
+            clipped = (dark_row - PLOT_Y_TOP) <= CLIP_ROW_TOLERANCE
+            sustained[col] = (round(y_to_value(dark_row, top_value, bottom_value), 1), clipped)
+
+        light_row = resolve_reading(_column_value_candidates(px, x, LIGHT_GREEN))
+        if light_row is not None:
+            clipped = (light_row - PLOT_Y_TOP) <= CLIP_ROW_TOLERANCE
+            gust[col] = (round(y_to_value(light_row, top_value, bottom_value), 1), clipped)
+
+    return sustained, gust
+
+
+def resample_wind_to_native(timestamps, sustained, gust):
+    bucket_minutes = NATIVE_RESOLUTION_MINUTES
+    buckets = {}
+    for t, s, g in zip(timestamps, sustained, gust):
+        minutes_since_hour = t.minute + t.second / 60
+        bucket_idx = int(minutes_since_hour // bucket_minutes)
+        bucket_key = t.replace(minute=0, second=0, microsecond=0) + timedelta(minutes=bucket_idx * bucket_minutes)
+        bucket_key = bucket_key - timedelta(seconds=bucket_key.second, microseconds=bucket_key.microsecond)
+
+        buckets.setdefault(bucket_key, {"s": [], "s_clip": False, "g": [], "g_clip": False})
+        if s is not None:
+            val, clipped = s
+            buckets[bucket_key]["s"].append(val)
+            buckets[bucket_key]["s_clip"] = buckets[bucket_key]["s_clip"] or clipped
+        if g is not None:
+            val, clipped = g
+            buckets[bucket_key]["g"].append(val)
+            buckets[bucket_key]["g_clip"] = buckets[bucket_key]["g_clip"] or clipped
+
+    result = {}
+    for key, vals in buckets.items():
+        s_avg = round(sum(vals["s"]) / len(vals["s"]), 1) if vals["s"] else None
+        g_avg = round(sum(vals["g"]) / len(vals["g"]), 1) if vals["g"] else None
+        result[key] = (s_avg, vals["s_clip"], g_avg, vals["g_clip"])
+    return result
+
+
+def load_existing_wind_timestamps():
+    if not os.path.exists(CSV_PATH):
+        return set()
+    existing = set()
+    with open(CSV_PATH, newline="") as f:
+        reader = csv.reader(f)
+        next(reader, None)
+        for row in reader:
+            if row:
+                existing.add(row[0])
+    return existing
+
+
+def append_wind_csv_rows(rows):
+    file_exists = os.path.exists(CSV_PATH)
+    with open(CSV_PATH, "a", newline="") as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow([
+                "timestamp_utc", "wind_sustained_mph", "sustained_clipped",
+                "wind_gust_mph", "gust_clipped",
+            ])
+        for ts, s, s_clip, g, g_clip in rows:
+            writer.writerow([ts, s if s is not None else "", s_clip, g if g is not None else "", g_clip])
+
+
+def write_wind_rows_to_db(con, rows):
+    """Upsert (not insert-if-new) -- a fresh re-read is always at least as
+    reliable as an older one, never less (see extract_wind.py history)."""
+    for ts, s, s_clip, g, g_clip in rows:
+        if s is not None:
+            quality = "clipped_high" if s_clip else None
+            con.execute(
+                """
+                INSERT INTO observations (location_id, ts_utc, variable, value, source, quality)
+                VALUES (?, ?, 'wind_speed_kt', ?, 'mit_pixel_scrape', ?)
+                ON CONFLICT (location_id, ts_utc, variable) DO UPDATE SET
+                    value = excluded.value, quality = excluded.quality, source = excluded.source
+                """,
+                [LOCATION_ID, ts, round(s * MPH_TO_KT, 1), quality],
+            )
+        if g is not None:
+            quality = "clipped_high" if g_clip else None
+            con.execute(
+                """
+                INSERT INTO observations (location_id, ts_utc, variable, value, source, quality)
+                VALUES (?, ?, 'wind_gust_kt', ?, 'mit_pixel_scrape', ?)
+                ON CONFLICT (location_id, ts_utc, variable) DO UPDATE SET
+                    value = excluded.value, quality = excluded.quality, source = excluded.source
+                """,
+                [LOCATION_ID, ts, round(g * MPH_TO_KT, 1), quality],
+            )
+
+
+def process_wind_graph(con, existing_wind_timestamps):
+    """Returns (new_row_count, clipped_count)."""
+    data = fetch_bytes(f"{BASE}daywind.png")
+    img = Image.open(BytesIO(data))
+    width = PLOT_X_MAX - PLOT_X_MIN
+    top_value, bottom_value = read_axis_scale(img)
+    sustained, gust = extract_wind_series(img, top_value, bottom_value)
+
+    now_utc = datetime.now(timezone.utc)
+    timestamps = columns_to_timestamps(width, now_utc, SPAN_HOURS)
+    buckets = resample_wind_to_native(timestamps, sustained, gust)
+
+    csv_new_rows, db_rows, clipped_count = [], [], 0
+    for ts, (s, s_clip, g, g_clip) in sorted(buckets.items()):
+        if s is None and g is None:
+            continue
+        iso = ts.isoformat()
+        db_rows.append((iso, s, s_clip, g, g_clip))
+        if iso not in existing_wind_timestamps:
+            csv_new_rows.append((iso, s, s_clip, g, g_clip))
+            existing_wind_timestamps.add(iso)
+        if s_clip or g_clip:
+            clipped_count += 1
+
+    if csv_new_rows:
+        append_wind_csv_rows(csv_new_rows)
+    if db_rows:
+        write_wind_rows_to_db(con, db_rows)
+    return len(db_rows), clipped_count
+
+
+# ---------------------------------------------------------------------------
+# Pressure/air-temp/water-temp/wind-direction extraction (from
+# ingest_mit_graphs.py, unchanged logic)
+# ---------------------------------------------------------------------------
+
+def extract_line_series(img, top_value, bottom_value):
+    px = img.load()
+    width = PLOT_X_MAX - PLOT_X_MIN
+    series = [None] * width
+    for col in range(width):
+        x = PLOT_X_MIN + col
+        for y in range(PLOT_Y_TOP, PLOT_Y_BOTTOM + 1):
+            if color_match(px[x, y][:3], DARK_GREEN):
+                series[col] = round(y_to_value(y, top_value, bottom_value), 1)
+                break
+    return series
+
+
+def extract_scatter_series(img):
+    px = img.load()
+    width = PLOT_X_MAX - PLOT_X_MIN
+    series = [None] * width
+    for col in range(width):
+        x = PLOT_X_MIN + col
+        matches = [y for y in range(PLOT_Y_TOP, PLOT_Y_BOTTOM + 1) if color_match(px[x, y][:3], DARK_GREEN)]
+        if matches:
+            avg_y = sum(matches) / len(matches)
+            series[col] = round(y_to_value(avg_y, 360.0, 0.0), 1)
+    return series
+
+
+def resample_other_to_native(timestamps, series):
+    bucket_minutes = NATIVE_RESOLUTION_MINUTES
+    buckets = {}
+    for t, v in zip(timestamps, series):
+        if v is None:
+            continue
+        minutes_since_hour = t.minute + t.second / 60
+        bucket_idx = int(minutes_since_hour // bucket_minutes)
+        bucket_key = t.replace(minute=0, second=0, microsecond=0) + timedelta(minutes=bucket_idx * bucket_minutes)
+        buckets.setdefault(bucket_key, []).append(v)
+    return {k: round(sum(vs) / len(vs), 2) for k, vs in buckets.items()}
+
+
+def process_other_graph(filename, variable, is_line_graph):
+    data = fetch_bytes(f"{BASE}{filename}")
+    img = Image.open(BytesIO(data))
+    width = PLOT_X_MAX - PLOT_X_MIN
+
+    if is_line_graph:
+        top_value, bottom_value = read_axis_scale(img)
+        series = extract_line_series(img, top_value, bottom_value)
+    else:
+        series = extract_scatter_series(img)
+
+    now_utc = datetime.now(timezone.utc)
+    timestamps = columns_to_timestamps(width, now_utc, SPAN_HOURS)
+    buckets = resample_other_to_native(timestamps, series)
+    return [(LOCATION_ID, ts, variable, val) for ts, val in buckets.items()]
+
+
+def write_other_rows_to_db(con, filename, variable, rows):
+    """Insert-if-new (not upsert) -- matches ingest_mit_graphs.py's
+    original behavior exactly (these 4 variables don't have the same
+    known stale-value-correction need that wind's upsert was fixing)."""
+    con.execute(
+        "CREATE OR REPLACE TEMP TABLE stage_mit (location_id TEXT, ts_utc TIMESTAMP, variable TEXT, value DOUBLE)"
+    )
+    bulk_insert(con, "stage_mit", ["location_id", "ts_utc", "variable", "value"], rows)
+    before = con.execute(
+        "SELECT count(*) FROM observations WHERE location_id=? AND variable=?", [LOCATION_ID, variable]
+    ).fetchone()[0]
+    con.execute(
+        """
+        INSERT INTO observations (location_id, ts_utc, variable, value, source)
+        SELECT s.location_id, s.ts_utc, s.variable, ANY_VALUE(s.value), 'mit_graph_ocr'
+        FROM stage_mit s
+        ANTI JOIN observations o
+            ON o.location_id = s.location_id AND o.ts_utc = s.ts_utc AND o.variable = s.variable
+        GROUP BY s.location_id, s.ts_utc, s.variable
+        """
+    )
+    con.execute("DROP TABLE stage_mit")
+    after = con.execute(
+        "SELECT count(*) FROM observations WHERE location_id=? AND variable=?", [LOCATION_ID, variable]
+    ).fetchone()[0]
+    return after - before
+
+
+# ---------------------------------------------------------------------------
+# Combined entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    os.makedirs(DATA_DIR, exist_ok=True)
+    existing_wind_timestamps = load_existing_wind_timestamps()
+
+    errors = []
+    total_new = 0
+
+    # ONE connection for the whole run (this is the actual point of the
+    # merge -- was 2 separate get_connection() calls/lock acquisitions
+    # across 2 separate cron jobs before).
+    con = get_connection()
+    try:
+        try:
+            n, clipped = process_wind_graph(con, existing_wind_timestamps)
+            print(f"daywind.png -> wind_speed_kt/wind_gust_kt: {n} new rows at "
+                  f"~{NATIVE_RESOLUTION_MINUTES:.2f}-min native resolution "
+                  f"({clipped} with a clipped/ceiling-hit reading)")
+            total_new += n
+        except Exception as e:
+            errors.append(f"daywind.png: {e}")
+
+        for filename, (variable, is_line_graph) in OTHER_GRAPHS.items():
+            try:
+                rows = process_other_graph(filename, variable, is_line_graph)
+                new_count = write_other_rows_to_db(con, filename, variable, rows)
+                total_new += new_count
+                print(f"{filename} -> {variable}: {len(rows)} readings in 24h window, {new_count} new rows inserted")
+            except Exception as e:
+                errors.append(f"{filename}: {e}")
+    finally:
+        con.close()
+
+    print(f"Total new rows: {total_new}")
+    if errors:
+        print("Errors:")
+        for e in errors:
+            print(" ", e)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

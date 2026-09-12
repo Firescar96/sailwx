@@ -1,0 +1,1469 @@
+// Sailing Weather Dashboard frontend. Plain JS + D3 v7, no framework.
+
+const MODEL_COLORS = {
+  gfs: getCssVar('--gfs'),
+  ecmwf: getCssVar('--ecmwf'),
+  hrrr: getCssVar('--hrrr'),
+  icon: getCssVar('--icon'),
+  nam: getCssVar('--nam'),
+  hrdps: getCssVar('--hrdps'),
+};
+
+const FLAG_COLORS = {
+  green: getCssVar('--flag-green'),
+  yellow: getCssVar('--flag-yellow'),
+  red: getCssVar('--flag-red'),
+  closed: getCssVar('--flag-black'),
+};
+
+const VARIABLE_LABELS = {
+  wind_speed_kt: 'Wind Speed (kt)',
+  wind_gust_kt: 'Wind Gust (kt)',
+  wind_dir_deg: 'Wind Direction (deg)',
+  pressure_hpa: 'Pressure (hPa)',
+  air_temp_f: 'Air Temp (°F)',
+  water_temp_f: 'Water Temp (°F)',
+  water_level_ft_mllw: 'Water Level (ft MLLW)',
+};
+
+// 'other' (negative lead-time / hindcast backfill rows -- past_days/
+// past_hours data added so the forecast time-series chart can show
+// historical model context, see ingest_forecasts.py) is intentionally
+// excluded here. It's real, legitimate data, just not "forecast skill
+// at a given lead time" (there's no lead time when valid_time predates
+// init_time), so it doesn't belong in the Model Accuracy chart --
+// user-requested 2026-09-11 to skip it there specifically.
+const LEAD_BUCKET_ORDER = ['0-6h', '6-12h', '12-24h', '24-48h', '48-72h', '72h+'];
+
+function getCssVar(name) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+
+function fmtVarLabel(v) {
+  return VARIABLE_LABELS[v] || v;
+}
+
+const state = {
+  locations: [],
+  location: null,
+  variable: 'wind_speed_kt',
+  accuracyVarsByLocation: {}, // location_id -> Set(variable)
+  hours: 72,
+  pastHours: 24, // matches the <select> default in index.html (Last 24h) -- observed data visible by default
+  hiddenModels: new Set(), // model keys (or 'observed') toggled off via legend click
+};
+
+async function fetchJSON(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`${url} -> HTTP ${res.status}`);
+  return res.json();
+}
+
+// ---------------------------------------------------------------------------
+// Init
+// ---------------------------------------------------------------------------
+
+async function init() {
+  const [locations, accuracyVars] = await Promise.all([
+    fetchJSON('/api/locations'),
+    fetchJSON('/api/accuracy-variables'),
+  ]);
+
+  state.locations = locations;
+  accuracyVars.forEach(row => {
+    if (!state.accuracyVarsByLocation[row.location_id]) {
+      state.accuracyVarsByLocation[row.location_id] = new Set();
+    }
+    state.accuracyVarsByLocation[row.location_id].add(row.variable);
+  });
+
+  const locSelect = d3.select('#location-select');
+  locSelect.selectAll('option')
+    .data(locations)
+    .join('option')
+    .attr('value', d => d.location_id)
+    .text(d => d.name);
+
+  state.location = locations[0].location_id;
+  locSelect.property('value', state.location);
+  locSelect.on('change', function () {
+    state.location = this.value;
+    state.hiddenModels.clear(); // don't carry a stale hidden-set across to a different location's chart
+    refreshVariableOptions();
+    refreshAll();
+    updatePredictionPanelVisibility();
+    if (state.location !== 'cbi_dockhouse') {
+      loadWindPredictionChart();
+      loadWindRoseChart();
+      loadGustFactorChart();
+    }
+  });
+
+  d3.select('#hours-select').on('change', function () {
+    state.hours = +this.value;
+    loadForecastChart();
+  });
+
+  d3.select('#past-hours-select').on('change', function () {
+    state.pastHours = +this.value;
+    loadForecastChart();
+  });
+
+  d3.select('#convergence-fetch-btn').on('click', () => {
+    const val = d3.select('#target-time-input').property('value');
+    if (val) {
+      loadConvergenceChart(val);
+    } else {
+      // Previously silently did nothing here if the datetime-local input
+      // was empty/incomplete (e.g. date picked but time left blank) --
+      // reported by user as "the button does nothing". Now gives visible
+      // feedback instead of failing silently.
+      d3.select('#convergence-empty')
+        .attr('hidden', null)
+        .text('Pick a complete date AND time (both fields) before clicking Show convergence.');
+      d3.select('#convergence-chart').selectAll('*').remove();
+    }
+  });
+
+  // Flag Prediction panel (CBI only) and Wind Prediction panel (all other
+  // locations with real wind observations) -- separate from the existing
+  // Forecast/Accuracy charts (user explicit direction 2026-09-11: "do not
+  // ruin or mess up the existing charts... I want additional overlay or a
+  // separate chart"; then 2026-09-11 again: "only show CBI Flag Prediction
+  // on the CBI page, on the other pages... show a very similar graph, but
+  // do wind prediction instead"). Model lists reuse MODEL_COLORS' keys
+  // since that's the same 6-model set the forecast ingester populates
+  // everywhere.
+  const flagModelSelect = d3.select('#flag-prediction-model-select');
+  flagModelSelect.selectAll('option')
+    .data(Object.keys(MODEL_COLORS))
+    .join('option')
+    .attr('value', d => d)
+    .text(d => d.toUpperCase());
+  flagModelSelect.property('value', 'gfs');
+  flagModelSelect.on('change', loadFlagPredictionChart);
+  d3.select('#flag-prediction-hours-select').on('change', loadFlagPredictionChart);
+
+  const windModelSelect = d3.select('#wind-prediction-model-select');
+  windModelSelect.selectAll('option')
+    .data(Object.keys(MODEL_COLORS))
+    .join('option')
+    .attr('value', d => d)
+    .text(d => d.toUpperCase());
+  windModelSelect.property('value', 'gfs');
+  windModelSelect.on('change', loadWindPredictionChart);
+  d3.select('#wind-prediction-hours-select').on('change', loadWindPredictionChart);
+
+  // Wind Rose panel: model select has an extra "Observed only" option
+  // (empty value) since the comparison model is optional.
+  const roseModelSelect = d3.select('#wind-rose-model-select');
+  roseModelSelect.selectAll('option.model-option')
+    .data(Object.keys(MODEL_COLORS))
+    .join('option')
+    .attr('class', 'model-option')
+    .attr('value', d => d)
+    .text(d => d.toUpperCase());
+  roseModelSelect.on('change', loadWindRoseChart);
+  d3.select('#wind-rose-hours-select').on('change', loadWindRoseChart);
+
+  d3.select('#gust-factor-hours-select').on('change', loadGustFactorChart);
+
+  updatePredictionPanelVisibility();
+
+  refreshVariableOptions();
+  await refreshAll();
+  // Independent panels, not part of refreshAll's location/variable-driven
+  // set -- only load whichever one is actually visible for this location.
+  if (state.location === 'cbi_dockhouse') {
+    await loadFlagPredictionChart();
+  } else {
+    await Promise.all([
+      loadWindPredictionChart(),
+      loadWindRoseChart(),
+      loadGustFactorChart(),
+    ]);
+  }
+}
+
+// CBI is the only location with flag data (no wind sensor of its own);
+// every other location has real wind observations instead. Exactly one
+// of these two panels is ever shown at a time. Wind Rose + Gust Factor
+// are ALSO only meaningful at locations with real wind sensors (same
+// condition as Wind Prediction) -- per user 2026-09-11 ("only on places
+// with observed wind data").
+function updatePredictionPanelVisibility() {
+  const isCbi = state.location === 'cbi_dockhouse';
+  d3.select('#flag-prediction-panel').attr('hidden', isCbi ? null : true);
+  d3.select('#wind-prediction-panel').attr('hidden', isCbi ? true : null);
+  d3.select('#wind-rose-panel').attr('hidden', isCbi ? true : null);
+  d3.select('#gust-factor-panel').attr('hidden', isCbi ? true : null);
+}
+
+function allVariablesUnion() {
+  const s = new Set();
+  Object.values(state.accuracyVarsByLocation).forEach(set => set.forEach(v => s.add(v)));
+  // Always ensure the two required variables are present as options even
+  // if a given location has no accuracy rows yet for them.
+  s.add('wind_speed_kt');
+  s.add('wind_gust_kt');
+  return Array.from(s);
+}
+
+function refreshVariableOptions() {
+  const varSelect = d3.select('#variable-select');
+  const vars = allVariablesUnion().sort();
+  const current = state.variable;
+
+  varSelect.selectAll('option')
+    .data(vars)
+    .join('option')
+    .attr('value', d => d)
+    .text(d => fmtVarLabel(d));
+
+  if (vars.includes(current)) {
+    varSelect.property('value', current);
+  } else {
+    state.variable = vars[0];
+    varSelect.property('value', state.variable);
+  }
+
+  varSelect.on('change', function () {
+    state.variable = this.value;
+    refreshAll();
+  });
+}
+
+async function refreshAll() {
+  await Promise.all([
+    loadCurrentConditions(),
+    loadAccuracyChart(),
+    loadForecastChart(),
+  ]);
+  // Clear stale convergence view on location/variable change
+  d3.select('#convergence-chart').selectAll('*').remove();
+  d3.select('#convergence-empty')
+    .attr('hidden', null)
+    .text('Pick a target time above, or click a point on the forecast chart.');
+}
+
+// ---------------------------------------------------------------------------
+// Current conditions panel
+// ---------------------------------------------------------------------------
+
+function ageString(isoTs) {
+  const then = new Date(isoTs + 'Z'); // ts_utc has no offset suffix from the API
+  const diffMs = Date.now() - then.getTime();
+  const mins = Math.round(diffMs / 60000);
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.round(mins / 60);
+  if (hrs < 48) return `${hrs}h ago`;
+  return `${Math.round(hrs / 24)}d ago`;
+}
+
+async function loadCurrentConditions() {
+  const [conditions, flags] = await Promise.all([
+    fetchJSON('/api/current-conditions'),
+    fetchJSON('/api/flags-latest'),
+  ]);
+
+  const byLocation = d3.group(conditions, d => d.location_id);
+  const grid = d3.select('#conditions-grid');
+
+  const cards = grid.selectAll('.condition-card')
+    .data(state.locations, d => d.location_id)
+    .join('div')
+    .attr('class', 'condition-card');
+
+  cards.each(function (loc) {
+    const rows = (byLocation.get(loc.location_id) || [])
+      .slice()
+      .sort((a, b) => a.variable.localeCompare(b.variable));
+    const card = d3.select(this);
+    card.selectAll('*').remove();
+    card.append('h3').text(loc.name);
+    if (rows.length === 0) {
+      card.append('div').attr('class', 'condition-age').text('No observations yet.');
+      return;
+    }
+    let latestTs = rows[0].ts_utc;
+    rows.forEach(r => {
+      if (r.ts_utc > latestTs) latestTs = r.ts_utc;
+      const row = card.append('div').attr('class', 'condition-row');
+      row.append('span').text(fmtVarLabel(r.variable));
+      row.append('span').attr('class', 'val').text(
+        typeof r.value === 'number' ? r.value.toFixed(2) : r.value
+      );
+    });
+    card.append('div').attr('class', 'condition-age').text(`updated ${ageString(latestTs)}`);
+  });
+
+  const flagsRow = d3.select('#flags-row');
+  flagsRow.selectAll('*').remove();
+  flags.forEach(f => {
+    const loc = state.locations.find(l => l.location_id === f.location_id);
+    const badge = flagsRow.append('span')
+      .attr('class', 'flag-badge')
+      .style('background', FLAG_COLORS[f.flag_color] || '#555')
+      .text(`${loc ? loc.name : f.location_id}: ${f.flag_color.toUpperCase()} flag (${ageString(f.ts_utc)})`);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Accuracy chart: grouped bar chart, one group per lead bucket, one bar per model
+// ---------------------------------------------------------------------------
+
+async function loadAccuracyChart() {
+  const data = await fetchJSON(`/api/accuracy?location=${state.location}&variable=${state.variable}`);
+  const container = d3.select('#accuracy-chart');
+  container.selectAll('*').remove();
+  d3.select('#accuracy-empty').attr('hidden', data.length ? true : null);
+  if (!data.length) return;
+
+  const buckets = LEAD_BUCKET_ORDER.filter(b => data.some(d => d.lead_bucket === b));
+  const models = Array.from(new Set(data.map(d => d.model))).sort();
+
+  const width = Math.min(900, container.node().clientWidth || 900);
+  const height = 320;
+  const margin = { top: 20, right: 20, bottom: 55, left: 55 };
+
+  const svg = container.append('svg')
+    .attr('width', width)
+    .attr('height', height);
+
+  const x0 = d3.scaleBand().domain(buckets).range([margin.left, width - margin.right]).padding(0.25);
+  const x1 = d3.scaleBand().domain(models).range([0, x0.bandwidth()]).padding(0.1);
+  const y = d3.scaleLinear()
+    .domain([0, d3.max(data, d => d.mae) * 1.15 || 1])
+    .nice()
+    .range([height - margin.bottom, margin.top]);
+
+  // gridlines
+  svg.append('g')
+    .selectAll('line')
+    .data(y.ticks(5))
+    .join('line')
+    .attr('class', 'grid-line')
+    .attr('x1', margin.left).attr('x2', width - margin.right)
+    .attr('y1', d => y(d)).attr('y2', d => y(d));
+
+  svg.append('g')
+    .attr('class', 'axis')
+    .attr('transform', `translate(0,${height - margin.bottom})`)
+    .call(d3.axisBottom(x0))
+    .selectAll('text')
+    .attr('transform', 'rotate(-25)')
+    .style('text-anchor', 'end');
+
+  svg.append('g')
+    .attr('class', 'axis')
+    .attr('transform', `translate(${margin.left},0)`)
+    .call(d3.axisLeft(y).ticks(5));
+
+  svg.append('text')
+    .attr('x', -height / 2).attr('y', 16)
+    .attr('transform', 'rotate(-90)')
+    .attr('text-anchor', 'middle')
+    .attr('fill', 'var(--muted)')
+    .attr('font-size', '0.75rem')
+    .text('MAE');
+
+  const tooltip = d3.select('body').append('div').attr('class', 'bar-tooltip');
+
+  const byBucket = d3.group(data, d => d.lead_bucket);
+
+  const bucketGroups = svg.append('g')
+    .selectAll('g')
+    .data(buckets)
+    .join('g')
+    .attr('transform', b => `translate(${x0(b)},0)`);
+
+  bucketGroups.selectAll('rect')
+    .data(bucket => models.map(m => {
+      const row = (byBucket.get(bucket) || []).find(d => d.model === m);
+      return row ? { ...row } : { model: m, lead_bucket: bucket, mae: 0, rmse: 0, n: 0, missing: true };
+    }))
+    .join('rect')
+    .attr('x', d => x1(d.model))
+    .attr('width', x1.bandwidth())
+    .attr('y', d => d.missing ? y(0) : y(d.mae))
+    .attr('height', d => d.missing ? 0 : y(0) - y(d.mae))
+    .attr('fill', d => MODEL_COLORS[d.model] || '#888')
+    .attr('opacity', d => d.missing ? 0.15 : 0.9)
+    .on('mousemove', (event, d) => {
+      if (d.missing) return;
+      tooltip.style('opacity', 1)
+        .html(`<b>${d.model.toUpperCase()}</b> · ${d.lead_bucket}<br>MAE: ${d.mae}<br>RMSE: ${d.rmse}<br>n=${d.n}`)
+        .style('left', (event.pageX + 12) + 'px')
+        .style('top', (event.pageY - 10) + 'px');
+    })
+    .on('mouseleave', () => tooltip.style('opacity', 0));
+
+  // legend
+  const legend = container.insert('div', 'svg').attr('class', 'legend');
+  models.forEach(m => {
+    const item = legend.append('div').attr('class', 'legend-item');
+    item.append('span').attr('class', 'legend-swatch').style('background', MODEL_COLORS[m] || '#888');
+    item.append('span').text(m.toUpperCase());
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Forecast time-series chart: one line per model, latest run, optional obs overlay
+// ---------------------------------------------------------------------------
+
+let forecastXScale = null;
+
+async function loadForecastChart() {
+  const hours = state.hours;
+  const pastHours = state.pastHours;
+  // Observation overlay window: strictly follows "Also show past". If
+  // it's OFF (0), show ZERO trailing observation history -- previously
+  // this fell back to a 6h "recent context" default even when Off,
+  // which visibly contradicted what "Off" should mean (user-reported
+  // 2026-09-10/11: "forecast show past Off doesnt work, i can always
+  // see some history"). Off now genuinely means no observed overlay at
+  // all; only current-conditions data (shown elsewhere on the page)
+  // reflects "right now" when past-hours is Off.
+  const obsHours = pastHours;
+  const showFlagBands = state.location === 'cbi_dockhouse'; // only CBI has flag data
+  // Flag history window follows ONLY "Also show past" (obsHours), not
+  // the forward-looking forecast window (`hours`) at all. Previously
+  // used Math.max(hours, obsHours), which meant a large forward window
+  // (e.g. "Next 14 days" = 336h) forced the flag lookback to 336h too,
+  // showing flag data from "since the beginning," far past what the
+  // past-hours selector actually asked for (user-reported 2026-09-11:
+  // "the flag is still showing since beginning of data, not for the
+  // time period I want"). Flags have no future data anyway, so there
+  // was never a reason to couple this to the forward-looking `hours`.
+  let [forecast, obs, flagHistory] = await Promise.all([
+    fetchJSON(`/api/forecast?location=${state.location}&variable=${state.variable}&hours=${hours}&past_hours=${pastHours}`),
+    obsHours > 0
+      ? fetchJSON(`/api/observations?location=${state.location}&variable=${state.variable}&hours=${obsHours}`)
+      : Promise.resolve([]), // Off (0) means genuinely no observed overlay, not "hours=0" API edge case
+    showFlagBands
+      ? fetchJSON(`/api/flags-history?location=${state.location}&hours=${obsHours}`)
+      : Promise.resolve([]),
+  ]);
+
+  const container = d3.select('#forecast-chart');
+  container.selectAll('*').remove();
+  d3.select('#forecast-empty').attr('hidden', forecast.length ? true : null);
+  if (!forecast.length) { forecastXScale = null; return; }
+
+  forecast.forEach(d => { d.valid_time_utc_date = new Date(d.valid_time_utc + 'Z'); });
+  obs.forEach(d => { d.ts_utc_date = new Date(d.ts_utc + 'Z'); });
+  flagHistory.forEach(d => { d.ts_utc_date = new Date(d.ts_utc + 'Z'); });
+
+  // X-axis domain: computed EXPLICITLY from the selected forward/backward
+  // windows (now +/- hours), not derived from d3.extent() of whatever
+  // dates happen to be present in forecast+obs+flagHistory combined.
+  // Previously combining all three data sources' actual dates into one
+  // extent() meant the domain's min/max silently depended on which
+  // series happened to have the widest real data, decoupled from what
+  // the user actually selected in the Window/Also-show-past controls --
+  // this is also what let the flag strip's window drift out of sync
+  // (user-reported 2026-09-11: "separate in code the minimum date and
+  // maximum date and don't combine the forward and backward windows").
+  // minDate is exactly "now - pastHours" (or "now" if Off); maxDate is
+  // exactly "now + hours" -- both independent, neither derived from the
+  // other or from any dataset's actual contents.
+  const nowForDomain = new Date();
+  const minDate = new Date(nowForDomain.getTime() - pastHours * 3600000);
+  const maxDate = new Date(nowForDomain.getTime() + hours * 3600000);
+
+  // Clip observed/forecast/flag points to exactly [minDate, maxDate]
+  // BEFORE grouping by model -- this must happen before `byModel`/
+  // `models` are built below (a model whose latest run's own past-data
+  // window only reaches back e.g. 48h, while the user selected "Last 7
+  // days," has no reason to have points outside its own real data, but
+  // when it DOES have a point just past minDate due to how each model's
+  // backfill window is computed server-side, that stray point was still
+  // being drawn -- filtering only happened later on a variable that
+  // `byModel`/the actual <path>/<circle> rendering never used, since it
+  // read from the ORIGINAL unfiltered array. This caused model lines to
+  // visibly extend past the chart's own plotted x-range (user-reported
+  // 2026-09-11: "models breaking chart bounds because they are limited
+  // to the min backwards window"). Filtering here, before any grouping,
+  // guarantees every rendered point is truly within the chart's exact
+  // window.
+  obs = obs.filter(d => d.ts_utc_date >= minDate && d.ts_utc_date <= maxDate);
+  forecast = forecast.filter(d => d.valid_time_utc_date >= minDate && d.valid_time_utc_date <= maxDate);
+  flagHistory = flagHistory.filter(d => d.ts_utc_date >= minDate && d.ts_utc_date <= maxDate);
+
+  const models = Array.from(new Set(forecast.map(d => d.model))).sort();
+  const byModel = d3.group(forecast, d => d.model);
+
+  const width = Math.min(900, container.node().clientWidth || 900);
+  const flagStripSpace = showFlagBands ? 22 : 0; // extra room below the axis for the flag strip + its own label
+  const height = 340 + flagStripSpace;
+  const margin = { top: 20, right: 20, bottom: 95 + flagStripSpace, left: 55 };
+
+  const x = d3.scaleTime()
+    .domain([minDate, maxDate])
+    .range([margin.left, width - margin.right]);
+  forecastXScale = x;
+
+  // Y-axis domain only considers currently-VISIBLE series (respecting
+  // hiddenModels) so toggling a model off via the legend rescales the
+  // chart sensibly around what's actually shown, instead of leaving
+  // dead space sized for a hidden series' range.
+  const visibleForecast = forecast.filter(d => !state.hiddenModels.has(d.model));
+  const visibleObs = state.hiddenModels.has('observed') ? [] : obs;
+  const allValues = visibleForecast.map(d => d.value).concat(visibleObs.map(d => d.value)).filter(v => v != null);
+  const y = d3.scaleLinear()
+    .domain([d3.min(allValues) * (d3.min(allValues) < 0 ? 1.1 : 0.9), d3.max(allValues) * 1.1])
+    .nice()
+    .range([height - margin.bottom, margin.top]);
+
+  const svg = container.append('svg').attr('width', width).attr('height', height);
+
+  // Flag-color strip (CBI only): each flag reading is a point in time,
+  // extended as a colored segment until the next reading (or the
+  // chart's right edge for the last one). Rendered as a thick line
+  // hugging the x-axis rather than a full-height background wash --
+  // reads more like a discrete status timeline than a shaded region.
+  if (flagHistory.length) {
+    const flagBandTooltip = d3.select('body').selectAll('.flag-band-tooltip').data([0]).join('div').attr('class', 'point-tooltip');
+    // Simple "carry forward last known value" band: each reading's color
+    // extends until the next reading (or the chart's right edge for the
+    // last one). No uncertainty/gap-dimming concept -- per explicit user
+    // direction 2026-09-11 ("remove the uncertainty concept and just
+    // fill in with the last data known for past data"), a missed poll
+    // just means the last known flag color is assumed to have persisted,
+    // same as any other "last observation carried forward" series on
+    // this dashboard.
+    const bands = flagHistory.map((d, i) => {
+      const next = flagHistory[i + 1];
+      const end = next ? next.ts_utc_date : new Date(x.domain()[1]);
+      return { color: d.flag_color, start: d.ts_utc_date, end };
+    });
+    const flagStripY = height - 10; // in the extra bottom space, below the rotated axis tick labels
+    svg.append('text')
+      .attr('x', margin.left - 6).attr('y', flagStripY + 3)
+      .attr('text-anchor', 'end')
+      .attr('fill', 'var(--muted)')
+      .attr('font-size', '0.68rem')
+      .text('Flag');
+    svg.append('g')
+      .attr('class', 'flag-strip')
+      .selectAll('line')
+      .data(bands)
+      .join('line')
+      .attr('x1', d => x(d.start))
+      .attr('x2', d => Math.max(x(d.start), x(d.end)))
+      .attr('y1', flagStripY)
+      .attr('y2', flagStripY)
+      .attr('stroke', d => FLAG_COLORS[d.color] || '#888')
+      .attr('stroke-width', 8)
+      .attr('stroke-linecap', 'butt')
+      .style('cursor', 'default')
+      .on('mousemove', (event, d) => {
+        flagBandTooltip.style('opacity', 1)
+          .html(`<b>${d.color.toUpperCase()} flag</b><br>${d.start.toISOString().slice(0, 16).replace('T', ' ')} UTC onward`)
+          .style('left', (event.pageX + 12) + 'px')
+          .style('top', (event.pageY - 10) + 'px');
+      })
+      .on('mouseleave', () => flagBandTooltip.style('opacity', 0));
+  }
+
+  svg.append('g')
+    .selectAll('line')
+    .data(y.ticks(5))
+    .join('line')
+    .attr('class', 'grid-line')
+    .attr('x1', margin.left).attr('x2', width - margin.right)
+    .attr('y1', d => y(d)).attr('y2', d => y(d));
+
+  // "Right now" vertical marker -- a static reference line so it's easy
+  // to see at a glance which points are past/observed vs. future/
+  // forecast, without having to read the axis labels' relative offsets.
+  // Drawn early (in the background, before the data lines) so it never
+  // visually competes with them.
+  const nowDate = new Date();
+  if (nowDate >= x.domain()[0] && nowDate <= x.domain()[1]) {
+    svg.append('line')
+      .attr('class', 'now-line')
+      .attr('x1', x(nowDate)).attr('x2', x(nowDate))
+      .attr('y1', margin.top).attr('y2', height - margin.bottom)
+      .attr('stroke', 'var(--muted)')
+      .attr('stroke-width', 1)
+      .attr('stroke-dasharray', '2,2')
+      .attr('opacity', 0.5);
+    svg.append('text')
+      .attr('x', x(nowDate) + 4).attr('y', margin.top + 10)
+      .attr('fill', 'var(--muted)')
+      .attr('font-size', '0.68rem')
+      .text('now');
+  }
+
+
+  // X-axis tick format: previously "%m/%d %Hh" (e.g. "09/09 06h") was
+  // ambiguous about which day/year and gave no sense of "how far from
+  // now" at a glance -- replaced with an absolute timestamp plus a
+  // relative offset from the current moment, e.g.
+  // "2026-09-09 15:30 (-3h)" / "2026-09-11 09:00 (+41h)".
+  function formatAxisTick(d) {
+    const pad = n => String(n).padStart(2, '0');
+    const abs = `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
+    const diffHours = Math.round((d.getTime() - Date.now()) / 3600000);
+    const sign = diffHours >= 0 ? '+' : '';
+    return `${abs} (${sign}${diffHours}h)`;
+  }
+
+  svg.append('g')
+    .attr('class', 'axis')
+    .attr('transform', `translate(0,${height - margin.bottom})`)
+    .call(d3.axisBottom(x).ticks(Math.min(8, (hours + pastHours) / 12)).tickFormat(formatAxisTick))
+    .selectAll('text')
+    .attr('transform', 'rotate(-45)')
+    .style('text-anchor', 'end');
+
+  svg.append('g')
+    .attr('class', 'axis')
+    .attr('transform', `translate(${margin.left},0)`)
+    .call(d3.axisLeft(y).ticks(6));
+
+  const line = d3.line()
+    .x(d => x(d.valid_time_utc_date))
+    .y(d => y(d.value))
+    .defined(d => d.value != null);
+
+  // Hover-to-highlight: when overlapping lines make it hard to tell which
+  // model is which, hovering a line (or its legend swatch) bolds that
+  // model's line/points and dims the rest instead of leaving everything
+  // at equal visual weight.
+  function setHighlight(hoveredModel) {
+    svg.selectAll('.model-line')
+      .attr('stroke-width', d => d === hoveredModel ? 4 : 2)
+      .attr('opacity', d => !hoveredModel || d === hoveredModel ? 1 : 0.25);
+    svg.selectAll('.model-dot')
+      .attr('opacity', d => !hoveredModel || d.__model === hoveredModel ? 1 : 0.2);
+  }
+
+  models.forEach(m => {
+    if (state.hiddenModels.has(m)) return; // toggled off via legend click
+    const series = (byModel.get(m) || []).slice().sort((a, b) => a.valid_time_utc_date - b.valid_time_utc_date);
+    svg.append('path')
+      .datum(m)
+      .attr('class', 'model-line')
+      .attr('fill', 'none')
+      .attr('stroke', MODEL_COLORS[m] || '#888')
+      .attr('stroke-width', 2)
+      .attr('d', () => line(series))
+      .style('cursor', 'pointer')
+      .on('mouseenter', () => setHighlight(m))
+      .on('mouseleave', () => setHighlight(null));
+
+    const tooltip = d3.select('body').selectAll('.point-tooltip').data([0]).join('div').attr('class', 'point-tooltip');
+
+    series.forEach(d => { d.__model = m; });
+    svg.append('g')
+      .selectAll('circle')
+      .data(series)
+      .join('circle')
+      .attr('class', 'model-dot')
+      .attr('cx', d => x(d.valid_time_utc_date))
+      .attr('cy', d => y(d.value))
+      .attr('r', 3)
+      .attr('fill', MODEL_COLORS[m] || '#888')
+      .style('cursor', 'pointer')
+      .on('mouseenter', () => setHighlight(m))
+      .on('mousemove', (event, d) => {
+        tooltip.style('opacity', 1)
+          .html(`<b>${m.toUpperCase()}</b><br>${d.valid_time_utc}<br>value: ${d.value}<br><i>click to see convergence</i>`)
+          .style('left', (event.pageX + 12) + 'px')
+          .style('top', (event.pageY - 10) + 'px');
+      })
+      .on('mouseleave', () => { tooltip.style('opacity', 0); setHighlight(null); })
+      .on('click', (event, d) => {
+        const localVal = toDatetimeLocalValue(d.valid_time_utc_date);
+        d3.select('#target-time-input').property('value', localVal);
+        loadConvergenceChart(d.valid_time_utc);
+      });
+  });
+
+  // observation overlay (dashed grey line + dots), participates in the
+  // same hover-to-highlight system as the model lines -- previously had
+  // no interactive elements at all, so hovering it (or its legend entry)
+  // did nothing.
+  const OBS_KEY = 'observed';
+  if (obs.length && !state.hiddenModels.has(OBS_KEY)) {
+    const obsLine = d3.line()
+      .x(d => x(d.ts_utc_date))
+      .y(d => y(d.value))
+      .defined(d => d.value != null);
+    svg.append('path')
+      .datum(OBS_KEY)
+      .attr('class', 'model-line')
+      .attr('fill', 'none')
+      .attr('stroke', '#9aa5ab')
+      .attr('stroke-width', 1.5)
+      .attr('stroke-dasharray', '4,3')
+      .attr('d', () => obsLine(obs))
+      .style('cursor', 'pointer')
+      .on('mouseenter', () => setHighlight(OBS_KEY))
+      .on('mouseleave', () => setHighlight(null));
+
+    const obsTooltip = d3.select('body').selectAll('.obs-tooltip').data([0]).join('div').attr('class', 'point-tooltip');
+    obs.forEach(d => { d.__model = OBS_KEY; });
+    svg.append('g')
+      .selectAll('circle')
+      .data(obs.filter(d => d.value != null))
+      .join('circle')
+      .attr('class', 'model-dot')
+      .attr('cx', d => x(d.ts_utc_date))
+      .attr('cy', d => y(d.value))
+      .attr('r', 2.5)
+      .attr('fill', '#9aa5ab')
+      .style('cursor', 'pointer')
+      .on('mouseenter', () => setHighlight(OBS_KEY))
+      .on('mousemove', (event, d) => {
+        obsTooltip.style('opacity', 1)
+          .html(`<b>Observed</b><br>${d.ts_utc}<br>value: ${d.value}`)
+          .style('left', (event.pageX + 12) + 'px')
+          .style('top', (event.pageY - 10) + 'px');
+      })
+      .on('mouseleave', () => { obsTooltip.style('opacity', 0); setHighlight(null); });
+  }
+
+  // Legend: hover-to-highlight (existing behavior) PLUS click-to-toggle
+  // visibility of that model's line/dots entirely. A toggled-off item
+  // gets a dimmed/struck-through look so it's clear it's disabled, not
+  // just unhighlighted.
+  function toggleModel(key) {
+    if (state.hiddenModels.has(key)) {
+      state.hiddenModels.delete(key);
+    } else {
+      state.hiddenModels.add(key);
+    }
+    loadForecastChart(); // re-render with the updated visibility set
+  }
+
+  const legend = container.insert('div', 'svg').attr('class', 'legend');
+  models.forEach(m => {
+    const item = legend.append('div').attr('class', 'legend-item')
+      .classed('legend-disabled', state.hiddenModels.has(m))
+      .style('cursor', 'pointer')
+      .on('mouseenter', () => setHighlight(m))
+      .on('mouseleave', () => setHighlight(null))
+      .on('click', () => toggleModel(m));
+    item.append('span').attr('class', 'legend-swatch').style('background', MODEL_COLORS[m] || '#888');
+    item.append('span').text(m.toUpperCase());
+  });
+  if (obs.length) {
+    const item = legend.append('div').attr('class', 'legend-item')
+      .classed('legend-disabled', state.hiddenModels.has(OBS_KEY))
+      .style('cursor', 'pointer')
+      .on('mouseenter', () => setHighlight(OBS_KEY))
+      .on('mouseleave', () => setHighlight(null))
+      .on('click', () => toggleModel(OBS_KEY));
+    item.append('span').attr('class', 'legend-swatch').style('background', '#9aa5ab');
+    item.append('span').text('Observed');
+  }
+
+  if (flagHistory.length) {
+    const seen = new Set(flagHistory.map(d => d.flag_color));
+    Array.from(seen).sort().forEach(color => {
+      const item = legend.append('div').attr('class', 'legend-item');
+      item.append('span').attr('class', 'legend-swatch')
+        .style('background', FLAG_COLORS[color] || '#888');
+      item.append('span').text(`${color.toUpperCase()} flag`);
+    });
+  }
+}
+
+function toDatetimeLocalValue(date) {
+  // datetime-local input wants local time w/o timezone; we keep everything
+  // UTC-labeled so just format the UTC components directly.
+  const pad = n => String(n).padStart(2, '0');
+  return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())}T${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}`;
+}
+
+// ---------------------------------------------------------------------------
+// Forecast convergence chart: for one fixed valid_time, how did each model's
+// prediction change across successive init runs?
+// ---------------------------------------------------------------------------
+
+// Guards against a real race condition (user-reported 2026-09-11: "select
+// a date once, then the bottom graph won't change again when I click on
+// other nodes"): loadConvergenceChart does two sequential awaited
+// fetches, so clicking a second point before the first click's fetches
+// resolve starts a second, overlapping invocation. Whichever finishes
+// LAST wins the DOM update -- not necessarily the most recent click's
+// target -- so a click could appear to silently do nothing (the older,
+// slower request clobbered it right after). Each invocation gets a
+// unique token; if a newer invocation has started by the time an older
+// one's fetches resolve, the older one bails out before touching the DOM.
+let convergenceRequestToken = 0;
+
+async function loadConvergenceChart(targetIso) {
+  const myToken = ++convergenceRequestToken;
+  // targetIso may come from a datetime-local input (no seconds/zone) or an
+  // ISO string already; normalize to "YYYY-MM-DD HH:MM:SS" for the API.
+  let target = targetIso;
+  if (target.length === 16) target += ':00'; // from <input type=datetime-local>
+  target = target.replace('T', ' ');
+  const targetDate = new Date(target.replace(' ', 'T') + 'Z');
+
+  const data = await fetchJSON(`/api/forecast-convergence?location=${state.location}&variable=${state.variable}&target=${encodeURIComponent(target)}`);
+  // Real "what actually happened" value at the target time, if we have
+  // an observation close enough to it -- was previously entirely
+  // missing from this chart (user-reported 2026-09-11: "doesnt seem to
+  // always include the observable data when available in the past").
+  const observedAtTarget = await fetchJSON(`/api/observation-near?location=${state.location}&variable=${state.variable}&target=${encodeURIComponent(target)}`);
+  // A newer click started (and possibly already finished) while these
+  // fetches were in flight -- abandon this stale invocation instead of
+  // overwriting whatever the newer one already rendered (or is about to).
+  if (myToken !== convergenceRequestToken) return;
+
+  const container = d3.select('#convergence-chart');
+  container.selectAll('*').remove();
+  const empty = d3.select('#convergence-empty');
+
+  if (!data.length) {
+    empty.attr('hidden', null).text(`No forecast runs found targeting ${target} UTC for this location/variable.`);
+    return;
+  }
+  empty.attr('hidden', true);
+
+  data.forEach(d => {
+    d.init_time_utc_date = new Date(d.init_time_utc + 'Z');
+    // Hours BEFORE the target valid time that this run was issued --
+    // e.g. a run issued 72h before the target has lead_hours=72. This is
+    // the "how far in advance was this prediction made" axis the user
+    // wants: far-in-advance runs on the left, the target moment (0h) on
+    // the right, so you can watch predictions start scattered and
+    // (ideally) converge toward the truth as the target approaches.
+    d.lead_hours = (targetDate.getTime() - d.init_time_utc_date.getTime()) / 3600000;
+  });
+  const models = Array.from(new Set(data.map(d => d.model))).sort();
+  const byModel = d3.group(data, d => d.model);
+
+  const width = Math.min(900, container.node().clientWidth || 900);
+  const height = 300;
+  const margin = { top: 20, right: 20, bottom: 70, left: 60 };
+
+  // Reversed domain: largest lead_hours (furthest from target) maps to
+  // the left edge, 0 (the target time itself) maps to the right edge.
+  const maxLead = d3.max(data, d => d.lead_hours);
+  const x = d3.scaleLinear()
+    .domain([maxLead, 0])
+    .range([margin.left, width - margin.right]);
+  const allValuesForY = data.map(d => d.value).concat(observedAtTarget ? [observedAtTarget.value] : []);
+  const y = d3.scaleLinear()
+    .domain(d3.extent(allValuesForY)).nice()
+    .range([height - margin.bottom, margin.top]);
+
+  const svg = container.append('svg').attr('width', width).attr('height', height);
+
+  // gridlines (matches the styling of the other two charts, was missing here)
+  svg.append('g')
+    .selectAll('line')
+    .data(y.ticks(6))
+    .join('line')
+    .attr('class', 'grid-line')
+    .attr('x1', margin.left).attr('x2', width - margin.right)
+    .attr('y1', d => y(d)).attr('y2', d => y(d));
+
+  svg.append('g')
+    .attr('class', 'axis')
+    .attr('transform', `translate(0,${height - margin.bottom})`)
+    .call(d3.axisBottom(x).ticks(Math.min(12, data.length)).tickFormat(d => `${Math.round(d)}h`))
+    .selectAll('text')
+    .attr('transform', 'rotate(-35)')
+    .style('text-anchor', 'end');
+
+  svg.append('g')
+    .attr('class', 'axis')
+    .attr('transform', `translate(${margin.left},0)`)
+    .call(d3.axisLeft(y).ticks(6));
+
+  // y-axis label (was entirely missing -- this is what made the chart
+  // "make no sense": no way to tell what the numbers/axis represented)
+  svg.append('text')
+    .attr('x', -height / 2).attr('y', 14)
+    .attr('transform', 'rotate(-90)')
+    .attr('text-anchor', 'middle')
+    .attr('fill', 'var(--muted)')
+    .attr('font-size', '0.75rem')
+    .text(fmtVarLabel(state.variable));
+
+  svg.append('text')
+    .attr('x', width / 2).attr('y', height - 6)
+    .attr('text-anchor', 'middle')
+    .attr('fill', 'var(--muted)').attr('font-size', '0.72rem')
+    .text(`Hours before target time (target: ${target} UTC, at right edge = 0h)`);
+
+  const line = d3.line()
+    .x(d => x(d.lead_hours))
+    .y(d => y(d.value));
+
+  const tooltip = d3.select('body').selectAll('.convergence-tooltip').data([0]).join('div').attr('class', 'point-tooltip');
+
+  function setConvergenceHighlight(hoveredModel) {
+    svg.selectAll('.model-line')
+      .attr('stroke-width', d => d === hoveredModel ? 4 : 2)
+      .attr('opacity', d => !hoveredModel || d === hoveredModel ? 1 : 0.25);
+    svg.selectAll('.model-dot')
+      .attr('opacity', d => !hoveredModel || d.__model === hoveredModel ? 1 : 0.2);
+  }
+
+  models.forEach(m => {
+    const series = (byModel.get(m) || []).slice().sort((a, b) => b.lead_hours - a.lead_hours);
+    series.forEach(d => { d.__model = m; });
+    svg.append('path')
+      .datum(m)
+      .attr('class', 'model-line')
+      .attr('fill', 'none')
+      .attr('stroke', MODEL_COLORS[m] || '#888')
+      .attr('stroke-width', 2)
+      .attr('d', () => line(series))
+      .style('cursor', 'pointer')
+      .on('mouseenter', () => setConvergenceHighlight(m))
+      .on('mouseleave', () => setConvergenceHighlight(null));
+    svg.append('g')
+      .selectAll('circle')
+      .data(series)
+      .join('circle')
+      .attr('class', 'model-dot')
+      .attr('cx', d => x(d.lead_hours))
+      .attr('cy', d => y(d.value))
+      .attr('r', 4)
+      .attr('fill', MODEL_COLORS[m] || '#888')
+      .style('cursor', 'pointer')
+      .on('mouseenter', () => setConvergenceHighlight(m))
+      .on('mousemove', (event, d) => {
+        tooltip.style('opacity', 1)
+          .html(`<b>${m.toUpperCase()}</b><br>${Math.round(d.lead_hours)}h before target<br>run init: ${d.init_time_utc}<br>${fmtVarLabel(state.variable)}: ${d.value}`)
+          .style('left', (event.pageX + 12) + 'px')
+          .style('top', (event.pageY - 10) + 'px');
+      })
+      .on('mouseleave', () => { tooltip.style('opacity', 0); setConvergenceHighlight(null); });
+  });
+
+  // "What actually happened" reference line -- a horizontal dashed line
+  // at the real observed value for this target time, if one exists
+  // within +/-7.5min (see api_observation_near). Lets you see at a
+  // glance how far off (or close) each model's converging predictions
+  // were from the truth, not just how they compared to EACH OTHER.
+  if (observedAtTarget) {
+    const obsY = y(observedAtTarget.value);
+    svg.append('line')
+      .attr('x1', margin.left).attr('x2', width - margin.right)
+      .attr('y1', obsY).attr('y2', obsY)
+      .attr('stroke', '#9aa5ab')
+      .attr('stroke-width', 1.5)
+      .attr('stroke-dasharray', '5,3')
+      .attr('opacity', 0.8);
+    svg.append('text')
+      .attr('x', width - margin.right - 4).attr('y', obsY - 5)
+      .attr('text-anchor', 'end')
+      .attr('fill', '#9aa5ab')
+      .attr('font-size', '0.7rem')
+      .text(`Observed: ${observedAtTarget.value}`);
+  }
+
+  const legend = container.insert('div', 'svg').attr('class', 'legend');
+  models.forEach(m => {
+    const item = legend.append('div').attr('class', 'legend-item')
+      .style('cursor', 'pointer')
+      .on('mouseenter', () => setConvergenceHighlight(m))
+      .on('mouseleave', () => setConvergenceHighlight(null));
+    item.append('span').attr('class', 'legend-swatch').style('background', MODEL_COLORS[m] || '#888');
+    item.append('span').text(m.toUpperCase());
+  });
+  if (observedAtTarget) {
+    const item = legend.append('div').attr('class', 'legend-item');
+    item.append('span').attr('class', 'legend-swatch').style('background', '#9aa5ab');
+    item.append('span').text(`Observed (${observedAtTarget.ts_utc})`);
+  } else {
+    const item = legend.append('div').attr('class', 'legend-item');
+    item.append('span').attr('class', 'legend-swatch').style('background', 'transparent');
+    item.append('span').attr('style', 'color:var(--muted); font-style:italic;')
+      .text('No observation within 7.5min of target time');
+  }
+}
+
+// ---------------------------------------------------------------------------
+// CBI Flag Prediction panel: Bayesian P(flag color | forecast wind) from one
+// selected model. SEPARATE from the Forecast/Accuracy/Convergence charts
+// above -- user explicit direction 2026-09-11: "do not ruin or mess up the
+// existing charts... I want additional overlay or a separate chart". This
+// panel answers "what flag color is likely at CBI at some future hour",
+// NOT a wind forecast itself -- backed by /api/flag-prediction, which pairs
+// the selected model's forecast wind with CBI's own historical wind-vs-flag
+// distribution (Bayesian posterior with Dirichlet smoothing, since the
+// training set of ~40 flag readings is small).
+// ---------------------------------------------------------------------------
+
+async function loadFlagPredictionChart() {
+  const model = d3.select('#flag-prediction-model-select').property('value');
+  const hours = +d3.select('#flag-prediction-hours-select').property('value');
+  if (!model) return;
+
+  const data = await fetchJSON(`/api/flag-prediction?model=${model}&hours=${hours}`);
+  const container = d3.select('#flag-prediction-chart');
+  container.selectAll('*').remove();
+  const empty = d3.select('#flag-prediction-empty');
+
+  if (data.error) {
+    empty.attr('hidden', null).text(data.error);
+    return;
+  }
+  if (!data.predictions || !data.predictions.length) {
+    empty.attr('hidden', null).text(`No forecast data yet for ${model.toUpperCase()} at CBI.`);
+    return;
+  }
+  empty.attr('hidden', true);
+
+  const predictions = data.predictions.filter(p => p.flag_probabilities);
+  predictions.forEach(p => { p.valid_time_utc_date = new Date(p.valid_time_utc + 'Z'); });
+
+  const width = Math.min(900, container.node().clientWidth || 900);
+  const height = 320;
+  const margin = { top: 20, right: 20, bottom: 70, left: 55 };
+
+  const x = d3.scaleBand()
+    .domain(predictions.map(p => p.valid_time_utc))
+    .range([margin.left, width - margin.right])
+    .padding(0.15);
+  const y = d3.scaleLinear().domain([0, 1]).range([height - margin.bottom, margin.top]);
+  const stackOrder = ['closed', 'red', 'yellow', 'green']; // most-restrictive at bottom
+  const stacked = d3.stack().keys(stackOrder).value((p, key) => p.flag_probabilities[key])(predictions);
+
+  const svg = container.append('svg').attr('width', width).attr('height', height);
+
+  svg.append('g')
+    .selectAll('line')
+    .data(y.ticks(5))
+    .join('line')
+    .attr('class', 'grid-line')
+    .attr('x1', margin.left).attr('x2', width - margin.right)
+    .attr('y1', d => y(d)).attr('y2', d => y(d));
+
+  const tooltip = d3.select('body').append('div').attr('class', 'bar-tooltip');
+
+  svg.append('g')
+    .selectAll('g')
+    .data(stacked)
+    .join('g')
+    .attr('fill', d => FLAG_COLORS[d.key] || '#888')
+    .selectAll('rect')
+    .data(d => d.map(seg => ({ ...seg, key: d.key })))
+    .join('rect')
+    .attr('x', (d, i) => x(predictions[i].valid_time_utc))
+    .attr('width', x.bandwidth())
+    .attr('y', d => y(d[1]))
+    .attr('height', d => y(d[0]) - y(d[1]))
+    .on('mousemove', (event, d) => {
+      const p = predictions.find(pr => pr.valid_time_utc === d.data.valid_time_utc);
+      tooltip.style('opacity', 1)
+        .html(`<b>${d.key.toUpperCase()}</b>: ${(p.flag_probabilities[d.key] * 100).toFixed(1)}%<br>` +
+              `${p.valid_time_utc.replace('T', ' ')} UTC<br>` +
+              `forecast wind: ${p.wind_kt != null ? p.wind_kt.toFixed(1) + ' kt' : 'n/a'} (${p.wind_bucket || 'n/a'})<br>` +
+              `<i>most likely: ${p.most_likely_flag ? p.most_likely_flag.toUpperCase() : 'n/a'}</i>`)
+        .style('left', (event.pageX + 12) + 'px')
+        .style('top', (event.pageY - 10) + 'px');
+    })
+    .on('mouseleave', () => tooltip.style('opacity', 0));
+
+  const tickEvery = Math.max(1, Math.ceil(predictions.length / 10));
+  svg.append('g')
+    .attr('class', 'axis')
+    .attr('transform', `translate(0,${height - margin.bottom})`)
+    .call(d3.axisBottom(x).tickValues(x.domain().filter((d, i) => i % tickEvery === 0))
+      .tickFormat(d => new Date(d + 'Z').toISOString().slice(5, 16).replace('T', ' ')))
+    .selectAll('text')
+    .attr('transform', 'rotate(-35)')
+    .style('text-anchor', 'end');
+
+  svg.append('g')
+    .attr('class', 'axis')
+    .attr('transform', `translate(${margin.left},0)`)
+    .call(d3.axisLeft(y).ticks(5).tickFormat(d3.format('.0%')));
+
+  svg.append('text')
+    .attr('x', -height / 2).attr('y', 16)
+    .attr('transform', 'rotate(-90)')
+    .attr('text-anchor', 'middle')
+    .attr('fill', 'var(--muted)')
+    .attr('font-size', '0.75rem')
+    .text('P(flag color)');
+
+  const legend = container.insert('div', 'svg').attr('class', 'legend');
+  stackOrder.forEach(c => {
+    const item = legend.append('div').attr('class', 'legend-item');
+    item.append('span').attr('class', 'legend-swatch').style('background', FLAG_COLORS[c] || '#888');
+    item.append('span').text(c.toUpperCase());
+  });
+  legend.append('div').attr('class', 'legend-item')
+    .attr('style', 'color:var(--muted); font-size:0.75rem;')
+    .text(`(trained on ${data.training_sample_size} historical flag readings)`);
+}
+
+// ---------------------------------------------------------------------------
+// Wind Prediction panel (all locations EXCEPT CBI -- CBI has no wind sensor
+// of its own, hence the separate Flag Prediction panel above): Bayesian
+// P(actual wind bucket | forecast wind), from one selected model. Mirrors
+// the Flag Prediction panel's stacked-probability-by-hour design, per user
+// direction 2026-09-11 ("show a very similar graph, but do wind prediction
+// instead"), backed by /api/wind-prediction.
+// ---------------------------------------------------------------------------
+
+function windBucketColorScale(buckets) {
+  // Ordered numeric buckets get a sequential color scale (unlike flag
+  // colors, which are fixed categorical values) -- low wind = cool color,
+  // high wind = warm color, consistent regardless of how many buckets a
+  // given location's training data happens to produce.
+  const n = Math.max(1, buckets.length - 1);
+  const scale = d3.scaleSequential(d3.interpolateYlOrRd).domain([0, n]);
+  const map = {};
+  buckets.forEach((b, i) => { map[b] = scale(i); });
+  return map;
+}
+
+async function loadWindPredictionChart() {
+  const model = d3.select('#wind-prediction-model-select').property('value');
+  const hours = +d3.select('#wind-prediction-hours-select').property('value');
+  if (!model || !state.location) return;
+
+  const data = await fetchJSON(`/api/wind-prediction?location=${state.location}&model=${model}&hours=${hours}`);
+  const container = d3.select('#wind-prediction-chart');
+  container.selectAll('*').remove();
+  const empty = d3.select('#wind-prediction-empty');
+
+  if (data.error) {
+    empty.attr('hidden', null).text(data.error);
+    return;
+  }
+  if (!data.predictions || !data.predictions.length || !data.actual_wind_buckets || !data.actual_wind_buckets.length) {
+    empty.attr('hidden', null).text(`No forecast/training data yet for ${model.toUpperCase()} at this location.`);
+    return;
+  }
+  empty.attr('hidden', true);
+
+  const predictions = data.predictions.filter(p => p.actual_wind_probabilities);
+  if (!predictions.length) {
+    empty.attr('hidden', null).text(`No forecast data yet for ${model.toUpperCase()} at this location.`);
+    return;
+  }
+
+  const buckets = data.actual_wind_buckets; // already sorted low->high by the backend
+  const bucketColors = windBucketColorScale(buckets);
+
+  const width = Math.min(900, container.node().clientWidth || 900);
+  const height = 320;
+  const margin = { top: 20, right: 20, bottom: 70, left: 55 };
+
+  const x = d3.scaleBand()
+    .domain(predictions.map(p => p.valid_time_utc))
+    .range([margin.left, width - margin.right])
+    .padding(0.15);
+  const y = d3.scaleLinear().domain([0, 1]).range([height - margin.bottom, margin.top]);
+  const stacked = d3.stack().keys(buckets).value((p, key) => p.actual_wind_probabilities[key] || 0)(predictions);
+
+  const svg = container.append('svg').attr('width', width).attr('height', height);
+
+  svg.append('g')
+    .selectAll('line')
+    .data(y.ticks(5))
+    .join('line')
+    .attr('class', 'grid-line')
+    .attr('x1', margin.left).attr('x2', width - margin.right)
+    .attr('y1', d => y(d)).attr('y2', d => y(d));
+
+  const tooltip = d3.select('body').append('div').attr('class', 'bar-tooltip');
+
+  svg.append('g')
+    .selectAll('g')
+    .data(stacked)
+    .join('g')
+    .attr('fill', d => bucketColors[d.key] || '#888')
+    .selectAll('rect')
+    .data(d => d.map(seg => ({ ...seg, key: d.key })))
+    .join('rect')
+    .attr('x', (d, i) => x(predictions[i].valid_time_utc))
+    .attr('width', x.bandwidth())
+    .attr('y', d => y(d[1]))
+    .attr('height', d => y(d[0]) - y(d[1]))
+    .on('mousemove', (event, d) => {
+      const p = predictions.find(pr => pr.valid_time_utc === d.data.valid_time_utc);
+      const prob = p.actual_wind_probabilities[d.key] || 0;
+      tooltip.style('opacity', 1)
+        .html(`<b>${d.key}</b>: ${(prob * 100).toFixed(1)}%<br>` +
+              `${p.valid_time_utc.replace('T', ' ')} UTC<br>` +
+              `model forecast: ${p.forecast_wind_kt != null ? p.forecast_wind_kt.toFixed(1) + ' kt' : 'n/a'} (${p.forecast_wind_bucket || 'n/a'})<br>` +
+              `<i>most likely actual: ${p.most_likely_actual_bucket || 'n/a'}</i>`)
+        .style('left', (event.pageX + 12) + 'px')
+        .style('top', (event.pageY - 10) + 'px');
+    })
+    .on('mouseleave', () => tooltip.style('opacity', 0));
+
+  const tickEvery = Math.max(1, Math.ceil(predictions.length / 10));
+  svg.append('g')
+    .attr('class', 'axis')
+    .attr('transform', `translate(0,${height - margin.bottom})`)
+    .call(d3.axisBottom(x).tickValues(x.domain().filter((d, i) => i % tickEvery === 0))
+      .tickFormat(d => new Date(d + 'Z').toISOString().slice(5, 16).replace('T', ' ')))
+    .selectAll('text')
+    .attr('transform', 'rotate(-35)')
+    .style('text-anchor', 'end');
+
+  svg.append('g')
+    .attr('class', 'axis')
+    .attr('transform', `translate(${margin.left},0)`)
+    .call(d3.axisLeft(y).ticks(5).tickFormat(d3.format('.0%')));
+
+  svg.append('text')
+    .attr('x', -height / 2).attr('y', 16)
+    .attr('transform', 'rotate(-90)')
+    .attr('text-anchor', 'middle')
+    .attr('fill', 'var(--muted)')
+    .attr('font-size', '0.75rem')
+    .text('P(actual wind bucket)');
+
+  const legend = container.insert('div', 'svg').attr('class', 'legend');
+  buckets.forEach(b => {
+    const item = legend.append('div').attr('class', 'legend-item');
+    item.append('span').attr('class', 'legend-swatch').style('background', bucketColors[b] || '#888');
+    item.append('span').text(b);
+  });
+  legend.append('div').attr('class', 'legend-item')
+    .attr('style', 'color:var(--muted); font-size:0.75rem;')
+    .text(`(trained on ${data.training_sample_size} historical forecast-vs-observed pairs)`);
+}
+
+// ---------------------------------------------------------------------------
+// Wind Rose panel: direction + speed frequency, observed vs. (optional)
+// forecast, for locations with real wind sensors. New chart category --
+// unlike everything else on this dashboard, this uses a polar/radial
+// layout instead of a time-series x-axis, since direction is inherently
+// circular. Renders TWO side-by-side radial charts when a comparison
+// model is selected (one arc-length ring per direction sector, color per
+// speed bin, stacked radially like a proper wind rose).
+// ---------------------------------------------------------------------------
+
+function drawWindRose(svg, cx, cy, radius, rows, speedBins, title) {
+  const bySector = d3.group(rows, d => d.sector);
+  const maxTotal = d3.max(Array.from(bySector.values()), sectorRows => d3.sum(sectorRows, r => r.frequency)) || 0.0001;
+  const rScale = d3.scaleLinear().domain([0, maxTotal]).range([0, radius]);
+  const speedColor = d3.scaleOrdinal().domain(speedBins).range(d3.quantize(d3.interpolateYlOrRd, speedBins.length + 1).slice(1));
+  const angleStep = (2 * Math.PI) / 16;
+
+  const tooltip = d3.select('body').append('div').attr('class', 'point-tooltip');
+
+  const g = svg.append('g').attr('transform', `translate(${cx},${cy})`);
+
+  // gridlines: concentric circles at 25/50/75/100% of the max sector total
+  [0.25, 0.5, 0.75, 1.0].forEach(frac => {
+    g.append('circle')
+      .attr('r', rScale(maxTotal * frac))
+      .attr('fill', 'none')
+      .attr('class', 'grid-line');
+    g.append('text')
+      .attr('x', 4).attr('y', -rScale(maxTotal * frac) - 2)
+      .attr('fill', 'var(--muted)').attr('font-size', '0.6rem')
+      .text(d3.format('.0%')(frac * maxTotal));
+  });
+
+  // compass labels (N/E/S/W)
+  const compassLabels = [[0, 'N'], [4, 'E'], [8, 'S'], [12, 'W']];
+  compassLabels.forEach(([sector, label]) => {
+    const angle = sector * angleStep - Math.PI / 2;
+    g.append('text')
+      .attr('x', (radius + 14) * Math.cos(angle))
+      .attr('y', (radius + 14) * Math.sin(angle))
+      .attr('text-anchor', 'middle').attr('dominant-baseline', 'middle')
+      .attr('fill', 'var(--text)').attr('font-size', '0.75rem').attr('font-weight', 'bold')
+      .text(label);
+  });
+
+  for (const [sector, sectorRows] of bySector.entries()) {
+    let cumFreq = 0;
+    const angle0 = sector * angleStep - Math.PI / 2 - angleStep / 2 + angleStep * 0.08;
+    const angle1 = sector * angleStep - Math.PI / 2 + angleStep / 2 - angleStep * 0.08;
+    const arcGen = d3.arc().innerRadius(d => rScale(d.r0)).outerRadius(d => rScale(d.r1))
+      .startAngle(angle0 + Math.PI / 2).endAngle(angle1 + Math.PI / 2);
+    speedBins.forEach(bin => {
+      const row = sectorRows.find(r => r.speed_bin === bin);
+      const freq = row ? row.frequency : 0;
+      if (freq <= 0) return;
+      const d = { r0: cumFreq, r1: cumFreq + freq };
+      cumFreq += freq;
+      g.append('path')
+        .attr('d', arcGen(d))
+        .attr('fill', speedColor(bin))
+        .on('mousemove', (event) => {
+          tooltip.style('opacity', 1)
+            .html(`<b>${bin}</b><br>freq: ${(freq * 100).toFixed(1)}%<br>count: ${row.count}`)
+            .style('left', (event.pageX + 12) + 'px')
+            .style('top', (event.pageY - 10) + 'px');
+        })
+        .on('mouseleave', () => tooltip.style('opacity', 0));
+    });
+  }
+
+  svg.append('text')
+    .attr('x', cx).attr('y', cy - radius - 30)
+    .attr('text-anchor', 'middle')
+    .attr('fill', 'var(--text)').attr('font-size', '0.85rem').attr('font-weight', 'bold')
+    .text(title);
+
+  return speedColor;
+}
+
+async function loadWindRoseChart() {
+  const model = d3.select('#wind-rose-model-select').property('value');
+  const hours = +d3.select('#wind-rose-hours-select').property('value');
+  if (!state.location) return;
+
+  const url = `/api/wind-rose?location=${state.location}&hours=${hours}` + (model ? `&model=${model}` : '');
+  const data = await fetchJSON(url);
+  const container = d3.select('#wind-rose-chart');
+  container.selectAll('*').remove();
+  const empty = d3.select('#wind-rose-empty');
+
+  if (data.error) {
+    empty.attr('hidden', null).text(data.error);
+    return;
+  }
+  if (!data.observed || !data.observed.total_samples) {
+    empty.attr('hidden', null).text('No observed wind direction/speed data yet for this location.');
+    return;
+  }
+  empty.attr('hidden', true);
+
+  const showComparison = !!(data.forecast && data.forecast.total_samples);
+  const width = Math.min(900, container.node().clientWidth || 900);
+  const height = 420;
+  const radius = 130;
+  const svg = container.append('svg').attr('width', width).attr('height', height);
+
+  let speedColor;
+  if (showComparison) {
+    speedColor = drawWindRose(svg, width * 0.27, height / 2 + 20, radius, data.observed.rows, data.speed_bins,
+      `Observed (n=${data.observed.total_samples})`);
+    drawWindRose(svg, width * 0.73, height / 2 + 20, radius, data.forecast.rows, data.speed_bins,
+      `${model.toUpperCase()} Forecast (n=${data.forecast.total_samples})`);
+  } else {
+    speedColor = drawWindRose(svg, width / 2, height / 2 + 20, radius, data.observed.rows, data.speed_bins,
+      `Observed (n=${data.observed.total_samples})`);
+  }
+
+  const legend = container.insert('div', 'svg').attr('class', 'legend');
+  data.speed_bins.forEach(b => {
+    const item = legend.append('div').attr('class', 'legend-item');
+    item.append('span').attr('class', 'legend-swatch').style('background', speedColor(b));
+    item.append('span').text(b);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Gust Factor panel: gust_kt / sustained_kt time series, for locations with
+// real gust sensor data. A ratio near 1.0 = steady wind; higher = gusty and
+// potentially more hazardous than steady wind of the same average speed.
+// ---------------------------------------------------------------------------
+
+async function loadGustFactorChart() {
+  const hours = +d3.select('#gust-factor-hours-select').property('value');
+  if (!state.location) return;
+
+  const data = await fetchJSON(`/api/gust-factor?location=${state.location}&hours=${hours}`);
+  const container = d3.select('#gust-factor-chart');
+  container.selectAll('*').remove();
+  const empty = d3.select('#gust-factor-empty');
+
+  if (data.error) {
+    empty.attr('hidden', null).text(data.error);
+    return;
+  }
+  if (!data.length) {
+    empty.attr('hidden', null).text('No gust data yet for this location/window.');
+    return;
+  }
+  empty.attr('hidden', true);
+
+  data.forEach(d => { d.ts_utc_date = new Date(d.ts_utc + 'Z'); });
+
+  const width = Math.min(900, container.node().clientWidth || 900);
+  const height = 280;
+  const margin = { top: 20, right: 20, bottom: 60, left: 55 };
+
+  const x = d3.scaleTime().domain(d3.extent(data, d => d.ts_utc_date)).range([margin.left, width - margin.right]);
+  const y = d3.scaleLinear()
+    .domain([1, Math.max(2, d3.max(data, d => d.gust_factor) * 1.1)])
+    .nice()
+    .range([height - margin.bottom, margin.top]);
+
+  const svg = container.append('svg').attr('width', width).attr('height', height);
+
+  svg.append('g')
+    .selectAll('line')
+    .data(y.ticks(5))
+    .join('line')
+    .attr('class', 'grid-line')
+    .attr('x1', margin.left).attr('x2', width - margin.right)
+    .attr('y1', d => y(d)).attr('y2', d => y(d));
+
+  // Reference line at 1.0 (perfectly steady wind, no gusting at all)
+  svg.append('line')
+    .attr('x1', margin.left).attr('x2', width - margin.right)
+    .attr('y1', y(1)).attr('y2', y(1))
+    .attr('stroke', 'var(--muted)').attr('stroke-dasharray', '4,3').attr('opacity', 0.6);
+  svg.append('text')
+    .attr('x', width - margin.right).attr('y', y(1) - 4)
+    .attr('text-anchor', 'end').attr('fill', 'var(--muted)').attr('font-size', '0.65rem')
+    .text('steady (1.0)');
+
+  const line = d3.line().x(d => x(d.ts_utc_date)).y(d => y(d.gust_factor));
+  svg.append('path')
+    .datum(data)
+    .attr('fill', 'none')
+    .attr('stroke', getCssVar('--hrrr') || '#ff8a65')
+    .attr('stroke-width', 1.8)
+    .attr('d', line);
+
+  const tooltip = d3.select('body').append('div').attr('class', 'point-tooltip');
+  svg.selectAll('circle.gust-dot')
+    .data(data)
+    .join('circle')
+    .attr('class', 'gust-dot')
+    .attr('cx', d => x(d.ts_utc_date))
+    .attr('cy', d => y(d.gust_factor))
+    .attr('r', 2.5)
+    .attr('fill', getCssVar('--hrrr') || '#ff8a65')
+    .on('mousemove', (event, d) => {
+      tooltip.style('opacity', 1)
+        .html(`<b>${d.gust_factor}x</b><br>${d.ts_utc}<br>sustained: ${d.sustained_kt}kt, gust: ${d.gust_kt}kt`)
+        .style('left', (event.pageX + 12) + 'px')
+        .style('top', (event.pageY - 10) + 'px');
+    })
+    .on('mouseleave', () => tooltip.style('opacity', 0));
+
+  svg.append('g')
+    .attr('class', 'axis')
+    .attr('transform', `translate(0,${height - margin.bottom})`)
+    .call(d3.axisBottom(x).ticks(6))
+    .selectAll('text')
+    .attr('transform', 'rotate(-25)')
+    .style('text-anchor', 'end');
+
+  svg.append('g')
+    .attr('class', 'axis')
+    .attr('transform', `translate(${margin.left},0)`)
+    .call(d3.axisLeft(y).ticks(5).tickFormat(d => d + 'x'));
+
+  svg.append('text')
+    .attr('x', -height / 2).attr('y', 16)
+    .attr('transform', 'rotate(-90)')
+    .attr('text-anchor', 'middle')
+    .attr('fill', 'var(--muted)')
+    .attr('font-size', '0.75rem')
+    .text('Gust Factor (gust / sustained)');
+}
+
+init().catch(err => {
+  console.error(err);
+  document.body.insertAdjacentHTML('afterbegin',
+    `<div style="background:#c62828;color:#fff;padding:10px;">Failed to load dashboard: ${err.message}</div>`);
+});
