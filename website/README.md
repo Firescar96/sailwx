@@ -67,10 +67,15 @@ All under the same server, JSON responses:
 - `GET /api/locations` — the 5 rows of `locations`.
 - `GET /api/current-conditions` — most recent observation per (location, variable).
 - `GET /api/flags-latest` — most recent flag color per location (currently only cbi_dockhouse has rows).
+- `GET /api/flags-history?location=<id>&hours=<n>` — flag color readings over the last `hours`.
 - `GET /api/accuracy?location=<id>&variable=<var>` — rows from `v_accuracy_by_lead_time` for that location+variable.
 - `GET /api/accuracy-variables` — every (location, variable) pair that actually has accuracy rows, used to populate the variable dropdown.
-- `GET /api/forecast?location=<id>&variable=<var>&hours=<n>` — latest run per model, forecast values out to `hours` ahead of each run's init time.
-- `GET /api/forecast-convergence?location=<id>&variable=<var>&target=<ISO timestamp>` — every model run's prediction for one fixed valid_time_utc.
+- `GET /api/forecast?location=<id>&variable=<var>&hours=<n>&past_hours=<n>` — latest run per model, forecast values from `past_hours` before to `hours` ahead of real "now".
+- `GET /api/forecast-stability?location=<id>&variable=<var>&num_runs=<n>&hours=<n>` — day-over-day forecast stability: spread/stddev of each model's own prediction for each upcoming hour across its last `num_runs` runs.
+- `GET /api/flag-prediction?model=<model>&hours=<n>` — Bayesian P(flag color | forecast wind) for CBI, using the selected model's forecast wind and CBI's own historical wind-vs-flag pairing.
+- `GET /api/wind-prediction?location=<id>&model=<model>&hours=<n>` — Bayesian P(actual wind bucket | forecast wind bucket) for locations with real wind sensors, using that location's own historical forecast-vs-observed pairing.
+- `GET /api/wind-rose?location=<id>&hours=<n>&model=<model>` — direction/speed frequency distribution, observed and (if `model` given) forecast, for the wind rose chart.
+- `GET /api/gust-factor?location=<id>&hours=<n>` — gust_kt / sustained_kt ratio time series.
 - `GET /api/observations?location=<id>&variable=<var>&hours=<n>` — raw observations for the last `hours` before the most recent observation at that location (used for the forecast chart overlay).
 - `GET /api/variables-for-location?location=<id>` — which observation variables actually exist at a location.
 

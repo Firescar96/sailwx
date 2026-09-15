@@ -770,7 +770,7 @@ async function loadForecastChart() {
 // evolve over the runs leading up to it"; this answers "right now, across
 // the WHOLE upcoming forecast, which hours/models are still unstable
 // run-to-run" -- backed by /api/forecast-stability, a brand new endpoint
-// that doesn't touch/replace api_forecast_convergence server-side either.
+// that fully replaced the old convergence endpoint (removed 2026-09-14).
 // ---------------------------------------------------------------------------
 
 // Same overlapping-request race guard pattern used elsewhere on this

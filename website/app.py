@@ -41,7 +41,7 @@ def db():
     MUST set session TimeZone to UTC (found 2026-09-11): DuckDB's default
     session TimeZone is the OS local zone (America/New_York here), and
     ALL of `now()`'s time-window queries (api_forecast, api_observations,
-    api_flags_history, api_observation_near) compare it directly against
+    api_flags_history) compare it directly against
     valid_time_utc/ts_utc columns that are naive UTC timestamps. Without
     forcing UTC, now() returned local wall-clock time (e.g. 08:15 EDT)
     while being compared against UTC-stored columns -- a raw ~4h
@@ -248,46 +248,23 @@ def api_forecast(params):
         con.close()
 
 
-def api_forecast_convergence(params):
-    """For a fixed target valid_time_utc, show how each model's prediction
-    for that same target time changed across successive init runs."""
-    location = params.get("location")
-    variable = params.get("variable")
-    target = params.get("target")  # ISO timestamp string
-    if not location or not variable or not target:
-        return {"error": "location, variable, and target query params are required"}
-    con = db()
-    try:
-        cur = con.execute(
-            """
-            SELECT fr.model, fr.init_time_utc, fv.valid_time_utc, fv.value
-            FROM forecast_values fv
-            JOIN forecast_runs fr ON fr.run_id = fv.run_id
-            WHERE fr.location_id = ?
-              AND fv.variable = ?
-              AND fv.valid_time_utc = ?
-            ORDER BY fr.model, fr.init_time_utc
-            """,
-            [location, variable, target],
-        )
-        return rows_as_dicts(cur)
-    finally:
-        con.close()
-
-
 def api_forecast_stability(params):
     """Day-over-day forecast stability: for each upcoming hour in the
     forecast window, how much has each model's prediction for that exact
-    hour changed across its last few runs? A NEW, SEPARATE endpoint --
-    added alongside (not replacing) api_forecast_convergence, per
-    explicit user instruction 2026-09-14 ("don't break other graphs when
-    you change this one"). Convergence answers "how did predictions for
-    ONE fixed target time evolve over the run history leading up to it";
-    this answers a different question -- "right now, looking at the
-    whole upcoming forecast, which hours/models are the models still
-    disagreeing with THEMSELVES about run-to-run" -- i.e. a genuine
-    forecast-confidence signal distinct from convergence, model spread
-    (accuracy chart), or the Bayesian prediction panels.
+    hour changed across its last few runs?
+
+    This replaced the old Forecast Convergence endpoint entirely
+    (removed 2026-09-14, per explicit user instruction: "if you don't
+    use the backend convergence route, delete it" -- the frontend had
+    already stopped calling it once this stability chart replaced that
+    UI panel, so it was genuinely dead code, not just superseded).
+    Convergence answered "how did predictions for ONE fixed target time
+    evolve over the run history leading up to it"; this answers a
+    different question -- "right now, looking at the whole upcoming
+    forecast, which hours/models are the models still disagreeing with
+    THEMSELVES run-to-run" -- i.e. a genuine forecast-confidence signal
+    distinct from model accuracy (error vs. reality) or the Bayesian
+    prediction panels.
 
     For each model, takes its last `num_runs` distinct init_time_utc
     runs (most recent first) and, for every valid_time_utc that appears
@@ -374,42 +351,6 @@ def api_forecast_stability(params):
             "runs_used_by_model": runs_used,
             "rows": rows,
         }
-    finally:
-        con.close()
-
-
-def api_observation_near(params):
-    """The single nearest real observation to a target timestamp, within
-    a tolerance window -- used by the Forecast Convergence chart to draw
-    a "what actually happened" reference line alongside the models'
-    predictions for that same target time. Previously the convergence
-    chart had NO observed-data overlay at all (user-reported 2026-09-11:
-    "doesnt seem to always include the observable data when available in
-    the past") -- it wasn't intermittent, the feature was simply never
-    built; this fixes that by giving the frontend a value to plot.
-    Tolerance matches v_accuracy_by_lead_time's own forecast-to-
-    observation matching window (+/- 7.5 minutes) for consistency."""
-    location = params.get("location")
-    variable = params.get("variable")
-    target = params.get("target")
-    if not location or not variable or not target:
-        return {"error": "location, variable, and target query params are required"}
-    con = db()
-    try:
-        cur = con.execute(
-            """
-            SELECT ts_utc, value
-            FROM observations
-            WHERE location_id = ? AND variable = ?
-              AND ts_utc BETWEEN ?::TIMESTAMP - INTERVAL '7.5 minutes'
-                              AND ?::TIMESTAMP + INTERVAL '7.5 minutes'
-            ORDER BY abs(epoch(ts_utc) - epoch(?::TIMESTAMP))
-            LIMIT 1
-            """,
-            [location, variable, target, target, target],
-        )
-        rows = rows_as_dicts(cur)
-        return rows[0] if rows else None
     finally:
         con.close()
 
@@ -949,9 +890,7 @@ ROUTES = {
     "/api/accuracy": api_accuracy,
     "/api/accuracy-variables": api_accuracy_variables,
     "/api/forecast": api_forecast,
-    "/api/forecast-convergence": api_forecast_convergence,
     "/api/forecast-stability": api_forecast_stability,
-    "/api/observation-near": api_observation_near,
     "/api/observations": api_observations,
     "/api/variables-for-location": api_variables_for_location,
 }
