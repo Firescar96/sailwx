@@ -82,18 +82,31 @@
     <div id="forecast-empty" class="empty-msg" hidden>No forecast data available yet for this location/variable.</div>
   </section>
 
-  <section id="convergence-panel" class="panel">
-    <h2>Forecast Convergence <span class="subtitle">(how predictions for one target time changed across runs)</span></h2>
-    <p class="subtitle">Click a point on the forecast chart above to pick a target time, or use the picker below.</p>
+  <section id="stability-panel" class="panel">
+    <h2>Forecast Stability <span class="subtitle">(day-over-day: how much has each model's own forecast changed run to run?)</span></h2>
+    <p class="subtitle">Not the same as Model Accuracy (that's error vs. reality) -- this shows how much each model's predicted value for the SAME upcoming hour has shifted across its last few runs, independent of whether it turns out to be right. A tight band = the model has been consistent; a wide band = it's still making up its mind.</p>
     <div class="controls inline">
       <label>
-        Target time (UTC)
-        <input type="datetime-local" id="target-time-input">
+        Compare last
+        <select id="stability-num-runs-select">
+          <option value="2">2 runs</option>
+          <option value="3" selected>3 runs</option>
+          <option value="4">4 runs</option>
+          <option value="5">5 runs</option>
+        </select>
       </label>
-      <button type="button" id="convergence-fetch-btn">Show convergence</button>
+      <label>
+        Forecast window
+        <select id="stability-hours-select">
+          <option value="24">Next 24h</option>
+          <option value="48">Next 48h</option>
+          <option value="72" selected>Next 72h</option>
+          <option value="120">Next 5 days</option>
+        </select>
+      </label>
     </div>
-    <div id="convergence-chart"></div>
-    <div id="convergence-empty" class="empty-msg">Pick a target time above, or click a point on the forecast chart.</div>
+    <div id="stability-chart"></div>
+    <div id="stability-empty" class="empty-msg" hidden></div>
   </section>
 
   <section id="flag-prediction-panel" class="panel">

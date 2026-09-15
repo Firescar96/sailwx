@@ -275,6 +275,109 @@ def api_forecast_convergence(params):
         con.close()
 
 
+def api_forecast_stability(params):
+    """Day-over-day forecast stability: for each upcoming hour in the
+    forecast window, how much has each model's prediction for that exact
+    hour changed across its last few runs? A NEW, SEPARATE endpoint --
+    added alongside (not replacing) api_forecast_convergence, per
+    explicit user instruction 2026-09-14 ("don't break other graphs when
+    you change this one"). Convergence answers "how did predictions for
+    ONE fixed target time evolve over the run history leading up to it";
+    this answers a different question -- "right now, looking at the
+    whole upcoming forecast, which hours/models are the models still
+    disagreeing with THEMSELVES about run-to-run" -- i.e. a genuine
+    forecast-confidence signal distinct from convergence, model spread
+    (accuracy chart), or the Bayesian prediction panels.
+
+    For each model, takes its last `num_runs` distinct init_time_utc
+    runs (most recent first) and, for every valid_time_utc that appears
+    in ALL of them, computes the spread (max-min) and stddev of the
+    predicted value across those runs. A tight spread means the model
+    has been predicting the same thing for that hour run after run
+    (stable/high-confidence); a wide spread means its own story keeps
+    changing (unstable/low-confidence), independent of whether it's
+    actually accurate.
+    """
+    location = params.get("location")
+    variable = params.get("variable")
+    num_runs = int(params.get("num_runs", "3"))
+    hours = int(params.get("hours", "72"))
+    if not location or not variable:
+        return {"error": "location and variable query params are required"}
+    if num_runs < 2:
+        return {"error": "num_runs must be >= 2 to measure any stability"}
+    con = db()
+    try:
+        cur = con.execute(
+            """
+            WITH recent_runs AS (
+                SELECT run_id, model, init_time_utc,
+                       row_number() OVER (PARTITION BY model ORDER BY init_time_utc DESC) AS run_rank
+                FROM forecast_runs
+                WHERE location_id = ?
+            ),
+            chosen_runs AS (
+                SELECT run_id, model, init_time_utc
+                FROM recent_runs
+                WHERE run_rank <= ?
+            ),
+            values_across_runs AS (
+                SELECT cr.model, fv.valid_time_utc, fv.value, cr.init_time_utc
+                FROM forecast_values fv
+                JOIN chosen_runs cr ON cr.run_id = fv.run_id
+                WHERE fv.variable = ?
+                  AND fv.valid_time_utc >= now()
+                  AND fv.valid_time_utc <= now() + (? * INTERVAL '1 hour')
+            )
+            SELECT model, valid_time_utc,
+                   count(*) AS n_runs_with_this_hour,
+                   min(value) AS min_value,
+                   max(value) AS max_value,
+                   round(max(value) - min(value), 3) AS spread,
+                   round(stddev(value), 3) AS stddev_value,
+                   round(avg(value), 3) AS avg_value
+            FROM values_across_runs
+            GROUP BY model, valid_time_utc
+            HAVING count(*) = ?
+            ORDER BY model, valid_time_utc
+            """,
+            [location, num_runs, variable, hours, num_runs],
+        )
+        rows = rows_as_dicts(cur)
+
+        # Also report which init_time_utc runs were actually used per
+        # model, so the frontend/tooltip can say "based on the last 3
+        # runs: 12:00, 18:00, 00:00" instead of just a bare number.
+        runs_cur = con.execute(
+            """
+            WITH recent_runs AS (
+                SELECT model, init_time_utc,
+                       row_number() OVER (PARTITION BY model ORDER BY init_time_utc DESC) AS run_rank
+                FROM forecast_runs
+                WHERE location_id = ?
+            )
+            SELECT model, init_time_utc FROM recent_runs WHERE run_rank <= ?
+            ORDER BY model, init_time_utc DESC
+            """,
+            [location, num_runs],
+        )
+        runs_used = {}
+        for model, init_time in runs_cur.fetchall():
+            runs_used.setdefault(model, []).append(
+                init_time.isoformat() if hasattr(init_time, "isoformat") else init_time
+            )
+
+        return {
+            "location": location,
+            "variable": variable,
+            "num_runs": num_runs,
+            "runs_used_by_model": runs_used,
+            "rows": rows,
+        }
+    finally:
+        con.close()
+
+
 def api_observation_near(params):
     """The single nearest real observation to a target timestamp, within
     a tolerance window -- used by the Forecast Convergence chart to draw
@@ -847,6 +950,7 @@ ROUTES = {
     "/api/accuracy-variables": api_accuracy_variables,
     "/api/forecast": api_forecast,
     "/api/forecast-convergence": api_forecast_convergence,
+    "/api/forecast-stability": api_forecast_stability,
     "/api/observation-near": api_observation_near,
     "/api/observations": api_observations,
     "/api/variables-for-location": api_variables_for_location,

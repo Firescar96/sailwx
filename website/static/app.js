@@ -109,21 +109,17 @@ async function init() {
     loadForecastChart();
   });
 
-  d3.select('#convergence-fetch-btn').on('click', () => {
-    const val = d3.select('#target-time-input').property('value');
-    if (val) {
-      loadConvergenceChart(val);
-    } else {
-      // Previously silently did nothing here if the datetime-local input
-      // was empty/incomplete (e.g. date picked but time left blank) --
-      // reported by user as "the button does nothing". Now gives visible
-      // feedback instead of failing silently.
-      d3.select('#convergence-empty')
-        .attr('hidden', null)
-        .text('Pick a complete date AND time (both fields) before clicking Show convergence.');
-      d3.select('#convergence-chart').selectAll('*').remove();
-    }
-  });
+  // Forecast Stability panel (replaces the old Forecast Convergence panel
+  // entirely, per explicit user instruction 2026-09-14: "i want the
+  // convergence chart to be a day over day forecast stability instead" /
+  // "Replace the Forecast Convergence PANEL entirely... remove the old
+  // click-a-point/target-time picker UI"). Answers a different question
+  // than convergence did: not "how did predictions for ONE fixed target
+  // time evolve," but "right now, how much is each model still changing
+  // its own mind hour-to-hour across its last few runs" -- see
+  // api_forecast_stability in app.py.
+  d3.select('#stability-num-runs-select').on('change', loadStabilityChart);
+  d3.select('#stability-hours-select').on('change', loadStabilityChart);
 
   // Flag Prediction panel (CBI only) and Wind Prediction panel (all other
   // locations with real wind observations) -- separate from the existing
@@ -238,12 +234,8 @@ async function refreshAll() {
     loadCurrentConditions(),
     loadAccuracyChart(),
     loadForecastChart(),
+    loadStabilityChart(),
   ]);
-  // Clear stale convergence view on location/variable change
-  d3.select('#convergence-chart').selectAll('*').remove();
-  d3.select('#convergence-empty')
-    .attr('hidden', null)
-    .text('Pick a target time above, or click a point on the forecast chart.');
 }
 
 // ---------------------------------------------------------------------------
@@ -666,20 +658,15 @@ async function loadForecastChart() {
       .attr('cy', d => y(d.value))
       .attr('r', 3)
       .attr('fill', MODEL_COLORS[m] || '#888')
-      .style('cursor', 'pointer')
+      .style('cursor', 'default')
       .on('mouseenter', () => setHighlight(m))
       .on('mousemove', (event, d) => {
         tooltip.style('opacity', 1)
-          .html(`<b>${m.toUpperCase()}</b><br>${d.valid_time_utc}<br>value: ${d.value}<br><i>click to see convergence</i>`)
+          .html(`<b>${m.toUpperCase()}</b><br>${d.valid_time_utc}<br>value: ${d.value}`)
           .style('left', (event.pageX + 12) + 'px')
           .style('top', (event.pageY - 10) + 'px');
       })
-      .on('mouseleave', () => { tooltip.style('opacity', 0); setHighlight(null); })
-      .on('click', (event, d) => {
-        const localVal = toDatetimeLocalValue(d.valid_time_utc_date);
-        d3.select('#target-time-input').property('value', localVal);
-        loadConvergenceChart(d.valid_time_utc);
-      });
+      .on('mouseleave', () => { tooltip.style('opacity', 0); setHighlight(null); });
   });
 
   // observation overlay (dashed grey line + dots), participates in the
@@ -772,91 +759,72 @@ async function loadForecastChart() {
   }
 }
 
-function toDatetimeLocalValue(date) {
-  // datetime-local input wants local time w/o timezone; we keep everything
-  // UTC-labeled so just format the UTC components directly.
-  const pad = n => String(n).padStart(2, '0');
-  return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())}T${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}`;
-}
-
 // ---------------------------------------------------------------------------
-// Forecast convergence chart: for one fixed valid_time, how did each model's
-// prediction change across successive init runs?
+// Forecast Stability chart: for the upcoming forecast window, how much has
+// each model's OWN prediction for each hour changed across its last few
+// runs? REPLACES the old Forecast Convergence chart entirely (user explicit
+// direction 2026-09-14: "i want the convergence chart to be a day over day
+// forecast stability instead" / "Replace the Forecast Convergence PANEL
+// entirely... remove the old click-a-point/target-time picker UI").
+// Convergence answered "how did predictions for ONE fixed target time
+// evolve over the runs leading up to it"; this answers "right now, across
+// the WHOLE upcoming forecast, which hours/models are still unstable
+// run-to-run" -- backed by /api/forecast-stability, a brand new endpoint
+// that doesn't touch/replace api_forecast_convergence server-side either.
 // ---------------------------------------------------------------------------
 
-// Guards against a real race condition (user-reported 2026-09-11: "select
-// a date once, then the bottom graph won't change again when I click on
-// other nodes"): loadConvergenceChart does two sequential awaited
-// fetches, so clicking a second point before the first click's fetches
-// resolve starts a second, overlapping invocation. Whichever finishes
-// LAST wins the DOM update -- not necessarily the most recent click's
-// target -- so a click could appear to silently do nothing (the older,
-// slower request clobbered it right after). Each invocation gets a
-// unique token; if a newer invocation has started by the time an older
-// one's fetches resolve, the older one bails out before touching the DOM.
-let convergenceRequestToken = 0;
+// Same overlapping-request race guard pattern used elsewhere on this
+// dashboard (see the convergence-button race-condition fix history) --
+// changing "Compare last N runs" or "Forecast window" fires a new fetch
+// before an older one may have resolved.
+let stabilityRequestToken = 0;
 
-async function loadConvergenceChart(targetIso) {
-  const myToken = ++convergenceRequestToken;
-  // targetIso may come from a datetime-local input (no seconds/zone) or an
-  // ISO string already; normalize to "YYYY-MM-DD HH:MM:SS" for the API.
-  let target = targetIso;
-  if (target.length === 16) target += ':00'; // from <input type=datetime-local>
-  target = target.replace('T', ' ');
-  const targetDate = new Date(target.replace(' ', 'T') + 'Z');
+async function loadStabilityChart() {
+  const myToken = ++stabilityRequestToken;
+  const numRuns = d3.select('#stability-num-runs-select').property('value');
+  const hours = d3.select('#stability-hours-select').property('value');
+  if (!state.location || !state.variable) return;
 
-  const data = await fetchJSON(`/api/forecast-convergence?location=${state.location}&variable=${state.variable}&target=${encodeURIComponent(target)}`);
-  // Real "what actually happened" value at the target time, if we have
-  // an observation close enough to it -- was previously entirely
-  // missing from this chart (user-reported 2026-09-11: "doesnt seem to
-  // always include the observable data when available in the past").
-  const observedAtTarget = await fetchJSON(`/api/observation-near?location=${state.location}&variable=${state.variable}&target=${encodeURIComponent(target)}`);
-  // A newer click started (and possibly already finished) while these
-  // fetches were in flight -- abandon this stale invocation instead of
-  // overwriting whatever the newer one already rendered (or is about to).
-  if (myToken !== convergenceRequestToken) return;
+  const data = await fetchJSON(
+    `/api/forecast-stability?location=${state.location}&variable=${state.variable}&num_runs=${numRuns}&hours=${hours}`
+  );
+  if (myToken !== stabilityRequestToken) return; // a newer request has since started/finished
 
-  const container = d3.select('#convergence-chart');
+  const container = d3.select('#stability-chart');
   container.selectAll('*').remove();
-  const empty = d3.select('#convergence-empty');
+  const empty = d3.select('#stability-empty');
 
-  if (!data.length) {
-    empty.attr('hidden', null).text(`No forecast runs found targeting ${target} UTC for this location/variable.`);
+  if (data.error) {
+    empty.attr('hidden', null).text(data.error);
+    return;
+  }
+  if (!data.rows || !data.rows.length) {
+    empty.attr('hidden', null).text(
+      `Not enough forecast run history yet to compare the last ${numRuns} runs for this location/variable.`
+    );
     return;
   }
   empty.attr('hidden', true);
 
-  data.forEach(d => {
-    d.init_time_utc_date = new Date(d.init_time_utc + 'Z');
-    // Hours BEFORE the target valid time that this run was issued --
-    // e.g. a run issued 72h before the target has lead_hours=72. This is
-    // the "how far in advance was this prediction made" axis the user
-    // wants: far-in-advance runs on the left, the target moment (0h) on
-    // the right, so you can watch predictions start scattered and
-    // (ideally) converge toward the truth as the target approaches.
-    d.lead_hours = (targetDate.getTime() - d.init_time_utc_date.getTime()) / 3600000;
-  });
-  const models = Array.from(new Set(data.map(d => d.model))).sort();
-  const byModel = d3.group(data, d => d.model);
+  const rows = data.rows;
+  rows.forEach(d => { d.valid_time_utc_date = new Date(d.valid_time_utc + 'Z'); });
+  const models = Array.from(new Set(rows.map(d => d.model))).sort();
+  const byModel = d3.group(rows, d => d.model);
 
   const width = Math.min(900, container.node().clientWidth || 900);
-  const height = 300;
+  const height = 320;
   const margin = { top: 20, right: 20, bottom: 70, left: 60 };
 
-  // Reversed domain: largest lead_hours (furthest from target) maps to
-  // the left edge, 0 (the target time itself) maps to the right edge.
-  const maxLead = d3.max(data, d => d.lead_hours);
-  const x = d3.scaleLinear()
-    .domain([maxLead, 0])
+  const x = d3.scaleTime()
+    .domain(d3.extent(rows, d => d.valid_time_utc_date))
     .range([margin.left, width - margin.right]);
-  const allValuesForY = data.map(d => d.value).concat(observedAtTarget ? [observedAtTarget.value] : []);
   const y = d3.scaleLinear()
-    .domain(d3.extent(allValuesForY)).nice()
+    .domain([d3.min(rows, d => d.min_value), d3.max(rows, d => d.max_value)])
+    .nice()
     .range([height - margin.bottom, margin.top]);
 
   const svg = container.append('svg').attr('width', width).attr('height', height);
 
-  // gridlines (matches the styling of the other two charts, was missing here)
   svg.append('g')
     .selectAll('line')
     .data(y.ticks(6))
@@ -868,7 +836,7 @@ async function loadConvergenceChart(targetIso) {
   svg.append('g')
     .attr('class', 'axis')
     .attr('transform', `translate(0,${height - margin.bottom})`)
-    .call(d3.axisBottom(x).ticks(Math.min(12, data.length)).tickFormat(d => `${Math.round(d)}h`))
+    .call(d3.axisBottom(x).ticks(Math.min(10, rows.length)))
     .selectAll('text')
     .attr('transform', 'rotate(-35)')
     .style('text-anchor', 'end');
@@ -878,8 +846,6 @@ async function loadConvergenceChart(targetIso) {
     .attr('transform', `translate(${margin.left},0)`)
     .call(d3.axisLeft(y).ticks(6));
 
-  // y-axis label (was entirely missing -- this is what made the chart
-  // "make no sense": no way to tell what the numbers/axis represented)
   svg.append('text')
     .attr('x', -height / 2).attr('y', 14)
     .attr('transform', 'rotate(-90)')
@@ -892,101 +858,91 @@ async function loadConvergenceChart(targetIso) {
     .attr('x', width / 2).attr('y', height - 6)
     .attr('text-anchor', 'middle')
     .attr('fill', 'var(--muted)').attr('font-size', '0.72rem')
-    .text(`Hours before target time (target: ${target} UTC, at right edge = 0h)`);
+    .text(`Upcoming forecast hours -- shaded band = spread across each model's last ${numRuns} runs`);
 
-  const line = d3.line()
-    .x(d => x(d.lead_hours))
-    .y(d => y(d.value));
+  const tooltip = d3.select('body').selectAll('.stability-tooltip').data([0]).join('div').attr('class', 'point-tooltip');
 
-  const tooltip = d3.select('body').selectAll('.convergence-tooltip').data([0]).join('div').attr('class', 'point-tooltip');
-
-  function setConvergenceHighlight(hoveredModel) {
-    svg.selectAll('.model-line')
-      .attr('stroke-width', d => d === hoveredModel ? 4 : 2)
+  function setStabilityHighlight(hoveredModel) {
+    svg.selectAll('.stability-band')
+      .attr('opacity', d => !hoveredModel || d === hoveredModel ? 0.28 : 0.08);
+    svg.selectAll('.stability-line')
+      .attr('stroke-width', d => d === hoveredModel ? 3 : 1.75)
       .attr('opacity', d => !hoveredModel || d === hoveredModel ? 1 : 0.25);
-    svg.selectAll('.model-dot')
-      .attr('opacity', d => !hoveredModel || d.__model === hoveredModel ? 1 : 0.2);
   }
 
+  const areaGen = d3.area()
+    .x(d => x(d.valid_time_utc_date))
+    .y0(d => y(d.min_value))
+    .y1(d => y(d.max_value));
+  const lineGen = d3.line()
+    .x(d => x(d.valid_time_utc_date))
+    .y(d => y(d.avg_value));
+
   models.forEach(m => {
-    const series = (byModel.get(m) || []).slice().sort((a, b) => b.lead_hours - a.lead_hours);
-    series.forEach(d => { d.__model = m; });
+    const series = (byModel.get(m) || []).slice().sort((a, b) => a.valid_time_utc_date - b.valid_time_utc_date);
+    const color = MODEL_COLORS[m] || '#888';
+
+    // shaded min-max spread band -- the actual "stability" signal: wide =
+    // this model's own predictions for that hour disagreed across its
+    // last few runs, tight = it's been consistent.
     svg.append('path')
       .datum(m)
-      .attr('class', 'model-line')
+      .attr('class', 'stability-band')
+      .attr('fill', color)
+      .attr('opacity', 0.28)
+      .attr('d', () => areaGen(series))
+      .style('pointer-events', 'none');
+
+    // average-value line on top, for a clean reference of "where the
+    // model currently sits" independent of the band's width.
+    svg.append('path')
+      .datum(m)
+      .attr('class', 'stability-line')
       .attr('fill', 'none')
-      .attr('stroke', MODEL_COLORS[m] || '#888')
-      .attr('stroke-width', 2)
-      .attr('d', () => line(series))
+      .attr('stroke', color)
+      .attr('stroke-width', 1.75)
+      .attr('d', () => lineGen(series))
       .style('cursor', 'pointer')
-      .on('mouseenter', () => setConvergenceHighlight(m))
-      .on('mouseleave', () => setConvergenceHighlight(null));
+      .on('mouseenter', () => setStabilityHighlight(m))
+      .on('mouseleave', () => setStabilityHighlight(null));
+
     svg.append('g')
       .selectAll('circle')
       .data(series)
       .join('circle')
-      .attr('class', 'model-dot')
-      .attr('cx', d => x(d.lead_hours))
-      .attr('cy', d => y(d.value))
-      .attr('r', 4)
-      .attr('fill', MODEL_COLORS[m] || '#888')
+      .attr('cx', d => x(d.valid_time_utc_date))
+      .attr('cy', d => y(d.avg_value))
+      .attr('r', 3)
+      .attr('fill', color)
       .style('cursor', 'pointer')
-      .on('mouseenter', () => setConvergenceHighlight(m))
+      .on('mouseenter', () => setStabilityHighlight(m))
       .on('mousemove', (event, d) => {
         tooltip.style('opacity', 1)
-          .html(`<b>${m.toUpperCase()}</b><br>${Math.round(d.lead_hours)}h before target<br>run init: ${d.init_time_utc}<br>${fmtVarLabel(state.variable)}: ${d.value}`)
+          .html(`<b>${m.toUpperCase()}</b><br>${d.valid_time_utc}<br>` +
+                `avg: ${d.avg_value} ${fmtVarLabel(state.variable)}<br>` +
+                `range across last ${numRuns} runs: ${d.min_value} - ${d.max_value} (spread ${d.spread})<br>` +
+                `stddev: ${d.stddev_value}`)
           .style('left', (event.pageX + 12) + 'px')
           .style('top', (event.pageY - 10) + 'px');
       })
-      .on('mouseleave', () => { tooltip.style('opacity', 0); setConvergenceHighlight(null); });
+      .on('mouseleave', () => { tooltip.style('opacity', 0); setStabilityHighlight(null); });
   });
-
-  // "What actually happened" reference line -- a horizontal dashed line
-  // at the real observed value for this target time, if one exists
-  // within +/-7.5min (see api_observation_near). Lets you see at a
-  // glance how far off (or close) each model's converging predictions
-  // were from the truth, not just how they compared to EACH OTHER.
-  if (observedAtTarget) {
-    const obsY = y(observedAtTarget.value);
-    svg.append('line')
-      .attr('x1', margin.left).attr('x2', width - margin.right)
-      .attr('y1', obsY).attr('y2', obsY)
-      .attr('stroke', '#9aa5ab')
-      .attr('stroke-width', 1.5)
-      .attr('stroke-dasharray', '5,3')
-      .attr('opacity', 0.8);
-    svg.append('text')
-      .attr('x', width - margin.right - 4).attr('y', obsY - 5)
-      .attr('text-anchor', 'end')
-      .attr('fill', '#9aa5ab')
-      .attr('font-size', '0.7rem')
-      .text(`Observed: ${observedAtTarget.value}`);
-  }
 
   const legend = container.insert('div', 'svg').attr('class', 'legend');
   models.forEach(m => {
     const item = legend.append('div').attr('class', 'legend-item')
       .style('cursor', 'pointer')
-      .on('mouseenter', () => setConvergenceHighlight(m))
-      .on('mouseleave', () => setConvergenceHighlight(null));
+      .on('mouseenter', () => setStabilityHighlight(m))
+      .on('mouseleave', () => setStabilityHighlight(null));
     item.append('span').attr('class', 'legend-swatch').style('background', MODEL_COLORS[m] || '#888');
-    item.append('span').text(m.toUpperCase());
+    const runsForModel = (data.runs_used_by_model && data.runs_used_by_model[m]) || [];
+    item.append('span').text(`${m.toUpperCase()}${runsForModel.length ? ` (${runsForModel.length} runs)` : ''}`);
   });
-  if (observedAtTarget) {
-    const item = legend.append('div').attr('class', 'legend-item');
-    item.append('span').attr('class', 'legend-swatch').style('background', '#9aa5ab');
-    item.append('span').text(`Observed (${observedAtTarget.ts_utc})`);
-  } else {
-    const item = legend.append('div').attr('class', 'legend-item');
-    item.append('span').attr('class', 'legend-swatch').style('background', 'transparent');
-    item.append('span').attr('style', 'color:var(--muted); font-style:italic;')
-      .text('No observation within 7.5min of target time');
-  }
 }
 
 // ---------------------------------------------------------------------------
 // CBI Flag Prediction panel: Bayesian P(flag color | forecast wind) from one
-// selected model. SEPARATE from the Forecast/Accuracy/Convergence charts
+// selected model. SEPARATE from the Forecast/Accuracy/Stability charts
 // above -- user explicit direction 2026-09-11: "do not ruin or mess up the
 // existing charts... I want additional overlay or a separate chart". This
 // panel answers "what flag color is likely at CBI at some future hour",
