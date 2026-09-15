@@ -442,21 +442,47 @@ def api_flag_prediction(params):
     each wind bucket. This IS an explicit Bayesian posterior update
     (prior=uniform over colors, likelihood=observed per-bucket counts),
     not just a raw frequency table -- and the smoothing matters a lot
-    here specifically because the training set is small (~40 flag
-    readings as of 2026-09-11), so buckets with 0-2 real examples would
+    here specifically because the training set is small (~130 flag
+    readings as of 2026-09-15), so buckets with 0-2 real examples would
     otherwise give overconfident all-or-nothing probabilities. alpha=1
     (add-one smoothing) pulls sparse buckets toward the overall marginal
     P(flag=c) instead.
+
+    BUCKETING SIGNAL is max(sustained wind_speed_kt, wind_gust_kt), not
+    sustained wind alone (fixed 2026-09-15, user-reported: "i see red
+    23% for today... but i don't think today has a chance of red at all
+    personally from my experience"). Root cause found: matching each
+    flag reading to the single NEAREST instantaneous wind_speed_kt
+    sample is noisy right at the sample point -- a real Sept 14 evening
+    had gusts of 16-17kt (correctly flagged red by the dockmaster) but
+    the one sustained-wind sample nearest a couple of those flag
+    timestamps happened to catch a brief lull (~4-6kt), so those red
+    readings were polluting the LIGHT-wind bucket and inflating its red
+    probability well above what a sailor's actual experience would
+    suggest. Using max(wind, gust) as the bucketing key moves those
+    examples into the (correctly gustier) 16-20kt bucket where they
+    belong, and requires the same transform be applied to the forecast
+    side too (a model's forecast gust, not just its forecast sustained
+    wind) for the training and inference signals to stay consistent.
+    This is a compromise vs. a full 2D (wind_bucket x gust_bucket) joint
+    distribution, which would be strictly more faithful (gustiness is a
+    real, distinct signal from peak wind) but isn't viable yet at ~130
+    total examples -- most 2D cells would be too sparse for Dirichlet
+    smoothing to reflect real signal rather than just falling back to
+    the marginal prior. Revisit the full 2D grid once there's roughly
+    200-350+ training examples (some months of accumulated CBI-open-hours
+    history at the current hourly-poll rate).
     """
     model = params.get("model")
     hours = int(params.get("hours", "48"))
     location = "cbi_dockhouse"  # the only location with flag data
     variable = "wind_speed_kt"
+    gust_variable = "wind_gust_kt"
     if not model:
         return {"error": "model query param is required"}
     con = db()
     try:
-        # 1. Forecast wind for the selected model only, forward-looking.
+        # 1. Forecast wind AND gust for the selected model, forward-looking.
         forecast_rows = con.execute(
             """
             WITH latest_run AS (
@@ -465,23 +491,28 @@ def api_flag_prediction(params):
                 WHERE location_id = ? AND model = ?
                 QUALIFY row_number() OVER (ORDER BY init_time_utc DESC) = 1
             )
-            SELECT lr.init_time_utc, fv.valid_time_utc, fv.value
-            FROM forecast_values fv
-            JOIN latest_run lr ON lr.run_id = fv.run_id
-            WHERE fv.variable = ?
-              AND fv.valid_time_utc <= now() + (? * INTERVAL '1 hour')
-              AND fv.valid_time_utc >= now()
-            ORDER BY fv.valid_time_utc
+            SELECT lr.init_time_utc, fv_wind.valid_time_utc, fv_wind.value AS wind_kt,
+                   fv_gust.value AS gust_kt
+            FROM forecast_values fv_wind
+            JOIN latest_run lr ON lr.run_id = fv_wind.run_id
+            LEFT JOIN forecast_values fv_gust
+                ON fv_gust.run_id = fv_wind.run_id
+               AND fv_gust.valid_time_utc = fv_wind.valid_time_utc
+               AND fv_gust.variable = ?
+            WHERE fv_wind.variable = ?
+              AND fv_wind.valid_time_utc <= now() + (? * INTERVAL '1 hour')
+              AND fv_wind.valid_time_utc >= now()
+            ORDER BY fv_wind.valid_time_utc
             """,
-            [location, model, variable, hours],
+            [location, model, gust_variable, variable, hours],
         )
         forecast_points = rows_as_dicts(forecast_rows)
 
         # 2. Historical training pairs: each flag reading matched to the
-        # nearest real MIT Pavilion wind observation within 20 minutes.
-        # (CBI itself has no wind sensor -- only flag-color readings --
-        # so MIT Pavilion, a few hundred meters away on the same basin,
-        # stands in as the real wind ground-truth for training.)
+        # nearest real MIT Pavilion wind AND gust observations within 20
+        # minutes. (CBI itself has no wind sensor -- only flag-color
+        # readings -- so MIT Pavilion, a few hundred meters away on the
+        # same basin, stands in as the real wind ground-truth.)
         training_rows = con.execute(
             """
             SELECT f.flag_color,
@@ -489,23 +520,35 @@ def api_flag_prediction(params):
                     WHERE o.location_id = 'mit_pavilion' AND o.variable = ?
                       AND abs(epoch(o.ts_utc) - epoch(f.ts_utc)) <= 1200
                     ORDER BY abs(epoch(o.ts_utc) - epoch(f.ts_utc))
-                    LIMIT 1) AS wind_kt
+                    LIMIT 1) AS wind_kt,
+                   (SELECT o.value FROM observations o
+                    WHERE o.location_id = 'mit_pavilion' AND o.variable = ?
+                      AND abs(epoch(o.ts_utc) - epoch(f.ts_utc)) <= 1200
+                    ORDER BY abs(epoch(o.ts_utc) - epoch(f.ts_utc))
+                    LIMIT 1) AS gust_kt
             FROM flags f
             WHERE f.location_id = ?
             """,
-            [variable, location],
+            [variable, gust_variable, location],
         ).fetchall()
-        training_rows = [(color, wind) for (color, wind) in training_rows if wind is not None]
+        # Effective wind = max(sustained, gust) -- see docstring above.
+        # Falls back to whichever of the two is actually available if
+        # only one matched within the tolerance window.
+        training_rows = [
+            (color, max(w for w in (wind, gust) if w is not None))
+            for (color, wind, gust) in training_rows
+            if wind is not None or gust is not None
+        ]
 
         # 3. Build the joint bucket->color count table, then the Bayesian
         # posterior P(flag=c | wind_bucket=b) with Dirichlet(alpha=1)
         # smoothing per bucket.
         bucket_counts = {}  # bucket -> {color: count}
         marginal_counts = {c: 0 for c in FLAG_COLORS_ALL}
-        for color, wind in training_rows:
+        for color, effective_wind in training_rows:
             if color not in FLAG_COLORS_ALL:
                 continue
-            b = _wind_bucket(wind)
+            b = _wind_bucket(effective_wind)
             bucket_counts.setdefault(b, {c: 0 for c in FLAG_COLORS_ALL})
             bucket_counts[b][color] += 1
             marginal_counts[color] += 1
@@ -530,7 +573,9 @@ def api_flag_prediction(params):
         # and zero-out-and-renormalize "closed" during hours.
         predictions = []
         for row in forecast_points:
-            wind = row["value"]
+            wind = row["wind_kt"]
+            gust = row.get("gust_kt")
+            effective_wind = max((v for v in (wind, gust) if v is not None), default=None)
             valid_dt = row["valid_time_utc"]
             if isinstance(valid_dt, str):
                 valid_dt = datetime.fromisoformat(valid_dt)
@@ -540,17 +585,18 @@ def api_flag_prediction(params):
             if not is_cbi_open(valid_dt):
                 # Outside 9am-sunset: always closed, no wind-based estimate.
                 probs = {c: (1.0 if c == "closed" else 0.0) for c in FLAG_COLORS_ALL}
-                bucket = _wind_bucket(wind) if wind is not None else None
+                bucket = _wind_bucket(effective_wind) if effective_wind is not None else None
                 predictions.append({
                     "valid_time_utc": row["valid_time_utc"],
                     "wind_kt": wind,
+                    "gust_kt": gust,
                     "wind_bucket": bucket,
                     "flag_probabilities": probs,
                     "most_likely_flag": "closed",
                 })
                 continue
 
-            bucket = _wind_bucket(wind) if wind is not None else None
+            bucket = _wind_bucket(effective_wind) if effective_wind is not None else None
             probs = posterior_for_bucket(bucket) if bucket is not None else None
             if probs is not None:
                 # During open hours: drop "closed" entirely and
@@ -566,6 +612,7 @@ def api_flag_prediction(params):
             predictions.append({
                 "valid_time_utc": row["valid_time_utc"],
                 "wind_kt": wind,
+                "gust_kt": gust,
                 "wind_bucket": bucket,
                 "flag_probabilities": probs,
                 "most_likely_flag": max(probs, key=probs.get) if probs else None,

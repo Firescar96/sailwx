@@ -110,8 +110,8 @@
   </section>
 
   <section id="flag-prediction-panel" class="panel">
-    <h2>CBI Flag Prediction <span class="subtitle">(Bayesian: P(flag color | forecast wind), from one selected model)</span></h2>
-    <p class="subtitle">Not the same as the accuracy chart above -- this doesn't measure model error, it estimates "given this model's wind forecast, how likely is each flag color" using CBI's own historical wind-vs-flag pairing, with Bayesian smoothing so sparse wind ranges don't look falsely certain.</p>
+    <h2>CBI Flag Prediction <span class="subtitle">(Bayesian: P(flag color | forecast wind + gust), from one selected model)</span></h2>
+    <p class="subtitle">Not the same as the accuracy chart above -- this doesn't measure model error, it estimates "given this model's wind AND gust forecast, how likely is each flag color" using CBI's own historical wind/gust-vs-flag pairing (bucketed by the higher of the two, since a gusty light-wind hour behaves like a stronger steady wind), with Bayesian smoothing so sparse wind ranges don't look falsely certain.</p>
     <div class="controls inline">
       <label>
         Model

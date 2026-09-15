@@ -1016,7 +1016,7 @@ async function loadFlagPredictionChart() {
       tooltip.style('opacity', 1)
         .html(`<b>${d.key.toUpperCase()}</b>: ${(p.flag_probabilities[d.key] * 100).toFixed(1)}%<br>` +
               `${p.valid_time_utc.replace('T', ' ')} UTC<br>` +
-              `forecast wind: ${p.wind_kt != null ? p.wind_kt.toFixed(1) + ' kt' : 'n/a'} (${p.wind_bucket || 'n/a'})<br>` +
+              `forecast wind: ${p.wind_kt != null ? p.wind_kt.toFixed(1) + ' kt' : 'n/a'}, gust: ${p.gust_kt != null ? p.gust_kt.toFixed(1) + ' kt' : 'n/a'} (effective bucket: ${p.wind_bucket || 'n/a'})<br>` +
               `<i>most likely: ${p.most_likely_flag ? p.most_likely_flag.toUpperCase() : 'n/a'}</i>`)
         .style('left', (event.pageX + 12) + 'px')
         .style('top', (event.pageY - 10) + 'px');
