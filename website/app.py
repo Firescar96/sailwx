@@ -513,16 +513,31 @@ def api_flag_prediction(params):
         # minutes. (CBI itself has no wind sensor -- only flag-color
         # readings -- so MIT Pavilion, a few hundred meters away on the
         # same basin, stands in as the real wind ground-truth.)
+        #
+        # EXCLUDES quality='clipped_high' readings (added 2026-09-19,
+        # ahead of a forecast storm with GFS gusts to ~39kt): a clipped
+        # reading means MIT's graph axis maxed out and the TRUE value is
+        # >= what we recorded, not equal to it. Silently using a clipped
+        # 26kt reading as if it were exactly 26kt would systematically
+        # bucket genuinely extreme wind/gust events too LOW -- exactly
+        # backwards from what matters here, since storm data is the rare
+        # high-wind signal this model most needs. Better to skip a
+        # clipped point (falls back to the next-nearest good reading, or
+        # drops the flag row from training if none exists) than to teach
+        # the model a false "this was only ~26kt" for what might have
+        # actually been 35kt+.
         training_rows = con.execute(
             """
             SELECT f.flag_color,
                    (SELECT o.value FROM observations o
                     WHERE o.location_id = 'mit_pavilion' AND o.variable = ?
+                      AND (o.quality IS NULL OR o.quality != 'clipped_high')
                       AND abs(epoch(o.ts_utc) - epoch(f.ts_utc)) <= 1200
                     ORDER BY abs(epoch(o.ts_utc) - epoch(f.ts_utc))
                     LIMIT 1) AS wind_kt,
                    (SELECT o.value FROM observations o
                     WHERE o.location_id = 'mit_pavilion' AND o.variable = ?
+                      AND (o.quality IS NULL OR o.quality != 'clipped_high')
                       AND abs(epoch(o.ts_utc) - epoch(f.ts_utc)) <= 1200
                     ORDER BY abs(epoch(o.ts_utc) - epoch(f.ts_utc))
                     LIMIT 1) AS gust_kt
@@ -688,6 +703,17 @@ def api_wind_prediction(params):
         # values at this location, matched to the nearest real
         # observation within 7.5 minutes (same tolerance as
         # v_accuracy_by_lead_time).
+        #
+        # EXCLUDES quality='clipped_high' observations (added 2026-09-19,
+        # ahead of a forecast storm with GFS gusts to ~39kt) -- see
+        # api_flag_prediction's identical fix for the full rationale: a
+        # clipped MIT Pavilion reading means the true wind is >= the
+        # recorded value, not equal to it, so treating it as ground truth
+        # would systematically teach this model that extreme-wind
+        # forecasts verify LOWER than they actually did. Only affects
+        # locations with a `quality` column populated (currently just
+        # mit_pavilion); other sources are unaffected since their
+        # `quality` is always NULL and passes the filter either way.
         training_rows = con.execute(
             """
             WITH candidates AS (
@@ -703,6 +729,7 @@ def api_wind_prediction(params):
                 JOIN observations o
                     ON o.location_id = fr.location_id
                    AND o.variable = fv.variable
+                   AND (o.quality IS NULL OR o.quality != 'clipped_high')
                    AND o.ts_utc BETWEEN fv.valid_time_utc - INTERVAL '7.5 minutes'
                                      AND fv.valid_time_utc + INTERVAL '7.5 minutes'
                 WHERE fr.location_id = ? AND fr.model = ? AND fv.variable = ?
