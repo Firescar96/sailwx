@@ -59,11 +59,11 @@
           <option value="12">Next 12h</option>
           <option value="24">Next 24h</option>
           <option value="48">Next 48h</option>
-          <option value="72" selected>Next 72h</option>
+          <option value="72">Next 72h</option>
           <option value="120">Next 5 days</option>
           <option value="168">Next 7 days</option>
           <option value="240">Next 10 days</option>
-          <option value="336">Next 14 days</option>
+          <option value="336" selected>Next 14 days</option>
         </select>
       </label>
       <label>
@@ -71,10 +71,10 @@
         <select id="past-hours-select">
           <option value="0">Off</option>
           <option value="12">Last 12h</option>
-          <option value="24" selected>Last 24h</option>
+          <option value="24">Last 24h</option>
           <option value="48">Last 48h</option>
           <option value="72">Last 72h</option>
-          <option value="168">Last 7 days</option>
+          <option value="168" selected>Last 7 days</option>
         </select>
       </label>
     </div>
@@ -100,8 +100,10 @@
         <select id="stability-hours-select">
           <option value="24">Next 24h</option>
           <option value="48">Next 48h</option>
-          <option value="72" selected>Next 72h</option>
+          <option value="72">Next 72h</option>
           <option value="120">Next 5 days</option>
+          <option value="168">Next 7 days</option>
+          <option value="336" selected>Next 14 days</option>
         </select>
       </label>
     </div>
@@ -121,9 +123,11 @@
         Look ahead
         <select id="flag-prediction-hours-select">
           <option value="24">Next 24h</option>
-          <option value="48" selected>Next 48h</option>
+          <option value="48">Next 48h</option>
           <option value="72">Next 72h</option>
           <option value="120">Next 5 days</option>
+          <option value="168">Next 7 days</option>
+          <option value="336" selected>Next 14 days</option>
         </select>
       </label>
     </div>
@@ -143,9 +147,11 @@
         Look ahead
         <select id="wind-prediction-hours-select">
           <option value="24">Next 24h</option>
-          <option value="48" selected>Next 48h</option>
+          <option value="48">Next 48h</option>
           <option value="72">Next 72h</option>
           <option value="120">Next 5 days</option>
+          <option value="168">Next 7 days</option>
+          <option value="336" selected>Next 14 days</option>
         </select>
       </label>
     </div>
@@ -166,9 +172,9 @@
       <label>
         History window
         <select id="wind-rose-hours-select">
-          <option value="168">Last 7 days</option>
+          <option value="168" selected>Last 7 days</option>
           <option value="336">Last 14 days</option>
-          <option value="720" selected>Last 30 days</option>
+          <option value="720">Last 30 days</option>
         </select>
       </label>
     </div>
@@ -184,9 +190,9 @@
         Window
         <select id="gust-factor-hours-select">
           <option value="24">Last 24h</option>
-          <option value="48" selected>Last 48h</option>
+          <option value="48">Last 48h</option>
           <option value="72">Last 72h</option>
-          <option value="168">Last 7 days</option>
+          <option value="168" selected>Last 7 days</option>
         </select>
       </label>
     </div>

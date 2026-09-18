@@ -48,8 +48,8 @@ const state = {
   location: null,
   variable: 'wind_speed_kt',
   accuracyVarsByLocation: {}, // location_id -> Set(variable)
-  hours: 72,
-  pastHours: 24, // matches the <select> default in index.html (Last 24h) -- observed data visible by default
+  hours: 336, // matches the <select> default in index.html (Next 14 days) -- 14d is roughly GFS/ECMWF's own forecast horizon (the longest of the 6 models)
+  pastHours: 168, // matches the <select> default in index.html (Last 7 days)
   hiddenModels: new Set(), // model keys (or 'observed') toggled off via legend click
 };
 
