@@ -1322,16 +1322,38 @@ async function loadWindRoseChart() {
 
 // ---------------------------------------------------------------------------
 // Gustiness panel: primary chart is the absolute gust delta (gust minus
-// sustained, in kt) over time; secondary is a sustained-vs-gust scatter.
-// REDESIGNED 2026-09-19 per user: "let's talk about some better graphs to
-// represent the gustiness factor because 10x gust is different if wind is
-// 10 knots vs 1 knot base." The old chart plotted the RATIO alone, which
-// is misleading at low wind (dividing by a small base wind inflates the
-// ratio even for a mild absolute gust) -- see api_gust_factor's docstring
-// in app.py for the empirical numbers that motivated this. Delta is now
-// primary because "+5kt of gust" means the same real thing regardless of
-// the base wind, unlike a ratio.
+// sustained, in kt) over time, colored by gust/sustained ratio; secondary
+// is a sustained-vs-gust scatter, same color scheme. REDESIGNED 2026-09-19
+// per user: "let's talk about some better graphs to represent the
+// gustiness factor because 10x gust is different if wind is 10 knots vs 1
+// knot base." The old chart plotted the RATIO alone, which is misleading
+// at low wind (dividing by a small base wind inflates the ratio even for
+// a mild absolute gust) -- see api_gust_factor's docstring in app.py for
+// the empirical numbers that motivated this. Delta is now the primary
+// Y-axis/line metric because "+5kt of gust" means the same real thing
+// regardless of the base wind, unlike a ratio -- but per user follow-up
+// ("I like colors on the gust factor, do not null it at all at low wind"
+// then "grey out 3knots and below... add similar color scale... to 1d
+// chart"), the ratio is still shown as color on both charts, with points
+// at GUST_COLOR_GREY_BELOW_KT sustained wind or below rendered a flat
+// grey instead of colored -- not because the ratio is hidden/unavailable
+// (the backend always computes it now), but because a few near-zero-wind
+// points have such extreme ratios (up to ~20x) that including them in the
+// color domain washed out all the real variation in the rest of the plot.
 // ---------------------------------------------------------------------------
+
+const GUST_COLOR_GREY_BELOW_KT = 3.0;
+
+function gustColorScaleFor(data) {
+  const colorable = data.filter(d => d.gust_factor != null && d.sustained_kt > GUST_COLOR_GREY_BELOW_KT);
+  const colorDomain = colorable.length ? d3.extent(colorable, d => d.gust_factor) : [1, 2];
+  return d3.scaleSequential(d3.interpolateYlOrRd).domain(colorDomain);
+}
+
+function gustColorFor(d, color) {
+  if (d.gust_factor == null || d.sustained_kt <= GUST_COLOR_GREY_BELOW_KT) return 'var(--muted)';
+  return color(d.gust_factor);
+}
 
 async function loadGustFactorChart() {
   const hours = +d3.select('#gust-factor-hours-select').property('value');
@@ -1356,13 +1378,14 @@ async function loadGustFactorChart() {
 
   const width = Math.min(900, container.node().clientWidth || 900);
   const height = 280;
-  const margin = { top: 20, right: 20, bottom: 60, left: 55 };
+  const margin = { top: 20, right: 70, bottom: 60, left: 55 };
 
   const x = d3.scaleTime().domain(d3.extent(data, d => d.ts_utc_date)).range([margin.left, width - margin.right]);
   const y = d3.scaleLinear()
     .domain([0, Math.max(2, d3.max(data, d => d.gust_delta_kt) * 1.1)])
     .nice()
     .range([height - margin.bottom, margin.top]);
+  const color = gustColorScaleFor(data);
 
   const svg = container.append('svg').attr('width', width).attr('height', height);
 
@@ -1374,12 +1397,15 @@ async function loadGustFactorChart() {
     .attr('x1', margin.left).attr('x2', width - margin.right)
     .attr('y1', d => y(d)).attr('y2', d => y(d));
 
+  // Connecting line stays a single neutral color (a multi-color line is
+  // hard to read); the colored DOTS carry the ratio signal instead.
   const line = d3.line().x(d => x(d.ts_utc_date)).y(d => y(d.gust_delta_kt));
   svg.append('path')
     .datum(data)
     .attr('fill', 'none')
-    .attr('stroke', getCssVar('--hrrr') || '#ff8a65')
-    .attr('stroke-width', 1.8)
+    .attr('stroke', 'var(--muted)')
+    .attr('stroke-width', 1)
+    .attr('opacity', 0.5)
     .attr('d', line);
 
   const tooltip = d3.select('body').append('div').attr('class', 'point-tooltip');
@@ -1389,10 +1415,10 @@ async function loadGustFactorChart() {
     .attr('class', 'gust-dot')
     .attr('cx', d => x(d.ts_utc_date))
     .attr('cy', d => y(d.gust_delta_kt))
-    .attr('r', 2.5)
-    .attr('fill', getCssVar('--hrrr') || '#ff8a65')
+    .attr('r', 2.8)
+    .attr('fill', d => gustColorFor(d, color))
     .on('mousemove', (event, d) => {
-      const factorText = d.gust_factor != null ? `${d.gust_factor}x` : 'n/a (wind too light for a stable ratio)';
+      const factorText = d.gust_factor != null ? `${d.gust_factor}x` : 'n/a (0kt sustained)';
       tooltip.style('opacity', 1)
         .html(`<b>+${d.gust_delta_kt}kt</b><br>${d.ts_utc}<br>sustained: ${d.sustained_kt}kt, gust: ${d.gust_kt}kt<br>ratio: ${factorText}`)
         .style('left', (event.pageX + 12) + 'px')
@@ -1421,7 +1447,46 @@ async function loadGustFactorChart() {
     .attr('font-size', '0.75rem')
     .text('Gust delta (gust - sustained, kt)');
 
+  drawGustColorLegend(svg, color, width, height, margin);
+
   loadGustScatterChart(data);
+}
+
+// Shared color-legend renderer for both the 1D and 2D gustiness charts --
+// factored out so the two stay visually consistent (same gradient, same
+// "grey = <=3kt" caption) rather than drifting apart over time.
+function drawGustColorLegend(svg, color, width, height, margin) {
+  const legendHeight = Math.min(140, height - margin.top - margin.bottom);
+  const legendX = width - margin.right + 20;
+  const legendScale = d3.scaleLinear().domain(color.domain()).range([legendHeight, 0]);
+  const gradientId = `gust-ratio-gradient-${Math.random().toString(36).slice(2)}`;
+  const defs = svg.append('defs');
+  const gradient = defs.append('linearGradient')
+    .attr('id', gradientId).attr('x1', '0%').attr('x2', '0%').attr('y1', '100%').attr('y2', '0%');
+  const stops = 10;
+  const [lo, hi] = color.domain();
+  for (let i = 0; i <= stops; i++) {
+    const t = i / stops;
+    gradient.append('stop').attr('offset', `${t * 100}%`).attr('stop-color', color(lo + t * (hi - lo)));
+  }
+  svg.append('rect')
+    .attr('x', legendX).attr('y', margin.top).attr('width', 14).attr('height', legendHeight)
+    .attr('fill', `url(#${gradientId})`);
+  svg.append('g')
+    .attr('class', 'axis')
+    .attr('transform', `translate(${legendX + 14},${margin.top})`)
+    .call(d3.axisRight(legendScale).ticks(4).tickFormat(d => d.toFixed(1) + 'x'));
+  svg.append('text')
+    .attr('x', legendX + 7).attr('y', margin.top - 6)
+    .attr('text-anchor', 'middle').attr('fill', 'var(--muted)').attr('font-size', '0.65rem')
+    .text('ratio');
+  svg.append('rect')
+    .attr('x', legendX).attr('y', margin.top + legendHeight + 10).attr('width', 10).attr('height', 10)
+    .attr('fill', 'var(--muted)');
+  svg.append('text')
+    .attr('x', legendX + 14).attr('y', margin.top + legendHeight + 19)
+    .attr('fill', 'var(--muted)').attr('font-size', '0.62rem')
+    .text(`<=${GUST_COLOR_GREY_BELOW_KT}kt`);
 }
 
 function loadGustScatterChart(data) {
@@ -1446,10 +1511,7 @@ function loadGustScatterChart(data) {
 
   const x = d3.scaleLinear().domain([0, maxAxis]).range([margin.left, width - margin.right]).nice();
   const y = d3.scaleLinear().domain([0, maxAxis]).range([height - margin.bottom, margin.top]).nice();
-
-  const withRatio = data.filter(d => d.gust_factor != null);
-  const colorDomain = withRatio.length ? d3.extent(withRatio, d => d.gust_factor) : [1, 2];
-  const color = d3.scaleSequential(d3.interpolateYlOrRd).domain(colorDomain);
+  const color = gustColorScaleFor(data);
 
   const svg = container.append('svg').attr('width', width).attr('height', height);
 
@@ -1490,10 +1552,10 @@ function loadGustScatterChart(data) {
     .attr('cx', d => x(d.sustained_kt))
     .attr('cy', d => y(d.gust_kt))
     .attr('r', 3)
-    .attr('fill', d => d.gust_factor != null ? color(d.gust_factor) : 'var(--muted)')
-    .attr('opacity', d => d.gust_factor != null ? 0.8 : 0.35)
+    .attr('fill', d => gustColorFor(d, color))
+    .attr('opacity', 0.8)
     .on('mousemove', (event, d) => {
-      const factorText = d.gust_factor != null ? `${d.gust_factor}x` : 'n/a (wind too light for a stable ratio)';
+      const factorText = d.gust_factor != null ? `${d.gust_factor}x` : 'n/a (0kt sustained)';
       tooltip.style('opacity', 1)
         .html(`sustained: ${d.sustained_kt}kt, gust: ${d.gust_kt}kt<br>+${d.gust_delta_kt}kt, ratio: ${factorText}<br>${d.ts_utc}`)
         .style('left', (event.pageX + 12) + 'px')
@@ -1523,34 +1585,7 @@ function loadGustScatterChart(data) {
     .attr('font-size', '0.75rem')
     .text('Gust (kt)');
 
-  // color legend for the ratio, only meaningful above GUST_FACTOR_MIN_WIND_KT
-  if (withRatio.length) {
-    const legendHeight = height - margin.top - margin.bottom;
-    const legendX = width - margin.right + 20;
-    const legendScale = d3.scaleLinear().domain(colorDomain).range([legendHeight, 0]);
-    const gradientId = 'gust-ratio-gradient';
-    const defs = svg.append('defs');
-    const gradient = defs.append('linearGradient')
-      .attr('id', gradientId).attr('x1', '0%').attr('x2', '0%').attr('y1', '100%').attr('y2', '0%');
-    const stops = 10;
-    for (let i = 0; i <= stops; i++) {
-      const t = i / stops;
-      gradient.append('stop')
-        .attr('offset', `${t * 100}%`)
-        .attr('stop-color', color(colorDomain[0] + t * (colorDomain[1] - colorDomain[0])));
-    }
-    svg.append('rect')
-      .attr('x', legendX).attr('y', margin.top).attr('width', 14).attr('height', legendHeight)
-      .attr('fill', `url(#${gradientId})`);
-    svg.append('g')
-      .attr('class', 'axis')
-      .attr('transform', `translate(${legendX + 14},${margin.top})`)
-      .call(d3.axisRight(legendScale).ticks(4).tickFormat(d => d.toFixed(1) + 'x'));
-    svg.append('text')
-      .attr('x', legendX + 7).attr('y', margin.top - 6)
-      .attr('text-anchor', 'middle').attr('fill', 'var(--muted)').attr('font-size', '0.65rem')
-      .text('ratio');
-  }
+  drawGustColorLegend(svg, color, width, height, margin);
 }
 
 init().catch(err => {

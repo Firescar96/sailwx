@@ -768,7 +768,6 @@ def api_wind_prediction(params):
 
 WIND_ROSE_DIRECTIONS = 16  # standard 16-point compass rose (22.5-degree sectors)
 WIND_ROSE_SPEED_BINS = [(0, 5), (5, 10), (10, 15), (15, 20), (20, 25), (25, None)]  # kt
-GUST_FACTOR_MIN_WIND_KT = 5.0  # below this, gust/sustained ratio is too noisy to be meaningful (see api_gust_factor)
 
 
 def _compass_sector(deg, n=WIND_ROSE_DIRECTIONS):
@@ -900,12 +899,12 @@ def api_gust_factor(params):
     Fix: `gust_delta_kt` (gust - sustained, in knots) is now the primary
     metric -- directly answers "how many extra knots could hit me,"
     unaffected by low-wind division blowup. `gust_factor` (the ratio) is
-    still returned for backward compatibility / the secondary scatter
-    view, but is nulled out (`gust_factor: null`) below
-    GUST_FACTOR_MIN_WIND_KT sustained wind, since the ratio is
-    genuinely not a meaningful/stable number that close to zero --
-    small measurement noise in the denominator causes huge ratio swings
-    that don't reflect a real change in conditions.
+    still always computed and returned (user 2026-09-19: "I like colors
+    on the gust factor, do not null it at all at low wind" -- explicitly
+    wants the ratio visible/colored across the full wind range, low-wind
+    caveats notwithstanding); only genuinely undefined at sustained_kt=0
+    (division by zero), which is left as None since there's no ratio to
+    report, not because the wind was "too light."
     """
     location = params.get("location")
     hours = int(params.get("hours", "72"))
@@ -932,11 +931,7 @@ def api_gust_factor(params):
         for ts_utc, sustained_kt, gust_kt in rows:
             if sustained_kt is None or gust_kt is None or sustained_kt < 0:
                 continue
-            gust_factor = (
-                round(gust_kt / sustained_kt, 3)
-                if sustained_kt >= GUST_FACTOR_MIN_WIND_KT
-                else None
-            )
+            gust_factor = round(gust_kt / sustained_kt, 3) if sustained_kt > 0 else None
             out.append({
                 "ts_utc": ts_utc.isoformat(),
                 "sustained_kt": sustained_kt,
