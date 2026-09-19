@@ -1320,6 +1320,19 @@ async function loadWindRoseChart() {
 // potentially more hazardous than steady wind of the same average speed.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Gustiness panel: primary chart is the absolute gust delta (gust minus
+// sustained, in kt) over time; secondary is a sustained-vs-gust scatter.
+// REDESIGNED 2026-09-19 per user: "let's talk about some better graphs to
+// represent the gustiness factor because 10x gust is different if wind is
+// 10 knots vs 1 knot base." The old chart plotted the RATIO alone, which
+// is misleading at low wind (dividing by a small base wind inflates the
+// ratio even for a mild absolute gust) -- see api_gust_factor's docstring
+// in app.py for the empirical numbers that motivated this. Delta is now
+// primary because "+5kt of gust" means the same real thing regardless of
+// the base wind, unlike a ratio.
+// ---------------------------------------------------------------------------
+
 async function loadGustFactorChart() {
   const hours = +d3.select('#gust-factor-hours-select').property('value');
   if (!state.location) return;
@@ -1347,7 +1360,7 @@ async function loadGustFactorChart() {
 
   const x = d3.scaleTime().domain(d3.extent(data, d => d.ts_utc_date)).range([margin.left, width - margin.right]);
   const y = d3.scaleLinear()
-    .domain([1, Math.max(2, d3.max(data, d => d.gust_factor) * 1.1)])
+    .domain([0, Math.max(2, d3.max(data, d => d.gust_delta_kt) * 1.1)])
     .nice()
     .range([height - margin.bottom, margin.top]);
 
@@ -1361,17 +1374,7 @@ async function loadGustFactorChart() {
     .attr('x1', margin.left).attr('x2', width - margin.right)
     .attr('y1', d => y(d)).attr('y2', d => y(d));
 
-  // Reference line at 1.0 (perfectly steady wind, no gusting at all)
-  svg.append('line')
-    .attr('x1', margin.left).attr('x2', width - margin.right)
-    .attr('y1', y(1)).attr('y2', y(1))
-    .attr('stroke', 'var(--muted)').attr('stroke-dasharray', '4,3').attr('opacity', 0.6);
-  svg.append('text')
-    .attr('x', width - margin.right).attr('y', y(1) - 4)
-    .attr('text-anchor', 'end').attr('fill', 'var(--muted)').attr('font-size', '0.65rem')
-    .text('steady (1.0)');
-
-  const line = d3.line().x(d => x(d.ts_utc_date)).y(d => y(d.gust_factor));
+  const line = d3.line().x(d => x(d.ts_utc_date)).y(d => y(d.gust_delta_kt));
   svg.append('path')
     .datum(data)
     .attr('fill', 'none')
@@ -1385,12 +1388,13 @@ async function loadGustFactorChart() {
     .join('circle')
     .attr('class', 'gust-dot')
     .attr('cx', d => x(d.ts_utc_date))
-    .attr('cy', d => y(d.gust_factor))
+    .attr('cy', d => y(d.gust_delta_kt))
     .attr('r', 2.5)
     .attr('fill', getCssVar('--hrrr') || '#ff8a65')
     .on('mousemove', (event, d) => {
+      const factorText = d.gust_factor != null ? `${d.gust_factor}x` : 'n/a (wind too light for a stable ratio)';
       tooltip.style('opacity', 1)
-        .html(`<b>${d.gust_factor}x</b><br>${d.ts_utc}<br>sustained: ${d.sustained_kt}kt, gust: ${d.gust_kt}kt`)
+        .html(`<b>+${d.gust_delta_kt}kt</b><br>${d.ts_utc}<br>sustained: ${d.sustained_kt}kt, gust: ${d.gust_kt}kt<br>ratio: ${factorText}`)
         .style('left', (event.pageX + 12) + 'px')
         .style('top', (event.pageY - 10) + 'px');
     })
@@ -1407,7 +1411,7 @@ async function loadGustFactorChart() {
   svg.append('g')
     .attr('class', 'axis')
     .attr('transform', `translate(${margin.left},0)`)
-    .call(d3.axisLeft(y).ticks(5).tickFormat(d => d + 'x'));
+    .call(d3.axisLeft(y).ticks(5).tickFormat(d => d + 'kt'));
 
   svg.append('text')
     .attr('x', -height / 2).attr('y', 16)
@@ -1415,7 +1419,138 @@ async function loadGustFactorChart() {
     .attr('text-anchor', 'middle')
     .attr('fill', 'var(--muted)')
     .attr('font-size', '0.75rem')
-    .text('Gust Factor (gust / sustained)');
+    .text('Gust delta (gust - sustained, kt)');
+
+  loadGustScatterChart(data);
+}
+
+function loadGustScatterChart(data) {
+  const container = d3.select('#gust-scatter-chart');
+  container.selectAll('*').remove();
+  const empty = d3.select('#gust-scatter-empty');
+
+  if (!data || !data.length) {
+    empty.attr('hidden', null).text('No gust data yet for this location/window.');
+    return;
+  }
+  empty.attr('hidden', true);
+
+  const width = Math.min(900, container.node().clientWidth || 900);
+  const height = 340;
+  const margin = { top: 20, right: 70, bottom: 55, left: 55 };
+
+  const maxAxis = Math.max(
+    d3.max(data, d => d.sustained_kt),
+    d3.max(data, d => d.gust_kt)
+  ) * 1.05;
+
+  const x = d3.scaleLinear().domain([0, maxAxis]).range([margin.left, width - margin.right]).nice();
+  const y = d3.scaleLinear().domain([0, maxAxis]).range([height - margin.bottom, margin.top]).nice();
+
+  const withRatio = data.filter(d => d.gust_factor != null);
+  const colorDomain = withRatio.length ? d3.extent(withRatio, d => d.gust_factor) : [1, 2];
+  const color = d3.scaleSequential(d3.interpolateYlOrRd).domain(colorDomain);
+
+  const svg = container.append('svg').attr('width', width).attr('height', height);
+
+  svg.append('g')
+    .selectAll('line.grid-x')
+    .data(x.ticks(6))
+    .join('line')
+    .attr('class', 'grid-line')
+    .attr('y1', margin.top).attr('y2', height - margin.bottom)
+    .attr('x1', d => x(d)).attr('x2', d => x(d));
+  svg.append('g')
+    .selectAll('line.grid-y')
+    .data(y.ticks(6))
+    .join('line')
+    .attr('class', 'grid-line')
+    .attr('x1', margin.left).attr('x2', width - margin.right)
+    .attr('y1', d => y(d)).attr('y2', d => y(d));
+
+  // y=x reference line: points ON this line mean gust == sustained (no
+  // gusting at all); points further above it mean progressively gustier
+  // conditions, in absolute-knots terms -- this is the visual equivalent
+  // of the primary chart's delta metric, but shown against the full
+  // wind-speed range at once instead of as a time series.
+  svg.append('line')
+    .attr('x1', x(0)).attr('y1', y(0))
+    .attr('x2', x(maxAxis)).attr('y2', y(maxAxis))
+    .attr('stroke', 'var(--muted)').attr('stroke-dasharray', '4,3').attr('opacity', 0.6);
+  svg.append('text')
+    .attr('x', x(maxAxis) - 4).attr('y', y(maxAxis) - 6)
+    .attr('text-anchor', 'end').attr('fill', 'var(--muted)').attr('font-size', '0.65rem')
+    .text('gust = sustained (steady)');
+
+  const tooltip = d3.select('body').append('div').attr('class', 'point-tooltip');
+  svg.selectAll('circle.scatter-dot')
+    .data(data)
+    .join('circle')
+    .attr('class', 'scatter-dot')
+    .attr('cx', d => x(d.sustained_kt))
+    .attr('cy', d => y(d.gust_kt))
+    .attr('r', 3)
+    .attr('fill', d => d.gust_factor != null ? color(d.gust_factor) : 'var(--muted)')
+    .attr('opacity', d => d.gust_factor != null ? 0.8 : 0.35)
+    .on('mousemove', (event, d) => {
+      const factorText = d.gust_factor != null ? `${d.gust_factor}x` : 'n/a (wind too light for a stable ratio)';
+      tooltip.style('opacity', 1)
+        .html(`sustained: ${d.sustained_kt}kt, gust: ${d.gust_kt}kt<br>+${d.gust_delta_kt}kt, ratio: ${factorText}<br>${d.ts_utc}`)
+        .style('left', (event.pageX + 12) + 'px')
+        .style('top', (event.pageY - 10) + 'px');
+    })
+    .on('mouseleave', () => tooltip.style('opacity', 0));
+
+  svg.append('g')
+    .attr('class', 'axis')
+    .attr('transform', `translate(0,${height - margin.bottom})`)
+    .call(d3.axisBottom(x).ticks(6).tickFormat(d => d + 'kt'));
+  svg.append('g')
+    .attr('class', 'axis')
+    .attr('transform', `translate(${margin.left},0)`)
+    .call(d3.axisLeft(y).ticks(6).tickFormat(d => d + 'kt'));
+
+  svg.append('text')
+    .attr('x', width / 2).attr('y', height - 6)
+    .attr('text-anchor', 'middle')
+    .attr('fill', 'var(--muted)').attr('font-size', '0.72rem')
+    .text('Sustained wind (kt)');
+  svg.append('text')
+    .attr('x', -height / 2).attr('y', 16)
+    .attr('transform', 'rotate(-90)')
+    .attr('text-anchor', 'middle')
+    .attr('fill', 'var(--muted)')
+    .attr('font-size', '0.75rem')
+    .text('Gust (kt)');
+
+  // color legend for the ratio, only meaningful above GUST_FACTOR_MIN_WIND_KT
+  if (withRatio.length) {
+    const legendHeight = height - margin.top - margin.bottom;
+    const legendX = width - margin.right + 20;
+    const legendScale = d3.scaleLinear().domain(colorDomain).range([legendHeight, 0]);
+    const gradientId = 'gust-ratio-gradient';
+    const defs = svg.append('defs');
+    const gradient = defs.append('linearGradient')
+      .attr('id', gradientId).attr('x1', '0%').attr('x2', '0%').attr('y1', '100%').attr('y2', '0%');
+    const stops = 10;
+    for (let i = 0; i <= stops; i++) {
+      const t = i / stops;
+      gradient.append('stop')
+        .attr('offset', `${t * 100}%`)
+        .attr('stop-color', color(colorDomain[0] + t * (colorDomain[1] - colorDomain[0])));
+    }
+    svg.append('rect')
+      .attr('x', legendX).attr('y', margin.top).attr('width', 14).attr('height', legendHeight)
+      .attr('fill', `url(#${gradientId})`);
+    svg.append('g')
+      .attr('class', 'axis')
+      .attr('transform', `translate(${legendX + 14},${margin.top})`)
+      .call(d3.axisRight(legendScale).ticks(4).tickFormat(d => d.toFixed(1) + 'x'));
+    svg.append('text')
+      .attr('x', legendX + 7).attr('y', margin.top - 6)
+      .attr('text-anchor', 'middle').attr('fill', 'var(--muted)').attr('font-size', '0.65rem')
+      .text('ratio');
+  }
 }
 
 init().catch(err => {

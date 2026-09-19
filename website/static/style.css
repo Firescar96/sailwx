@@ -119,6 +119,14 @@ main {
   font-weight: normal;
 }
 
+.subsection-title {
+  margin: 20px 0 4px;
+  font-size: 0.9rem;
+  color: var(--muted);
+  border-top: 1px solid var(--border, #333);
+  padding-top: 14px;
+}
+
 .conditions-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));

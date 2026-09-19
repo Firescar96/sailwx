@@ -183,8 +183,8 @@
   </section>
 
   <section id="gust-factor-panel" class="panel" hidden>
-    <h2>Gust Factor <span class="subtitle">(gust speed &divide; sustained speed)</span></h2>
-    <p class="subtitle">A ratio near 1.0 means steady wind; a high ratio means gusty, variable conditions that can be more hazardous to sail in than steady-but-stronger wind of the same average speed. Only shown at locations with real gust sensor data.</p>
+    <h2>Gustiness <span class="subtitle">(extra wind above the sustained speed)</span></h2>
+    <p class="subtitle">Primary chart: gust minus sustained speed, in knots -- directly answers "how many extra knots could hit me," and unlike a ratio, a +5kt gust means the same thing whether the base wind is 2kt or 20kt. Below shows the underlying sustained-vs-gust relationship as a scatter (color = gust/sustained ratio, only shown above ~5kt sustained where the ratio is meaningful -- dividing by a near-zero base wind makes the ratio swing wildly without reflecting a real change in conditions).</p>
     <div class="controls inline">
       <label>
         Window
@@ -198,6 +198,9 @@
     </div>
     <div id="gust-factor-chart"></div>
     <div id="gust-factor-empty" class="empty-msg" hidden></div>
+    <h3 class="subsection-title">Sustained vs. Gust Scatter</h3>
+    <div id="gust-scatter-chart"></div>
+    <div id="gust-scatter-empty" class="empty-msg" hidden></div>
   </section>
 </main>
 

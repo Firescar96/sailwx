@@ -768,6 +768,7 @@ def api_wind_prediction(params):
 
 WIND_ROSE_DIRECTIONS = 16  # standard 16-point compass rose (22.5-degree sectors)
 WIND_ROSE_SPEED_BINS = [(0, 5), (5, 10), (10, 15), (15, 20), (20, 25), (25, None)]  # kt
+GUST_FACTOR_MIN_WIND_KT = 5.0  # below this, gust/sustained ratio is too noisy to be meaningful (see api_gust_factor)
 
 
 def _compass_sector(deg, n=WIND_ROSE_DIRECTIONS):
@@ -880,14 +881,31 @@ def api_wind_rose(params):
 
 
 def api_gust_factor(params):
-    """Gust factor (gust_kt / sustained_kt) time series for a location.
-    A genuinely different signal from raw speed/gust (user 2026-09-11:
-    "gust factor / variability chart... but only on places with observed
-    wind data") -- gusty-but-moderate conditions (high ratio) can be
-    more hazardous to sail in than steady-but-stronger wind (ratio near
-    1.0), and this ratio is invisible in the existing speed-only charts
-    even though both wind_speed_kt and wind_gust_kt are already ingested
-    everywhere that has real wind sensors.
+    """Gustiness data for a location: BOTH the absolute gust delta
+    (gust_kt - sustained_kt) and the ratio (gust_kt / sustained_kt),
+    for a location's wind_speed_kt/wind_gust_kt observation pairs.
+
+    REDESIGNED 2026-09-19 per user: "let's talk about some better
+    graphs to represent the gustiness factor because 10x gust is
+    different if wind is 10 knots vs 1 knot base." Confirmed
+    empirically against MIT Pavilion's own data: the ratio metric is
+    systematically misleading at low wind purely because dividing by a
+    small number inflates it -- 0-3kt wind showed avg ratio 3.04x (looks
+    "extremely gusty") for an absolute gust of only +2.6kt, while 6-10kt
+    wind showed a calmer-looking 1.40x ratio for a very similar +2.8kt
+    absolute gust. The ratio was telling two nearly-identical real
+    gustiness events "extremely gusty" and "not very gusty" respectively,
+    purely as an artifact of the denominator.
+
+    Fix: `gust_delta_kt` (gust - sustained, in knots) is now the primary
+    metric -- directly answers "how many extra knots could hit me,"
+    unaffected by low-wind division blowup. `gust_factor` (the ratio) is
+    still returned for backward compatibility / the secondary scatter
+    view, but is nulled out (`gust_factor: null`) below
+    GUST_FACTOR_MIN_WIND_KT sustained wind, since the ratio is
+    genuinely not a meaningful/stable number that close to zero --
+    small measurement noise in the denominator causes huge ratio swings
+    that don't reflect a real change in conditions.
     """
     location = params.get("location")
     hours = int(params.get("hours", "72"))
@@ -905,20 +923,26 @@ def api_gust_factor(params):
                AND o_gst.ts_utc = o_spd.ts_utc
             WHERE o_spd.location_id = ? AND o_spd.variable = 'wind_speed_kt'
               AND o_spd.ts_utc >= now() - (? * INTERVAL '1 hour')
-              AND o_spd.value > 0
+              AND o_spd.value >= 0
             ORDER BY o_spd.ts_utc
             """,
             [location, hours],
         ).fetchall()
         out = []
         for ts_utc, sustained_kt, gust_kt in rows:
-            if sustained_kt is None or gust_kt is None or sustained_kt <= 0:
+            if sustained_kt is None or gust_kt is None or sustained_kt < 0:
                 continue
+            gust_factor = (
+                round(gust_kt / sustained_kt, 3)
+                if sustained_kt >= GUST_FACTOR_MIN_WIND_KT
+                else None
+            )
             out.append({
                 "ts_utc": ts_utc.isoformat(),
                 "sustained_kt": sustained_kt,
                 "gust_kt": gust_kt,
-                "gust_factor": round(gust_kt / sustained_kt, 3),
+                "gust_delta_kt": round(gust_kt - sustained_kt, 1),
+                "gust_factor": gust_factor,
             })
         return out
     finally:
