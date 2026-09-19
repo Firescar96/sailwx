@@ -905,9 +905,25 @@ def api_gust_factor(params):
     caveats notwithstanding); only genuinely undefined at sustained_kt=0
     (division by zero), which is left as None since there's no ratio to
     report, not because the wind was "too light."
+
+    ONE-DAY FORWARD EXTENSION (added 2026-09-19, user: "I need to be
+    able to see a one day forward looking addition to the charts, with
+    past data using observed data only, and future data using a model
+    of my choice"): if `forecast_model` is given, appends up to 24h of
+    FORECAST-derived gustiness points (that model's own wind_speed_kt
+    and wind_gust_kt forecasts, same location, joined on valid_time_utc
+    from its single latest run) after the observed history. Returned as
+    a SEPARATE `forecast` array (not merged into `observed`) so the
+    frontend can render them with a visually distinct treatment (dashed
+    line / different color) -- this is a genuine response-shape change
+    from the old flat-array return, both charts' JS updated accordingly.
+    If `forecast_model` is omitted, `forecast` is always `[]` and
+    `observed` behaves exactly like the old flat-array response did.
     """
     location = params.get("location")
     hours = int(params.get("hours", "72"))
+    forecast_model = params.get("forecast_model")
+    forecast_hours = int(params.get("forecast_hours", "24"))
     if not location:
         return {"error": "location query param is required"}
     con = db()
@@ -927,19 +943,56 @@ def api_gust_factor(params):
             """,
             [location, hours],
         ).fetchall()
-        out = []
+        observed = []
         for ts_utc, sustained_kt, gust_kt in rows:
             if sustained_kt is None or gust_kt is None or sustained_kt < 0:
                 continue
             gust_factor = round(gust_kt / sustained_kt, 3) if sustained_kt > 0 else None
-            out.append({
+            observed.append({
                 "ts_utc": ts_utc.isoformat(),
                 "sustained_kt": sustained_kt,
                 "gust_kt": gust_kt,
                 "gust_delta_kt": round(gust_kt - sustained_kt, 1),
                 "gust_factor": gust_factor,
             })
-        return out
+
+        forecast = []
+        if forecast_model:
+            fc_rows = con.execute(
+                """
+                WITH latest_run AS (
+                    SELECT run_id
+                    FROM forecast_runs
+                    WHERE location_id = ? AND model = ?
+                    QUALIFY row_number() OVER (ORDER BY init_time_utc DESC) = 1
+                )
+                SELECT fv_spd.valid_time_utc, fv_spd.value AS sustained_kt, fv_gst.value AS gust_kt
+                FROM forecast_values fv_spd
+                JOIN latest_run lr ON lr.run_id = fv_spd.run_id
+                LEFT JOIN forecast_values fv_gst
+                    ON fv_gst.run_id = fv_spd.run_id
+                   AND fv_gst.valid_time_utc = fv_spd.valid_time_utc
+                   AND fv_gst.variable = 'wind_gust_kt'
+                WHERE fv_spd.variable = 'wind_speed_kt'
+                  AND fv_spd.valid_time_utc >= now()
+                  AND fv_spd.valid_time_utc <= now() + (? * INTERVAL '1 hour')
+                ORDER BY fv_spd.valid_time_utc
+                """,
+                [location, forecast_model, forecast_hours],
+            ).fetchall()
+            for valid_time_utc, sustained_kt, gust_kt in fc_rows:
+                if sustained_kt is None or gust_kt is None or sustained_kt < 0:
+                    continue
+                gust_factor = round(gust_kt / sustained_kt, 3) if sustained_kt > 0 else None
+                forecast.append({
+                    "ts_utc": valid_time_utc.isoformat(),
+                    "sustained_kt": sustained_kt,
+                    "gust_kt": gust_kt,
+                    "gust_delta_kt": round(gust_kt - sustained_kt, 1),
+                    "gust_factor": gust_factor,
+                })
+
+        return {"observed": observed, "forecast": forecast, "forecast_model": forecast_model}
     finally:
         con.close()
 

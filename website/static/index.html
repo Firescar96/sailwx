@@ -184,7 +184,7 @@
 
   <section id="gust-factor-panel" class="panel" hidden>
     <h2>Gustiness <span class="subtitle">(extra wind above the sustained speed)</span></h2>
-    <p class="subtitle">Primary chart: gust minus sustained speed, in knots -- directly answers "how many extra knots could hit me," and unlike a ratio, a +5kt gust means the same thing whether the base wind is 2kt or 20kt. Below shows the underlying sustained-vs-gust relationship as a scatter, colored by gust/sustained ratio across the full wind range (note: at very light wind, dividing by a near-zero base wind can make the ratio swing wildly even for a small absolute gust -- cross-check the color against the actual sustained/gust values shown on hover).</p>
+    <p class="subtitle">Primary chart: gust minus sustained speed, in knots -- directly answers "how many extra knots could hit me," and unlike a ratio, a +5kt gust means the same thing whether the base wind is 2kt or 20kt. Below shows the underlying sustained-vs-gust relationship as a scatter, colored by gust/sustained ratio across the full wind range (note: at very light wind, dividing by a near-zero base wind can make the ratio swing wildly even for a small absolute gust -- cross-check the color against the actual sustained/gust values shown on hover). Optionally extends 1 day into the future using a selected forecast model's own wind+gust forecast -- forecast-derived points are shown with a dashed line / hollow marker, distinct from solid observed data.</p>
     <div class="controls inline">
       <label>
         Window
@@ -193,6 +193,12 @@
           <option value="48">Last 48h</option>
           <option value="72">Last 72h</option>
           <option value="168" selected>Last 7 days</option>
+        </select>
+      </label>
+      <label>
+        Forecast next day (model)
+        <select id="gust-factor-model-select">
+          <option value="">None (observed only)</option>
         </select>
       </label>
     </div>

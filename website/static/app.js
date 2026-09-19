@@ -162,6 +162,19 @@ async function init() {
   roseModelSelect.on('change', loadWindRoseChart);
   d3.select('#wind-rose-hours-select').on('change', loadWindRoseChart);
 
+  // Gustiness panel: 1-day-forward extension (user 2026-09-19: "I need
+  // to be able to see a one day forward looking addition to the
+  // charts... future data using a model of my choice"). Model select
+  // has the same "None (observed only)" empty-value option as Wind
+  // Rose's comparison model, since the forecast extension is optional.
+  const gustModelSelect = d3.select('#gust-factor-model-select');
+  gustModelSelect.selectAll('option.model-option')
+    .data(Object.keys(MODEL_COLORS))
+    .join('option')
+    .attr('class', 'model-option')
+    .attr('value', d => d)
+    .text(d => d.toUpperCase());
+  gustModelSelect.on('change', loadGustFactorChart);
   d3.select('#gust-factor-hours-select').on('change', loadGustFactorChart);
 
   updatePredictionPanelVisibility();
@@ -1357,35 +1370,44 @@ function gustColorFor(d, color) {
 
 async function loadGustFactorChart() {
   const hours = +d3.select('#gust-factor-hours-select').property('value');
+  const forecastModel = d3.select('#gust-factor-model-select').property('value');
   if (!state.location) return;
 
-  const data = await fetchJSON(`/api/gust-factor?location=${state.location}&hours=${hours}`);
+  const url = forecastModel
+    ? `/api/gust-factor?location=${state.location}&hours=${hours}&forecast_model=${forecastModel}&forecast_hours=24`
+    : `/api/gust-factor?location=${state.location}&hours=${hours}`;
+  const resp = await fetchJSON(url);
   const container = d3.select('#gust-factor-chart');
   container.selectAll('*').remove();
   const empty = d3.select('#gust-factor-empty');
 
-  if (data.error) {
-    empty.attr('hidden', null).text(data.error);
+  if (resp.error) {
+    empty.attr('hidden', null).text(resp.error);
     return;
   }
-  if (!data.length) {
+  const observed = resp.observed || [];
+  const forecast = resp.forecast || [];
+  if (!observed.length && !forecast.length) {
     empty.attr('hidden', null).text('No gust data yet for this location/window.');
     return;
   }
   empty.attr('hidden', true);
 
-  data.forEach(d => { d.ts_utc_date = new Date(d.ts_utc + 'Z'); });
+  observed.forEach(d => { d.ts_utc_date = new Date(d.ts_utc + 'Z'); d.is_forecast = false; });
+  forecast.forEach(d => { d.ts_utc_date = new Date(d.ts_utc + 'Z'); d.is_forecast = true; });
+  const allPoints = observed.concat(forecast);
+  const now = new Date();
 
   const width = Math.min(900, container.node().clientWidth || 900);
   const height = 280;
   const margin = { top: 20, right: 70, bottom: 60, left: 55 };
 
-  const x = d3.scaleTime().domain(d3.extent(data, d => d.ts_utc_date)).range([margin.left, width - margin.right]);
+  const x = d3.scaleTime().domain(d3.extent(allPoints, d => d.ts_utc_date)).range([margin.left, width - margin.right]);
   const y = d3.scaleLinear()
-    .domain([0, Math.max(2, d3.max(data, d => d.gust_delta_kt) * 1.1)])
+    .domain([0, Math.max(2, d3.max(allPoints, d => d.gust_delta_kt) * 1.1)])
     .nice()
     .range([height - margin.bottom, margin.top]);
-  const color = gustColorScaleFor(data);
+  const color = gustColorScaleFor(allPoints);
 
   const svg = container.append('svg').attr('width', width).attr('height', height);
 
@@ -1397,30 +1419,67 @@ async function loadGustFactorChart() {
     .attr('x1', margin.left).attr('x2', width - margin.right)
     .attr('y1', d => y(d)).attr('y2', d => y(d));
 
+  // "now" divider -- everything left of this is real observed history,
+  // everything right is the selected model's own forecast (user
+  // 2026-09-19: "some indicator in the chart, a different color and/or
+  // dotted line for today which data is predicted from selected model").
+  if (forecast.length) {
+    const nowX = x(now);
+    svg.append('line')
+      .attr('x1', nowX).attr('x2', nowX)
+      .attr('y1', margin.top).attr('y2', height - margin.bottom)
+      .attr('stroke', 'var(--accent, #4fc3f7)').attr('stroke-width', 1.5).attr('stroke-dasharray', '2,2').attr('opacity', 0.7);
+    svg.append('text')
+      .attr('x', nowX + 4).attr('y', margin.top + 10)
+      .attr('fill', 'var(--accent, #4fc3f7)').attr('font-size', '0.65rem')
+      .text('now \u2192 forecast (' + forecastModel.toUpperCase() + ')');
+  }
+
   // Connecting line stays a single neutral color (a multi-color line is
   // hard to read); the colored DOTS carry the ratio signal instead.
+  // Observed and forecast are drawn as two SEPARATE paths (not one
+  // continuous line) with different dash patterns, so the observed/
+  // forecast boundary is visually unambiguous even before the "now" line.
   const line = d3.line().x(d => x(d.ts_utc_date)).y(d => y(d.gust_delta_kt));
-  svg.append('path')
-    .datum(data)
-    .attr('fill', 'none')
-    .attr('stroke', 'var(--muted)')
-    .attr('stroke-width', 1)
-    .attr('opacity', 0.5)
-    .attr('d', line);
+  if (observed.length) {
+    svg.append('path')
+      .datum(observed)
+      .attr('fill', 'none')
+      .attr('stroke', 'var(--muted)')
+      .attr('stroke-width', 1)
+      .attr('opacity', 0.5)
+      .attr('d', line);
+  }
+  if (forecast.length) {
+    // connect the last observed point to the first forecast point so
+    // there's no visual gap at the "now" boundary
+    const bridge = observed.length ? [observed[observed.length - 1], ...forecast] : forecast;
+    svg.append('path')
+      .datum(bridge)
+      .attr('fill', 'none')
+      .attr('stroke', 'var(--muted)')
+      .attr('stroke-width', 1.3)
+      .attr('stroke-dasharray', '5,3')
+      .attr('opacity', 0.7)
+      .attr('d', line);
+  }
 
   const tooltip = d3.select('body').append('div').attr('class', 'point-tooltip');
   svg.selectAll('circle.gust-dot')
-    .data(data)
+    .data(allPoints)
     .join('circle')
     .attr('class', 'gust-dot')
     .attr('cx', d => x(d.ts_utc_date))
     .attr('cy', d => y(d.gust_delta_kt))
-    .attr('r', 2.8)
-    .attr('fill', d => gustColorFor(d, color))
+    .attr('r', d => d.is_forecast ? 3.2 : 2.8)
+    .attr('fill', d => d.is_forecast ? 'none' : gustColorFor(d, color))
+    .attr('stroke', d => d.is_forecast ? gustColorFor(d, color) : 'none')
+    .attr('stroke-width', d => d.is_forecast ? 1.6 : 0)
     .on('mousemove', (event, d) => {
       const factorText = d.gust_factor != null ? `${d.gust_factor}x` : 'n/a (0kt sustained)';
+      const label = d.is_forecast ? `<b>+${d.gust_delta_kt}kt (${forecastModel.toUpperCase()} forecast)</b>` : `<b>+${d.gust_delta_kt}kt</b>`;
       tooltip.style('opacity', 1)
-        .html(`<b>+${d.gust_delta_kt}kt</b><br>${d.ts_utc}<br>sustained: ${d.sustained_kt}kt, gust: ${d.gust_kt}kt<br>ratio: ${factorText}`)
+        .html(`${label}<br>${d.ts_utc}<br>sustained: ${d.sustained_kt}kt, gust: ${d.gust_kt}kt<br>ratio: ${factorText}`)
         .style('left', (event.pageX + 12) + 'px')
         .style('top', (event.pageY - 10) + 'px');
     })
@@ -1449,7 +1508,7 @@ async function loadGustFactorChart() {
 
   drawGustColorLegend(svg, color, width, height, margin);
 
-  loadGustScatterChart(data);
+  loadGustScatterChart(allPoints, forecastModel);
 }
 
 // Shared color-legend renderer for both the 1D and 2D gustiness charts --
@@ -1489,7 +1548,7 @@ function drawGustColorLegend(svg, color, width, height, margin) {
     .text(`<=${GUST_COLOR_GREY_BELOW_KT}kt`);
 }
 
-function loadGustScatterChart(data) {
+function loadGustScatterChart(data, forecastModel) {
   const container = d3.select('#gust-scatter-chart');
   container.selectAll('*').remove();
   const empty = d3.select('#gust-scatter-empty');
@@ -1551,13 +1610,16 @@ function loadGustScatterChart(data) {
     .attr('class', 'scatter-dot')
     .attr('cx', d => x(d.sustained_kt))
     .attr('cy', d => y(d.gust_kt))
-    .attr('r', 3)
-    .attr('fill', d => gustColorFor(d, color))
+    .attr('r', d => d.is_forecast ? 4 : 3)
+    .attr('fill', d => d.is_forecast ? 'none' : gustColorFor(d, color))
+    .attr('stroke', d => d.is_forecast ? gustColorFor(d, color) : 'none')
+    .attr('stroke-width', d => d.is_forecast ? 1.8 : 0)
     .attr('opacity', 0.8)
     .on('mousemove', (event, d) => {
       const factorText = d.gust_factor != null ? `${d.gust_factor}x` : 'n/a (0kt sustained)';
+      const label = d.is_forecast ? `<b>${forecastModel.toUpperCase()} forecast</b><br>` : '';
       tooltip.style('opacity', 1)
-        .html(`sustained: ${d.sustained_kt}kt, gust: ${d.gust_kt}kt<br>+${d.gust_delta_kt}kt, ratio: ${factorText}<br>${d.ts_utc}`)
+        .html(`${label}sustained: ${d.sustained_kt}kt, gust: ${d.gust_kt}kt<br>+${d.gust_delta_kt}kt, ratio: ${factorText}<br>${d.ts_utc}`)
         .style('left', (event.pageX + 12) + 'px')
         .style('top', (event.pageY - 10) + 'px');
     })
