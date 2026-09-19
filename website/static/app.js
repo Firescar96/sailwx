@@ -1355,7 +1355,7 @@ async function loadWindRoseChart() {
 // color domain washed out all the real variation in the rest of the plot.
 // ---------------------------------------------------------------------------
 
-const GUST_COLOR_GREY_BELOW_KT = 3.0;
+const GUST_COLOR_GREY_BELOW_KT = 1.5;
 
 function gustColorScaleFor(data) {
   const colorable = data.filter(d => d.gust_factor != null && d.sustained_kt > GUST_COLOR_GREY_BELOW_KT);
