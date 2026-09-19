@@ -165,6 +165,61 @@ def extract_wind_series(img, top_value, bottom_value):
     return sustained, gust
 
 
+SMOOTH_WINDOW_COLUMNS = 5  # ~11 minutes at ~2.27 min/column, centered on each column
+
+
+def smooth_column_series(series, window=SMOOTH_WINDOW_COLUMNS):
+    """Rolling-MEDIAN filter across pixel columns (user 2026-09-19: "MIT
+    sailing data is very noisy I think due to the scraping, maybe you
+    could take more samples, but average them or take a clear mode to
+    make that better"). Confirmed empirically: while most consecutive
+    readings only drift ~0.3kt, real single-column spikes do occur
+    (e.g. one 24h window showed 1.7kt -> 6.9kt -> 1.3kt across just two
+    ~2-minute steps -- a jump and immediate reversal that isn't
+    physically plausible for real wind, almost certainly a scrape
+    artifact: a JPEG/anti-aliasing edge or stray pixel match on one
+    column slipping past the existing per-column 3-vote resolution,
+    since that vote only guards against noise WITHIN a single column's
+    own pixel scan, not an isolated bad column surrounded by consistent
+    neighbors).
+
+    This is the "take more samples and average/median them" fix: each
+    output column becomes the MEDIAN (not mean -- median completely
+    rejects a single outlier rather than being pulled toward it) of
+    itself and its `window`-wide neighborhood of already-resolved
+    columns, each ~2.27 real minutes apart. A single bad column
+    surrounded by good ones gets fully overridden; a real, sustained
+    change across multiple columns (actual wind shift) passes through
+    almost unchanged since the whole neighborhood agrees.
+
+    The CLIP flag is deliberately kept from the column's own original
+    reading, not smoothed -- clipping is about whether THIS column's
+    specific pixel hit the graph's axis ceiling, which has nothing to
+    do with neighboring columns' values.
+    """
+    n = len(series)
+    half = window // 2
+    smoothed = [None] * n
+    for i in range(n):
+        if series[i] is None:
+            continue
+        lo = max(0, i - half)
+        hi = min(n, i + half + 1)
+        neighborhood = [series[j][0] for j in range(lo, hi) if series[j] is not None]
+        if not neighborhood:
+            continue
+        neighborhood.sort()
+        m = len(neighborhood)
+        median_val = (
+            neighborhood[m // 2]
+            if m % 2 == 1
+            else (neighborhood[m // 2 - 1] + neighborhood[m // 2]) / 2
+        )
+        _, clipped = series[i]
+        smoothed[i] = (round(median_val, 1), clipped)
+    return smoothed
+
+
 def resample_wind_to_native(timestamps, sustained, gust):
     bucket_minutes = NATIVE_RESOLUTION_MINUTES
     buckets = {}
@@ -253,6 +308,15 @@ def process_wind_graph(con, existing_wind_timestamps):
     width = PLOT_X_MAX - PLOT_X_MIN
     top_value, bottom_value = read_axis_scale(img)
     sustained, gust = extract_wind_series(img, top_value, bottom_value)
+    # Rolling-median smoothing across raw pixel columns, BEFORE bucketing
+    # into native-resolution output rows -- this is where an isolated
+    # bad column (surrounded by consistent neighbors) actually gets
+    # corrected; smoothing after bucketing would be too coarse (each
+    # bucket already averages multiple columns together at
+    # NATIVE_RESOLUTION_MINUTES, but that doesn't help when the bad
+    # column IS the whole bucket at higher time resolutions).
+    sustained = smooth_column_series(sustained)
+    gust = smooth_column_series(gust)
 
     now_utc = datetime.now(timezone.utc)
     timestamps = columns_to_timestamps(width, now_utc, SPAN_HOURS)
