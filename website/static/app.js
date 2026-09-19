@@ -53,6 +53,82 @@ const state = {
   hiddenModels: new Set(), // model keys (or 'observed') toggled off via legend click
 };
 
+// ---------------------------------------------------------------------------
+// Control-state persistence: remembers every dropdown/selector's value
+// across a page refresh (user 2026-09-19: "I need to be able to save all
+// state of drop-downs and selectors in an organized way so it comes back on
+// refresh"). Deliberately a small hand-written localStorage wrapper, not a
+// state-management library (Vue/Redux/Zustand/etc, discussed and explicitly
+// decided against with the user) -- persisting ~14 <select> values is a
+// "read on load, write on change" problem, not something that needs
+// reactivity or component composition, and this dashboard's existing
+// plain-JS-plus-D3 approach (no build step, no framework) would fight with
+// any framework's own DOM ownership rather than benefit from it.
+// ---------------------------------------------------------------------------
+
+const CONTROL_STORAGE_KEY = 'sailwx.controls.v1';
+
+const ControlStorage = {
+  _cache: null,
+  _load() {
+    if (this._cache) return this._cache;
+    try {
+      this._cache = JSON.parse(localStorage.getItem(CONTROL_STORAGE_KEY) || '{}');
+    } catch (e) {
+      console.warn('ControlStorage: saved state was corrupt, resetting', e);
+      this._cache = {};
+    }
+    return this._cache;
+  },
+  get(id) {
+    return this._load()[id];
+  },
+  set(id, value) {
+    const data = this._load();
+    data[id] = value;
+    try {
+      localStorage.setItem(CONTROL_STORAGE_KEY, JSON.stringify(data));
+    } catch (e) {
+      // localStorage can throw (private-browsing quota, disabled storage,
+      // etc.) -- persistence is a nice-to-have, never let it break the
+      // dashboard itself.
+      console.warn('ControlStorage: failed to save', id, e);
+    }
+  },
+};
+
+// Restores a <select>'s value from storage IF a saved value exists AND is
+// still a valid option on that element right now (the option list can
+// legitimately differ between sessions -- e.g. a location added/removed,
+// or the Wind Rose/Gustiness model lists depend on MODEL_COLORS staying
+// the same 6 keys, which it always does today, but this stays defensive
+// regardless). Returns the resolved value (so callers can sync any
+// corresponding `state.*` field too), or null if nothing was restored --
+// in which case the element is left exactly as it already was (its HTML
+// `selected` default, or whatever earlier init() code already set).
+function restoreSelectValue(id) {
+  const saved = ControlStorage.get(id);
+  if (saved == null) return null;
+  const el = document.getElementById(id);
+  if (!el) return null;
+  const validOptions = Array.from(el.options).map(o => o.value);
+  if (!validOptions.includes(saved)) return null;
+  el.value = saved;
+  return saved;
+}
+
+// Adds a NAMESPACED 'change.persist' listener that saves the control's new
+// value on every change. Namespaced specifically so it coexists with each
+// panel's own '.on("change", ...)' chart-reload handler instead of
+// clobbering it -- d3 (like native addEventListener under the hood) only
+// replaces a listener when both the event name AND namespace match, so
+// 'change' and 'change.persist' are independent and both fire.
+function persistSelectOnChange(id) {
+  d3.select(`#${id}`).on('change.persist', function () {
+    ControlStorage.set(id, this.value);
+  });
+}
+
 async function fetchJSON(url) {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`${url} -> HTTP ${res.status}`);
@@ -84,7 +160,7 @@ async function init() {
     .attr('value', d => d.location_id)
     .text(d => d.name);
 
-  state.location = locations[0].location_id;
+  state.location = restoreSelectValue('location-select') || locations[0].location_id;
   locSelect.property('value', state.location);
   locSelect.on('change', function () {
     state.location = this.value;
@@ -98,16 +174,21 @@ async function init() {
       loadGustFactorChart();
     }
   });
+  persistSelectOnChange('location-select');
 
   d3.select('#hours-select').on('change', function () {
     state.hours = +this.value;
     loadForecastChart();
   });
+  if (restoreSelectValue('hours-select')) state.hours = +document.getElementById('hours-select').value;
+  persistSelectOnChange('hours-select');
 
   d3.select('#past-hours-select').on('change', function () {
     state.pastHours = +this.value;
     loadForecastChart();
   });
+  if (restoreSelectValue('past-hours-select')) state.pastHours = +document.getElementById('past-hours-select').value;
+  persistSelectOnChange('past-hours-select');
 
   // Forecast Stability panel (replaces the old Forecast Convergence panel
   // entirely, per explicit user instruction 2026-09-14: "i want the
@@ -118,8 +199,12 @@ async function init() {
   // time evolve," but "right now, how much is each model still changing
   // its own mind hour-to-hour across its last few runs" -- see
   // api_forecast_stability in app.py.
+  restoreSelectValue('stability-num-runs-select');
+  restoreSelectValue('stability-hours-select');
   d3.select('#stability-num-runs-select').on('change', loadStabilityChart);
   d3.select('#stability-hours-select').on('change', loadStabilityChart);
+  persistSelectOnChange('stability-num-runs-select');
+  persistSelectOnChange('stability-hours-select');
 
   // Flag Prediction panel (CBI only) and Wind Prediction panel (all other
   // locations with real wind observations) -- separate from the existing
@@ -136,9 +221,12 @@ async function init() {
     .join('option')
     .attr('value', d => d)
     .text(d => d.toUpperCase());
-  flagModelSelect.property('value', 'gfs');
+  flagModelSelect.property('value', restoreSelectValue('flag-prediction-model-select') || 'gfs');
   flagModelSelect.on('change', loadFlagPredictionChart);
+  persistSelectOnChange('flag-prediction-model-select');
+  restoreSelectValue('flag-prediction-hours-select');
   d3.select('#flag-prediction-hours-select').on('change', loadFlagPredictionChart);
+  persistSelectOnChange('flag-prediction-hours-select');
 
   const windModelSelect = d3.select('#wind-prediction-model-select');
   windModelSelect.selectAll('option')
@@ -146,9 +234,12 @@ async function init() {
     .join('option')
     .attr('value', d => d)
     .text(d => d.toUpperCase());
-  windModelSelect.property('value', 'gfs');
+  windModelSelect.property('value', restoreSelectValue('wind-prediction-model-select') || 'gfs');
   windModelSelect.on('change', loadWindPredictionChart);
+  persistSelectOnChange('wind-prediction-model-select');
+  restoreSelectValue('wind-prediction-hours-select');
   d3.select('#wind-prediction-hours-select').on('change', loadWindPredictionChart);
+  persistSelectOnChange('wind-prediction-hours-select');
 
   // Wind Rose panel: model select has an extra "Observed only" option
   // (empty value) since the comparison model is optional.
@@ -159,8 +250,12 @@ async function init() {
     .attr('class', 'model-option')
     .attr('value', d => d)
     .text(d => d.toUpperCase());
+  restoreSelectValue('wind-rose-model-select');
   roseModelSelect.on('change', loadWindRoseChart);
+  persistSelectOnChange('wind-rose-model-select');
+  restoreSelectValue('wind-rose-hours-select');
   d3.select('#wind-rose-hours-select').on('change', loadWindRoseChart);
+  persistSelectOnChange('wind-rose-hours-select');
 
   // Gustiness panel: 1-day-forward extension (user 2026-09-19: "I need
   // to be able to see a one day forward looking addition to the
@@ -174,8 +269,12 @@ async function init() {
     .attr('class', 'model-option')
     .attr('value', d => d)
     .text(d => d.toUpperCase());
+  restoreSelectValue('gust-factor-model-select');
   gustModelSelect.on('change', loadGustFactorChart);
+  persistSelectOnChange('gust-factor-model-select');
+  restoreSelectValue('gust-factor-hours-select');
   d3.select('#gust-factor-hours-select').on('change', loadGustFactorChart);
+  persistSelectOnChange('gust-factor-hours-select');
 
   updatePredictionPanelVisibility();
 
@@ -221,7 +320,17 @@ function allVariablesUnion() {
 function refreshVariableOptions() {
   const varSelect = d3.select('#variable-select');
   const vars = allVariablesUnion().sort();
-  const current = state.variable;
+  // Only pull the persisted value in on the FIRST call (page load) --
+  // refreshVariableOptions also runs on every location change, and by
+  // then state.variable already reflects the user's current in-session
+  // choice, which should win over a stale saved value from a previous
+  // session/location.
+  let current = state.variable;
+  if (!refreshVariableOptions._restored) {
+    refreshVariableOptions._restored = true;
+    const saved = ControlStorage.get('variable-select');
+    if (saved != null && vars.includes(saved)) current = saved;
+  }
 
   varSelect.selectAll('option')
     .data(vars)
@@ -230,6 +339,7 @@ function refreshVariableOptions() {
     .text(d => fmtVarLabel(d));
 
   if (vars.includes(current)) {
+    state.variable = current;
     varSelect.property('value', current);
   } else {
     state.variable = vars[0];
@@ -240,6 +350,7 @@ function refreshVariableOptions() {
     state.variable = this.value;
     refreshAll();
   });
+  persistSelectOnChange('variable-select');
 }
 
 async function refreshAll() {
