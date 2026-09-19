@@ -91,18 +91,6 @@ CREATE INDEX IF NOT EXISTS idx_flags_ts ON flags(ts_utc);
 -- raw data) -- no separate snapshot table, no generated files. Query it
 -- directly any time: SELECT * FROM v_accuracy_by_lead_time;
 -- Nearest-observation matching mirrors db/verify.py's tolerance (7.5 min).
---
--- EXCLUDES quality='clipped_high' observations (added 2026-09-19, ahead
--- of a forecast storm with GFS gusts to ~39kt): a clipped MIT Pavilion
--- reading means the true wind is >= the recorded value, not equal to
--- it, so computing MAE/RMSE against it would understate error during
--- exactly the extreme-wind events this accuracy tracking most needs to
--- capture honestly. Better for the view to have fewer data points at
--- the clipped timestamps (still using every OTHER real observation in
--- the same window) than to silently report a falsely-low error against
--- a value we know isn't the true one. Only affects MIT Pavilion
--- currently (the only source with a populated `quality` column); every
--- other location's `quality` is always NULL and passes the filter.
 CREATE OR REPLACE VIEW v_accuracy_by_lead_time AS
 WITH matched AS (
     WITH candidates AS (
@@ -123,7 +111,6 @@ WITH matched AS (
         JOIN observations o
             ON o.location_id = fr.location_id
            AND o.variable = fv.variable
-           AND (o.quality IS NULL OR o.quality != 'clipped_high')
            AND o.ts_utc BETWEEN fv.valid_time_utc - INTERVAL '7.5 minutes'
                              AND fv.valid_time_utc + INTERVAL '7.5 minutes'
     )
