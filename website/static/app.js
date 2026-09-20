@@ -129,9 +129,30 @@ function persistSelectOnChange(id) {
   });
 }
 
+// Base path this page was actually loaded under (e.g. "" at the domain
+// root, "/sailwx" when reverse-proxied under a subpath -- see Tailscale
+// Serve's --set-path, used to publish this dashboard at
+// https://<tailnet>.ts.net/sailwx). Serve's path-based routing STRIPS the
+// prefix before proxying to the backend (confirmed empirically 2026-09-19:
+// a request for /sailwx/style.css reaches this Flask-ish app as a request
+// for /style.css), so the page's own static assets (href="/style.css" etc
+// in index.html) work unmodified -- but a client-side `fetch('/api/...')`
+// call is a BROWSER-side absolute-path request that has no knowledge of
+// the server-side prefix stripping and resolves against the domain root,
+// not wherever the page itself was loaded from. That silently 404'd every
+// API call once this dashboard moved off the domain root. Fix: derive the
+// real mount prefix from the page's own URL once (this app is a single
+// page with no client-side routing, so window.location.pathname IS the
+// mount path, not a sub-route) and prepend it to '/api/...' fetches.
+const APP_BASE_PATH = (() => {
+  const p = window.location.pathname.replace(/\/index\.html$/, '').replace(/\/$/, '');
+  return p; // '' at the domain root, e.g. '/sailwx' when mounted under a subpath
+})();
+
 async function fetchJSON(url) {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`${url} -> HTTP ${res.status}`);
+  const finalUrl = url.startsWith('/api/') ? APP_BASE_PATH + url : url;
+  const res = await fetch(finalUrl);
+  if (!res.ok) throw new Error(`${finalUrl} -> HTTP ${res.status}`);
   return res.json();
 }
 

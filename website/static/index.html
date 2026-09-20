@@ -4,14 +4,51 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Sailing Weather Dashboard</title>
-<link rel="stylesheet" href="/style.css">
+<!-- Relative base + relative asset paths below (added 2026-09-19, moving
+     this dashboard to a public Tailscale Funnel URL under a subpath,
+     https://<tailnet>.ts.net/sailwx): a leading-slash href/src (e.g.
+     "/style.css") is resolved by the BROWSER against the domain root,
+     which breaks once this page is served from anywhere other than
+     the root -- Tailscale Serve's path-based proxying strips the
+     /sailwx prefix server-side before the request reaches this app
+     (so the app itself needs zero changes for THAT part), but that
+     stripping is invisible to the browser's own URL resolution for
+     assets/API calls it issues itself. <base> makes every relative
+     reference below resolve against wherever this HTML document was
+     actually loaded from, which is correct at both the domain root
+     and under any subpath -- BUT a plain `<base href="./">` breaks
+     when the page URL has no trailing slash (e.g. ".../sailwx" with
+     no slash, which both curl and real browsers happily serve a 200
+     for): resolving "./" against a slash-less URL treats the last
+     path segment as a FILENAME, not a directory, and pops up to the
+     PARENT directory (the domain root) instead of staying in /sailwx/
+     -- confirmed this exact failure live 2026-09-19 (a real user could
+     easily land on the no-slash form via a typed/shared URL). Fix:
+     compute the base href in JS from window.location.pathname with a
+     guaranteed trailing slash, so it's correct regardless of which
+     form the visitor actually used. This script MUST run before any
+     other href/src-bearing tag below it, so the base is in place
+     before those relative URLs get resolved. API fetch calls in
+     app.js get the equivalent fix via APP_BASE_PATH there, since
+     <base> only affects markup-declared URLs, not JS string
+     concatenation. -->
+<script>
+  (function () {
+    var path = window.location.pathname;
+    if (!path.endsWith('/')) path += '/';
+    var base = document.createElement('base');
+    base.href = path;
+    document.head.appendChild(base);
+  })();
+</script>
+<link rel="stylesheet" href="style.css">
 
 <!-- PWA: manifest + icons so this installs with a proper name/icon on a
      phone home screen instead of a generic browser-tab bookmark. -->
-<link rel="manifest" href="/manifest.json">
+<link rel="manifest" href="manifest.json">
 <meta name="theme-color" content="#0b1620">
-<link rel="icon" type="image/png" href="/favicon.png">
-<link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
+<link rel="icon" type="image/png" href="favicon.png">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
 <!-- iOS doesn't read manifest.json for "add to home screen" metadata --
      these meta tags are the only way to get a proper standalone-app feel
      (no browser chrome) and correct title when launched from iOS. -->
@@ -23,7 +60,7 @@
 </head>
 <body>
 <header>
-  <h1><img src="/logo.png" alt="" width="28" height="28" style="vertical-align:middle;margin-right:8px;">Sailing Weather Dashboard</h1>
+  <h1><img src="logo.png" alt="" width="28" height="28" style="vertical-align:middle;margin-right:8px;">Sailing Weather Dashboard</h1>
   <div class="controls">
     <label>
       Location
@@ -214,7 +251,7 @@
   <p>Data source: local DuckDB weather database (read-only). Times shown in UTC.</p>
 </footer>
 
-<script src="/app.js"></script>
+<script src="app.js"></script>
 <script>
   // Registers the service worker so the browser considers this page
   // "installable" (required for a proper home-screen icon + standalone
@@ -224,7 +261,7 @@
   // throwing and breaking the rest of the page.
   if ('serviceWorker' in navigator) {
     window.addEventListener('load', () => {
-      navigator.serviceWorker.register('/sw.js').catch(err => {
+      navigator.serviceWorker.register('sw.js').catch(err => {
         console.warn('Service worker registration failed (PWA install may not be available):', err);
       });
     });
