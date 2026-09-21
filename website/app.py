@@ -200,22 +200,33 @@ def api_accuracy_variables(params):
 
 
 def api_forecast(params):
-    """Latest forecast run per model for a location/variable, restricted
-    to a window around the CURRENT real time (not each model's own
-    init_time_utc, which can be many hours stale -- e.g. ECMWF only
-    updates every 6h and our poll cadence adds further lag, so its
-    latest run's init_time can be 10-15+ hours behind "now" at any given
-    moment). Filtering by init_time_utc +/- hours (the original
-    approach) meant "Last 12h" could silently pull data back 20+ hours
-    for a stale model, or "Next 24h" could already have partly elapsed
-    relative to the real present -- both visible as the forecast lines
-    extending further left/right than the observed-data overlay, which
-    correctly anchors to real now (user-reported 2026-09-11: "the grey
-    chart doesn't go all the way to [the stated relative time]", "time
-    range search is off"). Fixed 2026-09-11: bounds are now computed
-    from the actual current wall-clock time, matching what the frontend
-    axis labels/relative offsets and the observations endpoint already
-    assume.
+    """Forecast time series for a location/variable, spanning a past
+    window (observed history + REAL historical model forecasts) through
+    a future window (each model's current/latest prediction).
+
+    HISTORY-STITCHING (added 2026-09-21, user: "i don't see the
+    historical model data only the observed weather for 7 days" / "you
+    should be storing the historical runs right"): confirmed the
+    historical runs genuinely ARE stored (45-87 distinct runs per model
+    going back to Sept 6-10) -- this endpoint just wasn't using them.
+    The OLD query only ever looked at each model's single LATEST run,
+    which only carries ~2 days of backfilled hindcast data (however far
+    back its own `past_hours`/`past_days` ingestion window reaches) --
+    so selecting "Last 7 days" showed 5 of those 7 days with NO model
+    lines at all, even though real historical forecast data for that
+    period existed in `forecast_runs`/`forecast_values` the whole time.
+
+    Fix: for EVERY valid_time_utc in the requested window (past or
+    future), pick each model's forecast value from whichever of ITS OWN
+    runs has the LARGEST init_time_utc that is still <= valid_time_utc
+    -- i.e. "the freshest forecast that model had actually issued as of
+    that moment," not backfill/hindcast data from a run issued AFTER
+    the fact. This is a genuine "what did the model actually predict"
+    history, and it naturally unifies with the future window too: for
+    any valid_time in the future, the only run with init_time <= it is
+    each model's single latest run (nothing newer exists yet), so this
+    one query correctly reduces to the old future-only behavior without
+    needing a separate code path.
     """
     location = params.get("location")
     variable = params.get("variable")
@@ -227,19 +238,28 @@ def api_forecast(params):
     try:
         cur = con.execute(
             """
-            WITH latest_run AS (
-                SELECT run_id, model, init_time_utc
-                FROM forecast_runs
-                WHERE location_id = ?
-                QUALIFY row_number() OVER (PARTITION BY model ORDER BY init_time_utc DESC) = 1
+            WITH candidates AS (
+                SELECT
+                    fr.model,
+                    fr.init_time_utc,
+                    fv.valid_time_utc,
+                    fv.value,
+                    row_number() OVER (
+                        PARTITION BY fr.model, fv.valid_time_utc
+                        ORDER BY fr.init_time_utc DESC
+                    ) AS rn
+                FROM forecast_values fv
+                JOIN forecast_runs fr ON fr.run_id = fv.run_id
+                WHERE fr.location_id = ?
+                  AND fv.variable = ?
+                  AND fr.init_time_utc <= fv.valid_time_utc
+                  AND fv.valid_time_utc <= now() + (? * INTERVAL '1 hour')
+                  AND fv.valid_time_utc >= now() - (? * INTERVAL '1 hour')
             )
-            SELECT lr.model, lr.init_time_utc, fv.valid_time_utc, fv.value
-            FROM forecast_values fv
-            JOIN latest_run lr ON lr.run_id = fv.run_id
-            WHERE fv.variable = ?
-              AND fv.valid_time_utc <= now() + (? * INTERVAL '1 hour')
-              AND fv.valid_time_utc >= now() - (? * INTERVAL '1 hour')
-            ORDER BY lr.model, fv.valid_time_utc
+            SELECT model, init_time_utc, valid_time_utc, value
+            FROM candidates
+            WHERE rn = 1
+            ORDER BY model, valid_time_utc
             """,
             [location, variable, hours, past_hours],
         )
