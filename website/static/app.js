@@ -50,7 +50,8 @@ const state = {
   accuracyVarsByLocation: {}, // location_id -> Set(variable)
   hours: 336, // matches the <select> default in index.html (Next 14 days) -- 14d is roughly GFS/ECMWF's own forecast horizon (the longest of the 6 models)
   pastHours: 168, // matches the <select> default in index.html (Last 7 days)
-  hiddenModels: new Set(), // model keys (or 'observed') toggled off via legend click
+  hiddenModels: new Set(), // model keys (or 'observed') toggled off via legend click, Forecast Time Series chart
+  hiddenStabilityModels: new Set(), // same idea, separate set, Forecast Stability chart (user 2026-09-21: "hover to brighten works well, but only one chart has the click to temporarily hide")
 };
 
 // ---------------------------------------------------------------------------
@@ -186,6 +187,7 @@ async function init() {
   locSelect.on('change', function () {
     state.location = this.value;
     state.hiddenModels.clear(); // don't carry a stale hidden-set across to a different location's chart
+    state.hiddenStabilityModels.clear();
     refreshVariableOptions();
     refreshAll();
     updatePredictionPanelVisibility();
@@ -955,6 +957,12 @@ async function loadStabilityChart() {
   rows.forEach(d => { d.valid_time_utc_date = new Date(d.valid_time_utc + 'Z'); });
   const models = Array.from(new Set(rows.map(d => d.model))).sort();
   const byModel = d3.group(rows, d => d.model);
+  // Recompute the Y-axis domain from only VISIBLE models' rows (matches
+  // the Forecast Time Series chart's behavior: hiding a model rescales
+  // the chart to fit what's actually still shown, instead of leaving
+  // dead space sized for a hidden series).
+  const visibleRows = rows.filter(d => !state.hiddenStabilityModels.has(d.model));
+  const yDomainRows = visibleRows.length ? visibleRows : rows;
 
   const width = Math.min(900, container.node().clientWidth || 900);
   const height = 320;
@@ -964,7 +972,7 @@ async function loadStabilityChart() {
     .domain(d3.extent(rows, d => d.valid_time_utc_date))
     .range([margin.left, width - margin.right]);
   const y = d3.scaleLinear()
-    .domain([d3.min(rows, d => d.min_value), d3.max(rows, d => d.max_value)])
+    .domain([d3.min(yDomainRows, d => d.min_value), d3.max(yDomainRows, d => d.max_value)])
     .nice()
     .range([height - margin.bottom, margin.top]);
 
@@ -1024,6 +1032,7 @@ async function loadStabilityChart() {
     .y(d => y(d.avg_value));
 
   models.forEach(m => {
+    if (state.hiddenStabilityModels.has(m)) return; // toggled off via legend click
     const series = (byModel.get(m) || []).slice().sort((a, b) => a.valid_time_utc_date - b.valid_time_utc_date);
     const color = MODEL_COLORS[m] || '#888';
 
@@ -1073,12 +1082,27 @@ async function loadStabilityChart() {
       .on('mouseleave', () => { tooltip.style('opacity', 0); setStabilityHighlight(null); });
   });
 
+  // Legend: hover-to-highlight (existing behavior) PLUS click-to-toggle
+  // visibility, mirroring the Forecast Time Series chart's legend
+  // (user 2026-09-21: "hover to brighten works well, but only one
+  // chart has the click to temporarily hide").
+  function toggleStabilityModel(key) {
+    if (state.hiddenStabilityModels.has(key)) {
+      state.hiddenStabilityModels.delete(key);
+    } else {
+      state.hiddenStabilityModels.add(key);
+    }
+    loadStabilityChart(); // re-render with the updated visibility set
+  }
+
   const legend = container.insert('div', 'svg').attr('class', 'legend');
   models.forEach(m => {
     const item = legend.append('div').attr('class', 'legend-item')
+      .classed('legend-disabled', state.hiddenStabilityModels.has(m))
       .style('cursor', 'pointer')
       .on('mouseenter', () => setStabilityHighlight(m))
-      .on('mouseleave', () => setStabilityHighlight(null));
+      .on('mouseleave', () => setStabilityHighlight(null))
+      .on('click', () => toggleStabilityModel(m));
     item.append('span').attr('class', 'legend-swatch').style('background', MODEL_COLORS[m] || '#888');
     const runsForModel = (data.runs_used_by_model && data.runs_used_by_model[m]) || [];
     item.append('span').text(`${m.toUpperCase()}${runsForModel.length ? ` (${runsForModel.length} runs)` : ''}`);
