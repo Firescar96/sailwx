@@ -191,7 +191,22 @@ async function init() {
     refreshVariableOptions();
     refreshAll();
     updatePredictionPanelVisibility();
-    if (state.location !== 'cbi_dockhouse') {
+    if (state.location === 'cbi_dockhouse') {
+      // BUG FIXED 2026-09-22 (user: "CBI Flag Prediction is messed up,
+      // date dropdown broken" -- reproduced live: switching TO cbi_dockhouse
+      // via the location dropdown left the Flag Prediction panel's chart
+      // area completely empty, no chart AND no "no data" message, even
+      // though the model/hours dropdowns rendered fine and manually
+      // calling loadFlagPredictionChart() from the console worked
+      // perfectly). Root cause: this handler called
+      // loadWindPredictionChart/loadWindRoseChart/loadGustFactorChart
+      // when switching to any OTHER location, but never called
+      // loadFlagPredictionChart when switching TO cbi_dockhouse -- it
+      // only ever ran via init()'s initial-page-load path, which is why
+      // this looked fine as long as CBI happened to be the default
+      // location every time it was tested.
+      loadFlagPredictionChart();
+    } else {
       loadWindPredictionChart();
       loadWindRoseChart();
       loadGustFactorChart();
