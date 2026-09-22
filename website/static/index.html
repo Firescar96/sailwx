@@ -82,7 +82,20 @@
 
   <section id="accuracy-panel" class="panel">
     <h2>Model Accuracy by Lead Time</h2>
-    <p class="subtitle">Mean Absolute Error (MAE) per forecast model, broken out by how far ahead the forecast was made. Lower bars = more accurate at that lead time.</p>
+    <p class="subtitle">Mean Absolute Error (MAE) per forecast model, broken out by how far ahead the forecast was made. Lower bars = more accurate at that lead time. Computed live from every matched forecast-vs-observation pair within the selected window (no cached/scheduled snapshot).</p>
+    <div class="controls inline">
+      <label>
+        Window
+        <select id="accuracy-hours-select">
+          <option value="24">Last 24h</option>
+          <option value="72">Last 72h</option>
+          <option value="168" selected>Last 7 days</option>
+          <option value="336">Last 14 days</option>
+          <option value="720">Last 30 days</option>
+          <option value="">All time</option>
+        </select>
+      </label>
+    </div>
     <div id="accuracy-chart"></div>
     <div id="accuracy-empty" class="empty-msg" hidden></div>
   </section>

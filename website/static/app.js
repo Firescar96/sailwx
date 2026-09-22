@@ -199,6 +199,14 @@ async function init() {
   });
   persistSelectOnChange('location-select');
 
+  // Model Accuracy panel: time-window selector (user 2026-09-21: "add a
+  // dropdown that let's me pick a time window, with a default of 7
+  // days" -- following on from confirming the chart previously had NO
+  // time filter at all, i.e. was genuinely all-time/all-history).
+  restoreSelectValue('accuracy-hours-select');
+  d3.select('#accuracy-hours-select').on('change', loadAccuracyChart);
+  persistSelectOnChange('accuracy-hours-select');
+
   d3.select('#hours-select').on('change', function () {
     state.hours = +this.value;
     loadForecastChart();
@@ -452,7 +460,11 @@ async function loadCurrentConditions() {
 // ---------------------------------------------------------------------------
 
 async function loadAccuracyChart() {
-  const data = await fetchJSON(`/api/accuracy?location=${state.location}&variable=${state.variable}`);
+  const hours = d3.select('#accuracy-hours-select').property('value');
+  const url = hours
+    ? `/api/accuracy?location=${state.location}&variable=${state.variable}&hours=${hours}`
+    : `/api/accuracy?location=${state.location}&variable=${state.variable}&hours=`;
+  const data = await fetchJSON(url);
   const container = d3.select('#accuracy-chart');
   container.selectAll('*').remove();
   d3.select('#accuracy-empty').attr('hidden', data.length ? true : null);

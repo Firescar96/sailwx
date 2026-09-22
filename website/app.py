@@ -161,22 +161,110 @@ def api_flags_history(params):
 
 
 def api_accuracy(params):
-    """Accuracy (MAE/RMSE) per model x lead_bucket for a location+variable."""
+    """Accuracy (MAE/RMSE) per model x lead_bucket for a location+variable,
+    optionally restricted to a recent time window.
+
+    ADDED time-window filtering 2026-09-21 (user: "add a dropdown that
+    let's me pick a time window, with a default of 7 days" -- following
+    on from confirming v_accuracy_by_lead_time has NO time filter at all,
+    it's genuinely all-time/all-history accuracy, accumulating forever).
+    The view itself can't be parameterized (it's a plain CREATE VIEW,
+    and doesn't even expose the underlying observation timestamp to
+    filter on after the fact -- only the already-aggregated MAE/RMSE per
+    bucket), so this reimplements the view's matching/bucketing logic
+    inline with an added `hours` bound on the OBSERVATION's own
+    timestamp (o.ts_utc >= now() - hours), rather than editing the view
+    (which stays as the genuine unbounded/all-time computation, still
+    used as-is by api_accuracy_variables). `hours` omitted or empty
+    means "all time," matching the view's original unbounded behavior
+    exactly -- verified the two produce identical numbers when no
+    window is applied.
+    """
     location = params.get("location")
     variable = params.get("variable")
+    hours_param = params.get("hours", "168")
+    hours = int(hours_param) if hours_param else None
     if not location or not variable:
         return {"error": "location and variable query params are required"}
     con = db()
     try:
-        cur = con.execute(
-            """
-            SELECT model, lead_bucket, n, mae, rmse
-            FROM v_accuracy_by_lead_time
-            WHERE location_id = ? AND variable = ?
-            ORDER BY model, lead_bucket
-            """,
-            [location, variable],
-        )
+        if hours is None:
+            # All-time: identical to the pre-existing behavior, straight
+            # from the unbounded view.
+            cur = con.execute(
+                """
+                SELECT model, lead_bucket, n, mae, rmse
+                FROM v_accuracy_by_lead_time
+                WHERE location_id = ? AND variable = ?
+                ORDER BY model, lead_bucket
+                """,
+                [location, variable],
+            )
+        else:
+            cur = con.execute(
+                """
+                WITH candidates AS (
+                    SELECT
+                        fv.run_id,
+                        fv.valid_time_utc,
+                        fv.value AS forecast_value,
+                        o.ts_utc AS obs_ts_utc,
+                        o.value AS observed_value,
+                        row_number() OVER (
+                            PARTITION BY fv.run_id, fv.valid_time_utc
+                            ORDER BY abs(epoch(fv.valid_time_utc) - epoch(o.ts_utc))
+                        ) AS rn
+                    FROM forecast_values fv
+                    JOIN forecast_runs fr ON fr.run_id = fv.run_id
+                    JOIN observations o
+                        ON o.location_id = fr.location_id
+                       AND o.variable = fv.variable
+                       AND o.ts_utc BETWEEN fv.valid_time_utc - INTERVAL '7.5 minutes'
+                                         AND fv.valid_time_utc + INTERVAL '7.5 minutes'
+                    WHERE fr.location_id = ?
+                      AND fv.variable = ?
+                      AND o.ts_utc >= now() - (? * INTERVAL '1 hour')
+                ),
+                matched AS (
+                    SELECT run_id, valid_time_utc, forecast_value, observed_value
+                    FROM candidates
+                    WHERE rn = 1
+                ),
+                with_lead AS (
+                    SELECT
+                        m.*,
+                        fr.model,
+                        date_diff('hour', fr.init_time_utc, m.valid_time_utc) AS lead_hours
+                    FROM matched m
+                    JOIN forecast_runs fr ON fr.run_id = m.run_id
+                ),
+                bucketed AS (
+                    SELECT
+                        model,
+                        CASE
+                            WHEN lead_hours >= 0 AND lead_hours < 6 THEN '0-6h'
+                            WHEN lead_hours >= 6 AND lead_hours < 12 THEN '6-12h'
+                            WHEN lead_hours >= 12 AND lead_hours < 24 THEN '12-24h'
+                            WHEN lead_hours >= 24 AND lead_hours < 48 THEN '24-48h'
+                            WHEN lead_hours >= 48 AND lead_hours < 72 THEN '48-72h'
+                            WHEN lead_hours >= 72 THEN '72h+'
+                            ELSE 'other'
+                        END AS lead_bucket,
+                        forecast_value - observed_value AS error
+                    FROM with_lead
+                )
+                SELECT
+                    model,
+                    lead_bucket,
+                    count(*) AS n,
+                    round(avg(abs(error)), 3) AS mae,
+                    round(sqrt(avg(error * error)), 3) AS rmse
+                FROM bucketed
+                GROUP BY model, lead_bucket
+                ORDER BY model, lead_bucket
+                """,
+                [location, variable, hours],
+            )
         return rows_as_dicts(cur)
     finally:
         con.close()
