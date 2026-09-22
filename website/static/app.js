@@ -43,6 +43,27 @@ function fmtVarLabel(v) {
   return VARIABLE_LABELS[v] || v;
 }
 
+// Every chart's tooltip div was previously created via a bare
+// `d3.select('body').append('div').attr('class', '...')` inside that
+// chart's own load function -- since these load functions re-run on
+// every dropdown change (model/hours/window/etc), each re-render
+// appended ANOTHER tooltip div to <body> without ever removing the
+// previous one. Normally invisible (opacity:0 at rest, and whichever
+// one you're currently hovering looks fine on its own), but changing a
+// dropdown WHILE a tooltip happened to be visible left the stale one
+// stuck on-screen permanently, on top of a newly-created one for the
+// same chart -- exactly the "tooltips get stuck when changing time
+// period" bug reported 2026-09-22 (visible in a screenshot showing two
+// overlapping CBI Flag Prediction tooltips at once). Fix: a single
+// shared helper that removes ANY pre-existing tooltip(s) with the given
+// class before creating a fresh one, so there is always at most one
+// live tooltip div per chart at a time, no matter how many times its
+// load function has re-run.
+function getOrCreateTooltip(className) {
+  d3.selectAll(`div.${className}`).remove();
+  return d3.select('body').append('div').attr('class', className);
+}
+
 const state = {
   locations: [],
   location: null,
@@ -533,7 +554,7 @@ async function loadAccuracyChart() {
     .attr('font-size', '0.75rem')
     .text('MAE');
 
-  const tooltip = d3.select('body').append('div').attr('class', 'bar-tooltip');
+  const tooltip = getOrCreateTooltip('bar-tooltip');
 
   const byBucket = d3.group(data, d => d.lead_bucket);
 
@@ -683,13 +704,36 @@ async function loadForecastChart() {
 
   const svg = container.append('svg').attr('width', width).attr('height', height);
 
+  // Single shared tooltip div for this whole chart render, reused by
+  // the flag-color strip, every model's line/dots, and the observed
+  // overlay -- BUG FIXED 2026-09-22 (user: "tooltips get stuck when
+  // changing time period", reproduced via a screenshot showing two
+  // overlapping stuck tooltips on the CBI Flag Prediction chart).
+  // Previously each of those three usages independently created its
+  // OWN "shared" tooltip via `d3.select('body').selectAll(some-class)
+  // .data([0]).join('div').attr('class','point-tooltip')` -- but each
+  // used a DIFFERENT selector class (.flag-band-tooltip / .point-tooltip
+  // / .obs-tooltip) while all three actually SET class="point-tooltip",
+  // so the selectAll() each one used never matched anything (wrong
+  // class name), meaning .join() created a fresh div every single time
+  // regardless of what already existed. Worse, the per-model-dots one
+  // was INSIDE a forEach loop, so it alone created 6 new tooltip divs
+  // per chart re-render (one per model) that were then never removed.
+  // A dropdown change that fired mid-hover left whichever tooltip was
+  // visible at that moment permanently stuck on screen, with newer
+  // renders piling up their own on top. Fix: getOrCreateTooltip()
+  // removes any existing element(s) with the given class before
+  // creating exactly one fresh one, and this single call/variable is
+  // now shared across all three usages in this function instead of
+  // each site creating its own.
+  const tooltip = getOrCreateTooltip('point-tooltip');
+
   // Flag-color strip (CBI only): each flag reading is a point in time,
   // extended as a colored segment until the next reading (or the
   // chart's right edge for the last one). Rendered as a thick line
   // hugging the x-axis rather than a full-height background wash --
   // reads more like a discrete status timeline than a shaded region.
   if (flagHistory.length) {
-    const flagBandTooltip = d3.select('body').selectAll('.flag-band-tooltip').data([0]).join('div').attr('class', 'point-tooltip');
     // Simple "carry forward last known value" band: each reading's color
     // extends until the next reading (or the chart's right edge for the
     // last one). No uncertainty/gap-dimming concept -- per explicit user
@@ -724,12 +768,12 @@ async function loadForecastChart() {
       .attr('stroke-linecap', 'butt')
       .style('cursor', 'default')
       .on('mousemove', (event, d) => {
-        flagBandTooltip.style('opacity', 1)
+        tooltip.style('opacity', 1)
           .html(`<b>${d.color.toUpperCase()} flag</b><br>${d.start.toISOString().slice(0, 16).replace('T', ' ')} UTC onward`)
           .style('left', (event.pageX + 12) + 'px')
           .style('top', (event.pageY - 10) + 'px');
       })
-      .on('mouseleave', () => flagBandTooltip.style('opacity', 0));
+      .on('mouseleave', () => tooltip.style('opacity', 0));
   }
 
   svg.append('g')
@@ -820,8 +864,6 @@ async function loadForecastChart() {
       .on('mouseenter', () => setHighlight(m))
       .on('mouseleave', () => setHighlight(null));
 
-    const tooltip = d3.select('body').selectAll('.point-tooltip').data([0]).join('div').attr('class', 'point-tooltip');
-
     series.forEach(d => { d.__model = m; });
     svg.append('g')
       .selectAll('circle')
@@ -865,7 +907,6 @@ async function loadForecastChart() {
       .on('mouseenter', () => setHighlight(OBS_KEY))
       .on('mouseleave', () => setHighlight(null));
 
-    const obsTooltip = d3.select('body').selectAll('.obs-tooltip').data([0]).join('div').attr('class', 'point-tooltip');
     obs.forEach(d => { d.__model = OBS_KEY; });
     svg.append('g')
       .selectAll('circle')
@@ -879,12 +920,12 @@ async function loadForecastChart() {
       .style('cursor', 'pointer')
       .on('mouseenter', () => setHighlight(OBS_KEY))
       .on('mousemove', (event, d) => {
-        obsTooltip.style('opacity', 1)
+        tooltip.style('opacity', 1)
           .html(`<b>Observed</b><br>${d.ts_utc}<br>value: ${d.value}`)
           .style('left', (event.pageX + 12) + 'px')
           .style('top', (event.pageY - 10) + 'px');
       })
-      .on('mouseleave', () => { obsTooltip.style('opacity', 0); setHighlight(null); });
+      .on('mouseleave', () => { tooltip.style('opacity', 0); setHighlight(null); });
   }
 
   // Legend: hover-to-highlight (existing behavior) PLUS click-to-toggle
@@ -1040,7 +1081,7 @@ async function loadStabilityChart() {
     .attr('fill', 'var(--muted)').attr('font-size', '0.72rem')
     .text(`Upcoming forecast hours -- shaded band = spread across each model's last ${numRuns} runs`);
 
-  const tooltip = d3.select('body').selectAll('.stability-tooltip').data([0]).join('div').attr('class', 'point-tooltip');
+  const tooltip = getOrCreateTooltip('point-tooltip');
 
   function setStabilityHighlight(hoveredModel) {
     svg.selectAll('.stability-band')
@@ -1193,7 +1234,7 @@ async function loadFlagPredictionChart() {
     .attr('x1', margin.left).attr('x2', width - margin.right)
     .attr('y1', d => y(d)).attr('y2', d => y(d));
 
-  const tooltip = d3.select('body').append('div').attr('class', 'bar-tooltip');
+  const tooltip = getOrCreateTooltip('bar-tooltip');
 
   svg.append('g')
     .selectAll('g')
@@ -1324,7 +1365,7 @@ async function loadWindPredictionChart() {
     .attr('x1', margin.left).attr('x2', width - margin.right)
     .attr('y1', d => y(d)).attr('y2', d => y(d));
 
-  const tooltip = d3.select('body').append('div').attr('class', 'bar-tooltip');
+  const tooltip = getOrCreateTooltip('bar-tooltip');
 
   svg.append('g')
     .selectAll('g')
@@ -1402,7 +1443,7 @@ function drawWindRose(svg, cx, cy, radius, rows, speedBins, title) {
   const speedColor = d3.scaleOrdinal().domain(speedBins).range(d3.quantize(d3.interpolateYlOrRd, speedBins.length + 1).slice(1));
   const angleStep = (2 * Math.PI) / 16;
 
-  const tooltip = d3.select('body').append('div').attr('class', 'point-tooltip');
+  const tooltip = getOrCreateTooltip('point-tooltip');
 
   const g = svg.append('g').attr('transform', `translate(${cx},${cy})`);
 
@@ -1647,7 +1688,7 @@ async function loadGustFactorChart() {
       .attr('d', line);
   }
 
-  const tooltip = d3.select('body').append('div').attr('class', 'point-tooltip');
+  const tooltip = getOrCreateTooltip('point-tooltip');
   svg.selectAll('circle.gust-dot')
     .data(allPoints)
     .join('circle')
@@ -1786,7 +1827,7 @@ function loadGustScatterChart(data, forecastModel) {
     .attr('text-anchor', 'end').attr('fill', 'var(--muted)').attr('font-size', '0.65rem')
     .text('gust = sustained (steady)');
 
-  const tooltip = d3.select('body').append('div').attr('class', 'point-tooltip');
+  const tooltip = getOrCreateTooltip('point-tooltip');
   svg.selectAll('circle.scatter-dot')
     .data(data)
     .join('circle')
