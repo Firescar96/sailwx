@@ -166,36 +166,44 @@ def extract_wind_series(img, top_value, bottom_value):
 
 
 SMOOTH_WINDOW_COLUMNS = 5  # ~11 minutes at ~2.27 min/column, centered on each column
+SMOOTH_OUTLIER_MAD_MULTIPLIER = 3.5  # how many MADs from the local median counts as "genuinely an outlier" (see smooth_column_series)
 
 
 def smooth_column_series(series, window=SMOOTH_WINDOW_COLUMNS):
-    """Rolling-MEDIAN filter across pixel columns (user 2026-09-19: "MIT
-    sailing data is very noisy I think due to the scraping, maybe you
-    could take more samples, but average them or take a clear mode to
-    make that better"). Confirmed empirically: while most consecutive
-    readings only drift ~0.3kt, real single-column spikes do occur
-    (e.g. one 24h window showed 1.7kt -> 6.9kt -> 1.3kt across just two
-    ~2-minute steps -- a jump and immediate reversal that isn't
-    physically plausible for real wind, almost certainly a scrape
-    artifact: a JPEG/anti-aliasing edge or stray pixel match on one
-    column slipping past the existing per-column 3-vote resolution,
-    since that vote only guards against noise WITHIN a single column's
-    own pixel scan, not an isolated bad column surrounded by consistent
-    neighbors).
+    """Outlier-only correction across pixel columns (user 2026-09-19:
+    "MIT sailing data is very noisy I think due to the scraping, maybe
+    you could take more samples, but average them or take a clear mode
+    to make that better"; then 2026-09-23, after this filter shipped:
+    "mit sailing data is too smooth, there are some touches of 20 knots
+    in the past day that are getting smoothed out, i want to keep the
+    highs").
 
-    This is the "take more samples and average/median them" fix: each
-    output column becomes the MEDIAN (not mean -- median completely
-    rejects a single outlier rather than being pulled toward it) of
-    itself and its `window`-wide neighborhood of already-resolved
-    columns, each ~2.27 real minutes apart. A single bad column
-    surrounded by good ones gets fully overridden; a real, sustained
-    change across multiple columns (actual wind shift) passes through
-    almost unchanged since the whole neighborhood agrees.
+    REDESIGNED 2026-09-23 -- the original implementation was a blanket
+    rolling MEDIAN that unconditionally replaced EVERY column's value
+    with its neighborhood's median, no matter what. That's exactly why
+    it worked for the noise case (a real spike like 1.7kt -> 6.9kt ->
+    1.3kt got corrected) but ALSO quietly clipped real brief peaks --
+    confirmed empirically: 2 genuine gust readings (20.6kt, 20.1kt) got
+    pulled down to 19.3kt by the blanket median, even though they
+    weren't noise at all, just a real gust that only lasted one pixel
+    column. A single-column noise artifact and a single-column-wide
+    real gust peak look statistically identical to a filter that always
+    overwrites with the local median -- the filter can't tell "this
+    point is wrong" from "this point is the true, brief maximum of a
+    real gust" using magnitude alone.
 
-    The CLIP flag is deliberately kept from the column's own original
-    reading, not smoothed -- clipping is about whether THIS column's
-    specific pixel hit the graph's axis ceiling, which has nothing to
-    do with neighboring columns' values.
+    Fix: switched to a Hampel-filter-style OUTLIER-ONLY correction.
+    Still computes the local median (and now also the median absolute
+    deviation, MAD, a robust measure of "how much do points around here
+    normally vary") over the same window, but only overrides a column
+    when it deviates from that local median by more than
+    SMOOTH_OUTLIER_MAD_MULTIPLIER times the MAD -- i.e. only when a
+    point is a genuine, dramatic outlier relative to its own local
+    variability, not merely "higher than its immediate neighbors" (which
+    describes every real gust peak by definition). Real noise spikes
+    (isolated, both neighbors far away in value) still get caught and
+    corrected; real gust peaks (even ones lasting just one column) now
+    pass through completely untouched, preserving the true high.
     """
     n = len(series)
     half = window // 2
@@ -203,10 +211,14 @@ def smooth_column_series(series, window=SMOOTH_WINDOW_COLUMNS):
     for i in range(n):
         if series[i] is None:
             continue
+        raw_val, clipped = series[i]
         lo = max(0, i - half)
         hi = min(n, i + half + 1)
         neighborhood = [series[j][0] for j in range(lo, hi) if series[j] is not None]
-        if not neighborhood:
+        if len(neighborhood) < 3:
+            # Not enough real neighbors to judge "normal variability" at
+            # all -- keep the raw reading rather than guess.
+            smoothed[i] = (raw_val, clipped)
             continue
         neighborhood.sort()
         m = len(neighborhood)
@@ -215,8 +227,22 @@ def smooth_column_series(series, window=SMOOTH_WINDOW_COLUMNS):
             if m % 2 == 1
             else (neighborhood[m // 2 - 1] + neighborhood[m // 2]) / 2
         )
-        _, clipped = series[i]
-        smoothed[i] = (round(median_val, 1), clipped)
+        deviations = sorted(abs(v - median_val) for v in neighborhood)
+        mad = (
+            deviations[m // 2]
+            if m % 2 == 1
+            else (deviations[m // 2 - 1] + deviations[m // 2]) / 2
+        )
+        # A near-zero MAD (a genuinely flat/calm stretch) would make even
+        # a tiny real fluctuation look like a huge multiple of it -- a
+        # small floor keeps the outlier test meaningful instead of
+        # over-triggering during calm periods.
+        mad_floor = 0.3
+        threshold = SMOOTH_OUTLIER_MAD_MULTIPLIER * max(mad, mad_floor)
+        if abs(raw_val - median_val) > threshold:
+            smoothed[i] = (round(median_val, 1), clipped)
+        else:
+            smoothed[i] = (raw_val, clipped)
     return smoothed
 
 
