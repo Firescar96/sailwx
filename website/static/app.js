@@ -690,6 +690,33 @@ async function loadForecastChart() {
     .range([margin.left, width - margin.right]);
   forecastXScale = x;
 
+  // Single shared tooltip div for this whole chart render, reused by
+  // the flag-color strip, every model's line/dots, and the observed
+  // overlay -- BUG FIXED 2026-09-22 (user: "tooltips get stuck when
+  // changing time period", reproduced via a screenshot showing two
+  // overlapping stuck tooltips on the CBI Flag Prediction chart).
+  // Created here (before the wind-direction branch below) since both
+  // that path and the normal line-chart path need it.
+  const tooltip = getOrCreateTooltip('point-tooltip');
+
+  // Wind direction gets its OWN rendering path -- ADDED 2026-09-24 (user:
+  // "the wind direction forecast time series chart is confusing with the
+  // numbers could you draw arrows for each dot instead or something").
+  // Plotting degrees (0-360) on a normal Y-axis was genuinely misleading
+  // for a circular quantity: 359 degrees and 1 degree are almost the same
+  // real direction (both nearly due north) but sit at opposite ends of
+  // the axis, and a wind that oscillates across the 0/360 wrap point
+  // would draw as a huge vertical zigzag across the entire chart even
+  // though the real wind barely changed direction at all. Arrows avoid
+  // this entirely -- each one is drawn at a fixed row (one per model +
+  // observed) and simply rotated to point the real direction, with no
+  // false "high vs low" numeric axis for a value that has no natural
+  // ordering.
+  if (state.variable === 'wind_dir_deg') {
+    renderWindDirectionChart(container, tooltip, models, byModel, obs, flagHistory, x, width, height, margin, minDate, maxDate, hours, pastHours, showFlagBands);
+    return;
+  }
+
   // Y-axis domain only considers currently-VISIBLE series (respecting
   // hiddenModels) so toggling a model off via the legend rescales the
   // chart sensibly around what's actually shown, instead of leaving
@@ -703,30 +730,6 @@ async function loadForecastChart() {
     .range([height - margin.bottom, margin.top]);
 
   const svg = container.append('svg').attr('width', width).attr('height', height);
-
-  // Single shared tooltip div for this whole chart render, reused by
-  // the flag-color strip, every model's line/dots, and the observed
-  // overlay -- BUG FIXED 2026-09-22 (user: "tooltips get stuck when
-  // changing time period", reproduced via a screenshot showing two
-  // overlapping stuck tooltips on the CBI Flag Prediction chart).
-  // Previously each of those three usages independently created its
-  // OWN "shared" tooltip via `d3.select('body').selectAll(some-class)
-  // .data([0]).join('div').attr('class','point-tooltip')` -- but each
-  // used a DIFFERENT selector class (.flag-band-tooltip / .point-tooltip
-  // / .obs-tooltip) while all three actually SET class="point-tooltip",
-  // so the selectAll() each one used never matched anything (wrong
-  // class name), meaning .join() created a fresh div every single time
-  // regardless of what already existed. Worse, the per-model-dots one
-  // was INSIDE a forEach loop, so it alone created 6 new tooltip divs
-  // per chart re-render (one per model) that were then never removed.
-  // A dropdown change that fired mid-hover left whichever tooltip was
-  // visible at that moment permanently stuck on screen, with newer
-  // renders piling up their own on top. Fix: getOrCreateTooltip()
-  // removes any existing element(s) with the given class before
-  // creating exactly one fresh one, and this single call/variable is
-  // now shared across all three usages in this function instead of
-  // each site creating its own.
-  const tooltip = getOrCreateTooltip('point-tooltip');
 
   // Flag-color strip (CBI only): each flag reading is a point in time,
   // extended as a colored segment until the next reading (or the
@@ -972,6 +975,222 @@ async function loadForecastChart() {
       item.append('span').text(`${color.toUpperCase()} flag`);
     });
   }
+}
+
+// Wind-direction rendering path for the Forecast Time Series chart --
+// ADDED 2026-09-24 (user: "the wind direction forecast time series chart
+// is confusing with the numbers could you draw arrows for each dot
+// instead or something"). Called from loadForecastChart() when
+// state.variable === 'wind_dir_deg', reusing that function's already-
+// computed x scale/svg dimensions/margins/flag-strip so this stays
+// visually consistent with every other variable's chart (same width,
+// same "now" divider, same flag strip when applicable), but replaces
+// the y-axis + lines + dots with one fixed horizontal ROW per series
+// (one per model, plus Observed), each showing a small rotated arrow
+// at every timestamp instead of plotting degrees on a numeric axis.
+//
+// Arrow convention: rotated to point in the direction the wind is
+// blowing TOWARD (meteorological "wind_dir_deg" is conventionally
+// "wind FROM this direction", e.g. 0=from the north; adding 180 degrees
+// flips this to "blowing toward", which reads more intuitively at a
+// glance for a sailor -- the arrow points where the wind will push you
+// -- and matches the arrow convention sailors/mariners are generally
+// already used to on marine wind displays). This is a pure display
+// choice; the underlying stored/API value is untouched (still the raw
+// meteorological wind_dir_deg, "from" convention) so nothing else on
+// the dashboard (Wind Rose, Wind Prediction's direction sectors, etc)
+// is affected.
+function renderWindDirectionChart(container, tooltip, models, byModel, obs, flagHistory, x, width, height, margin, minDate, maxDate, hours, pastHours, showFlagBands) {
+  const OBS_KEY = 'observed';
+  const rowKeys = models.slice();
+  if (obs.length) rowKeys.push(OBS_KEY);
+
+  const rowHeight = 34;
+  const rowsTop = margin.top + 10;
+  const flagStripSpace = showFlagBands ? 22 : 0;
+  const plotHeight = Math.max(height - margin.bottom - rowsTop, rowKeys.length * rowHeight);
+  const svg = container.append('svg').attr('width', width).attr('height', rowsTop + plotHeight + margin.bottom);
+
+  const rowY = d3.scaleBand()
+    .domain(rowKeys)
+    .range([rowsTop, rowsTop + rowKeys.length * rowHeight])
+    .paddingInner(0.3);
+
+  // Flag-color strip (CBI only) -- same rendering as the main chart, so
+  // switching to Wind Direction on CBI still shows the flag timeline for
+  // context (CBI itself has no wind sensor, but this chart's row-based
+  // layout otherwise looks identical whether or not flags are present).
+  if (flagHistory.length) {
+    const bands = flagHistory.map((d, i) => {
+      const next = flagHistory[i + 1];
+      const end = next ? next.ts_utc_date : new Date(x.domain()[1]);
+      return { color: d.flag_color, start: d.ts_utc_date, end };
+    });
+    const flagStripY = rowsTop + rowKeys.length * rowHeight + 24;
+    svg.append('text')
+      .attr('x', margin.left - 6).attr('y', flagStripY + 3)
+      .attr('text-anchor', 'end')
+      .attr('fill', 'var(--muted)')
+      .attr('font-size', '0.68rem')
+      .text('Flag');
+    svg.append('g')
+      .attr('class', 'flag-strip')
+      .selectAll('line')
+      .data(bands)
+      .join('line')
+      .attr('x1', d => x(d.start))
+      .attr('x2', d => Math.max(x(d.start), x(d.end)))
+      .attr('y1', flagStripY)
+      .attr('y2', flagStripY)
+      .attr('stroke', d => FLAG_COLORS[d.color] || '#888')
+      .attr('stroke-width', 8)
+      .attr('stroke-linecap', 'butt')
+      .style('cursor', 'default')
+      .on('mousemove', (event, d) => {
+        tooltip.style('opacity', 1)
+          .html(`<b>${d.color.toUpperCase()} flag</b><br>${d.start.toISOString().slice(0, 16).replace('T', ' ')} UTC onward`)
+          .style('left', (event.pageX + 12) + 'px')
+          .style('top', (event.pageY - 10) + 'px');
+      })
+      .on('mouseleave', () => tooltip.style('opacity', 0));
+  }
+
+  // Row separators + labels (model name / "Observed"), left of the plot.
+  rowKeys.forEach(key => {
+    const rowCenter = rowY(key) + rowY.bandwidth() / 2;
+    svg.append('line')
+      .attr('class', 'grid-line')
+      .attr('x1', margin.left).attr('x2', width - margin.right)
+      .attr('y1', rowCenter).attr('y2', rowCenter);
+    svg.append('text')
+      .attr('x', margin.left - 6).attr('y', rowCenter + 3)
+      .attr('text-anchor', 'end')
+      .attr('fill', key === OBS_KEY ? '#9aa5ab' : (MODEL_COLORS[key] || '#888'))
+      .attr('font-size', '0.7rem')
+      .text(key === OBS_KEY ? 'Obs' : key.toUpperCase());
+  });
+
+  // "Right now" vertical marker -- same as the main chart.
+  const nowDate = new Date();
+  if (nowDate >= x.domain()[0] && nowDate <= x.domain()[1]) {
+    svg.append('line')
+      .attr('class', 'now-line')
+      .attr('x1', x(nowDate)).attr('x2', x(nowDate))
+      .attr('y1', rowsTop - 4).attr('y2', rowsTop + rowKeys.length * rowHeight + 4)
+      .attr('stroke', 'var(--muted)')
+      .attr('stroke-width', 1)
+      .attr('stroke-dasharray', '2,2')
+      .attr('opacity', 0.5);
+    svg.append('text')
+      .attr('x', x(nowDate) + 4).attr('y', rowsTop - 8)
+      .attr('fill', 'var(--muted)')
+      .attr('font-size', '0.68rem')
+      .text('now');
+  }
+
+  function formatAxisTick(d) {
+    const pad = n => String(n).padStart(2, '0');
+    const abs = `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
+    const diffHours = Math.round((d.getTime() - Date.now()) / 3600000);
+    const sign = diffHours >= 0 ? '+' : '';
+    return `${abs} (${sign}${diffHours}h)`;
+  }
+
+  svg.append('g')
+    .attr('class', 'axis')
+    .attr('transform', `translate(0,${rowsTop + rowKeys.length * rowHeight + flagStripSpace})`)
+    .call(d3.axisBottom(x).ticks(Math.min(8, (hours + pastHours) / 12)).tickFormat(formatAxisTick))
+    .selectAll('text')
+    .attr('transform', 'rotate(-45)')
+    .style('text-anchor', 'end');
+
+  // One arrow marker per (row, timestamp) -- a small triangle rotated to
+  // point in the direction the wind blows TOWARD (fromDeg + 180, see
+  // function-level comment above for the "from" vs "toward" rationale).
+  //
+  // DOWNSAMPLED to a minimum pixel spacing along x -- first version drew
+  // one arrow per raw data point (every native forecast/observation
+  // timestamp), which for 6 models + observed at hourly-or-finer native
+  // resolution over a multi-day window produced thousands of overlapping
+  // arrows per row, visually merging into an unreadable solid smear
+  // rather than distinguishable direction markers (confirmed visually --
+  // looked like a fuzzy noisy line, worse than the numbers it replaced).
+  // Picking points at a minimum ~26px spacing keeps a consistent, legible
+  // arrow density regardless of window length or each model's native
+  // data resolution.
+  const MIN_ARROW_SPACING_PX = 26;
+
+  function downsampleBySpacing(points, tsAccessor) {
+    const sorted = points.slice().sort((a, b) => tsAccessor(a) - tsAccessor(b));
+    const picked = [];
+    let lastPx = -Infinity;
+    for (const d of sorted) {
+      const px = x(tsAccessor(d));
+      if (px - lastPx >= MIN_ARROW_SPACING_PX) {
+        picked.push(d);
+        lastPx = px;
+      }
+    }
+    return picked;
+  }
+
+  function drawArrows(key, points, colorFn, tsAccessor) {
+    const rowCenter = rowY(key) + rowY.bandwidth() / 2;
+    const sampled = downsampleBySpacing(points.filter(d => d.value != null), tsAccessor);
+    svg.append('g')
+      .selectAll('path.wind-dir-arrow')
+      .data(sampled)
+      .join('path')
+      .attr('class', 'wind-dir-arrow')
+      .attr('d', 'M 0,-7 L 5,5 L 0,2 L -5,5 Z') // simple arrowhead, points "up" (0 deg) before rotation
+      .attr('transform', d => `translate(${x(tsAccessor(d))},${rowCenter}) rotate(${(d.value + 180) % 360})`)
+      .attr('fill', colorFn())
+      .style('cursor', 'default')
+      .on('mouseenter', () => setRowHighlight(key))
+      .on('mousemove', (event, d) => {
+        const towardDeg = Math.round((d.value + 180) % 360);
+        const rawTs = d.valid_time_utc || d.ts_utc;
+        tooltip.style('opacity', 1)
+          .html(`<b>${key === OBS_KEY ? 'Observed' : key.toUpperCase()}</b><br>${rawTs}<br>from ${Math.round(d.value)}\u00b0 (blowing toward ${towardDeg}\u00b0)`)
+          .style('left', (event.pageX + 12) + 'px')
+          .style('top', (event.pageY - 10) + 'px');
+      })
+      .on('mouseleave', () => { tooltip.style('opacity', 0); setRowHighlight(null); });
+  }
+
+  function setRowHighlight(hoveredKey) {
+    svg.selectAll('path.wind-dir-arrow')
+      .attr('opacity', d => !hoveredKey || d.__model === hoveredKey ? 1 : 0.25);
+  }
+
+  models.forEach(m => {
+    const series = (byModel.get(m) || []).slice().sort((a, b) => a.valid_time_utc_date - b.valid_time_utc_date);
+    series.forEach(d => { d.__model = m; });
+    drawArrows(m, series, () => MODEL_COLORS[m] || '#888', d => d.valid_time_utc_date);
+  });
+  if (obs.length) {
+    obs.forEach(d => { d.__model = OBS_KEY; });
+    drawArrows(OBS_KEY, obs, () => '#9aa5ab', d => d.ts_utc_date);
+  }
+
+  // Legend: same models + Observed as the main chart, but no click-to-
+  // toggle here (deliberately simpler -- with a fixed one-row-per-series
+  // layout there's no y-axis rescaling benefit to hiding a series the
+  // way there is on the line chart, and every row is already visually
+  // distinct/labeled on its own line).
+  const legend = container.insert('div', 'svg').attr('class', 'legend');
+  models.forEach(m => {
+    const item = legend.append('div').attr('class', 'legend-item');
+    item.append('span').attr('class', 'legend-swatch').style('background', MODEL_COLORS[m] || '#888');
+    item.append('span').text(m.toUpperCase());
+  });
+  if (obs.length) {
+    const item = legend.append('div').attr('class', 'legend-item');
+    item.append('span').attr('class', 'legend-swatch').style('background', '#9aa5ab');
+    item.append('span').text('Observed');
+  }
+  const note = container.insert('div', 'svg').attr('class', 'subsection-title');
+  note.text('Arrows point in the direction the wind is blowing TOWARD (hover an arrow for the raw "from" bearing).');
 }
 
 // ---------------------------------------------------------------------------
