@@ -524,6 +524,28 @@ def _wind_bucket(value):
     return f"{int(lo)}-{int(lo + WIND_BUCKET_WIDTH_KT)}kt"
 
 
+DAYPART_DAY_START_HOUR = 7   # local hour (America/New_York) day starts
+DAYPART_DAY_END_HOUR = 19    # local hour (exclusive) day ends, night starts
+
+
+def _daypart(local_hour):
+    """Coarse day/night split by LOCAL hour (America/New_York), added
+    2026-09-24 for api_wind_prediction's time-of-day conditioning (see
+    that function's docstring for the full rationale/investigation).
+    Deliberately just 2 buckets, not e.g. 4 (morning/afternoon/evening/
+    night) or hourly -- with a training set of a few thousand pairs per
+    model/location, finer daypart buckets would starve each
+    (daypart, wind_bucket) cell of enough samples for the Dirichlet
+    smoothing to mean much; day-vs-night was the actual regime split
+    empirically confirmed in the investigation (thermal/convective
+    effects roughly track daylight, not a finer schedule), so this is
+    the coarsest split that still captures the real effect.
+    """
+    if local_hour is None:
+        return None
+    return "day" if DAYPART_DAY_START_HOUR <= local_hour < DAYPART_DAY_END_HOUR else "night"
+
+
 def api_flag_prediction(params):
     """Bayesian flag-color prediction for CBI, driven by a selectable
     forecast model's wind-speed forecast.
@@ -747,21 +769,47 @@ def api_wind_prediction(params):
     uses flag color instead; these locations DO have real observed wind,
     so they predict P(actual wind bucket | model's forecast wind bucket)
     instead of a flag color). Deliberately mirrors that endpoint's shape
-    (stacked-probability-by-hour) per user direction 2026-09-11 ("show a
-    very similar graph, but do wind prediction instead").
+    (stacked-probability-by-hour) per user direction 2026-09-11 (\"show a
+    very similar graph, but do wind prediction instead\").
 
-        P(actual_bucket=b | forecast_bucket=f)
-            = P(forecast_bucket=f | actual_bucket=b) * P(actual_bucket=b) / P(forecast_bucket=f)
+        P(actual_bucket=b | forecast_bucket=f, daypart=d)
+            = P(forecast_bucket=f | actual_bucket=b, daypart=d) * P(actual_bucket=b | daypart=d)
+              / P(forecast_bucket=f | daypart=d)
 
-    Estimated the same way as the flag panel: build the joint
-    (forecast_bucket, actual_bucket) count table directly from this
-    location's own historical forecast-vs-observation pairs (same
+    ADDED time-of-day (daypart) conditioning 2026-09-24 (user: "how is it
+    possible theres a chance of both 20knots and 0 knots, this isn't
+    right", re: a genuinely bimodal-looking probability spread on this
+    chart). Investigated with a real query at MIT Pavilion/NAM: when NAM
+    forecasts 12-16kt, actual outcomes split into two very different
+    regimes -- daytime hours (roughly 9am-7pm EDT) frequently come in
+    MUCH lower (0-8kt, likely thermal/sea-breeze/convective effects this
+    river-basin location experiences that NAM's grid doesn't resolve),
+    while nighttime/early-morning hours reliably match or exceed the
+    forecast (12-20kt). The un-conditioned model was lumping both real
+    regimes into one joint distribution, which is honestly bimodal --
+    not a bug in the math, but avoidably confusing since "day" and
+    "night" are a known, cheap-to-condition-on confound. User confirmed
+    wanting this addressed: "yes, add time of day by bucket".
+
+    Fix: added a coarse 2-bucket daypart split (day ~7am-7pm local vs.
+    night otherwise, local = America/New_York so it tracks actual solar
+    time rather than a UTC offset that drifts with DST) as an extra
+    dimension in the joint count table, so historical pairs are only
+    compared against other pairs from the same daypart. Each future
+    forecast point is classified into a daypart from its OWN valid time
+    the same way, and looks up the posterior for (daypart, its forecast
+    bucket) instead of collapsing across day and night.
+
+    Estimated the same way as the flag panel otherwise: build the joint
+    (daypart, forecast_bucket, actual_bucket) count table directly from
+    this location's own historical forecast-vs-observation pairs (same
     nearest-observation-within-7.5min matching used by
     v_accuracy_by_lead_time), add Dirichlet(alpha=1) smoothing per
-    forecast-bucket row, then look up each future forecast point's
-    bucket in that table to get a probability distribution over what
-    the REAL wind is likely to be -- a genuine uncertainty band around
-    the model's raw number, not just the number itself.
+    (daypart, forecast-bucket) row, then look up each future forecast
+    point's (daypart, bucket) in that table to get a probability
+    distribution over what the REAL wind is likely to be -- a genuine
+    uncertainty band around the model's raw number, not just the number
+    itself.
     """
     location = params.get("location")
     model = params.get("model")
@@ -771,7 +819,11 @@ def api_wind_prediction(params):
         return {"error": "location and model query params are required"}
     con = db()
     try:
-        # 1. Forecast wind for the selected model, forward-looking.
+        # 1. Forecast wind for the selected model, forward-looking. Also
+        # pull each point's LOCAL hour (America/New_York, so it tracks
+        # real daylight rather than a fixed UTC offset that would drift
+        # across EDT/EST) to classify its daypart the same way training
+        # pairs are classified below.
         forecast_rows = con.execute(
             """
             WITH latest_run AS (
@@ -780,7 +832,8 @@ def api_wind_prediction(params):
                 WHERE location_id = ? AND model = ?
                 QUALIFY row_number() OVER (ORDER BY init_time_utc DESC) = 1
             )
-            SELECT lr.init_time_utc, fv.valid_time_utc, fv.value
+            SELECT lr.init_time_utc, fv.valid_time_utc, fv.value,
+                   extract(hour FROM (fv.valid_time_utc AT TIME ZONE 'UTC' AT TIME ZONE 'America/New_York')) AS local_hour
             FROM forecast_values fv
             JOIN latest_run lr ON lr.run_id = fv.run_id
             WHERE fv.variable = ?
@@ -795,13 +848,15 @@ def api_wind_prediction(params):
         # 2. Historical training pairs: this model's own past forecast
         # values at this location, matched to the nearest real
         # observation within 7.5 minutes (same tolerance as
-        # v_accuracy_by_lead_time).
+        # v_accuracy_by_lead_time), plus the observation's own local
+        # hour for daypart classification.
         training_rows = con.execute(
             """
             WITH candidates AS (
                 SELECT
                     fv.value AS forecast_value,
                     o.value AS observed_value,
+                    extract(hour FROM (o.ts_utc AT TIME ZONE 'UTC' AT TIME ZONE 'America/New_York')) AS local_hour,
                     row_number() OVER (
                         PARTITION BY fv.run_id, fv.valid_time_utc
                         ORDER BY abs(epoch(fv.valid_time_utc) - epoch(o.ts_utc))
@@ -815,32 +870,34 @@ def api_wind_prediction(params):
                                      AND fv.valid_time_utc + INTERVAL '7.5 minutes'
                 WHERE fr.location_id = ? AND fr.model = ? AND fv.variable = ?
             )
-            SELECT forecast_value, observed_value FROM candidates WHERE rn = 1
+            SELECT forecast_value, observed_value, local_hour FROM candidates WHERE rn = 1
             """,
             [location, model, variable],
         ).fetchall()
-        training_rows = [(f, o) for (f, o) in training_rows if f is not None and o is not None]
+        training_rows = [
+            (f, o, h) for (f, o, h) in training_rows if f is not None and o is not None and h is not None
+        ]
 
-        # 3. Build joint forecast_bucket -> {actual_bucket: count}, plus
-        # the marginal distribution of actual buckets, then compute the
-        # Dirichlet(alpha=1)-smoothed posterior per forecast bucket.
-        bucket_counts = {}  # forecast_bucket -> {actual_bucket: count}
-        marginal_counts = {}  # actual_bucket -> count (for degenerate fallback)
+        # 3. Build joint (daypart, forecast_bucket) -> {actual_bucket:
+        # count}, then compute the Dirichlet(alpha=1)-smoothed posterior
+        # per (daypart, forecast bucket) pair.
+        bucket_counts = {}  # (daypart, forecast_bucket) -> {actual_bucket: count}
         all_actual_buckets = set()
-        for f_val, o_val in training_rows:
+        for f_val, o_val, local_hour in training_rows:
+            dp = _daypart(local_hour)
             fb = _wind_bucket(f_val)
             ob = _wind_bucket(o_val)
             all_actual_buckets.add(ob)
-            bucket_counts.setdefault(fb, {})
-            bucket_counts[fb][ob] = bucket_counts[fb].get(ob, 0) + 1
-            marginal_counts[ob] = marginal_counts.get(ob, 0) + 1
+            key = (dp, fb)
+            bucket_counts.setdefault(key, {})
+            bucket_counts[key][ob] = bucket_counts[key].get(ob, 0) + 1
 
         all_actual_buckets = sorted(all_actual_buckets, key=lambda b: int(b.split("-")[0]))
         alpha = 1.0
         n_buckets = max(1, len(all_actual_buckets))
 
-        def posterior_for_forecast_bucket(fb):
-            counts = bucket_counts.get(fb, {})
+        def posterior_for(daypart, fb):
+            counts = bucket_counts.get((daypart, fb), {})
             total = sum(counts.values()) + alpha * n_buckets
             return {
                 b: round((counts.get(b, 0) + alpha) / total, 4)
@@ -848,16 +905,18 @@ def api_wind_prediction(params):
             }
 
         # 4. Attach a probability distribution (over ACTUAL wind buckets)
-        # to every forecast point.
+        # to every forecast point, using ITS OWN local-hour daypart.
         predictions = []
         for row in forecast_points:
             forecast_wind = row["value"]
             fb = _wind_bucket(forecast_wind) if forecast_wind is not None else None
-            probs = posterior_for_forecast_bucket(fb) if (fb is not None and all_actual_buckets) else None
+            dp = _daypart(row["local_hour"]) if row["local_hour"] is not None else None
+            probs = posterior_for(dp, fb) if (fb is not None and dp is not None and all_actual_buckets) else None
             predictions.append({
                 "valid_time_utc": row["valid_time_utc"],
                 "forecast_wind_kt": forecast_wind,
                 "forecast_wind_bucket": fb,
+                "daypart": dp,
                 "actual_wind_probabilities": probs,
                 "most_likely_actual_bucket": max(probs, key=probs.get) if probs else None,
             })
