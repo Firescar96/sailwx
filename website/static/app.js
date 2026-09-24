@@ -1070,7 +1070,7 @@ function renderWindDirectionChart(container, tooltip, models, byModel, obs, flag
       .attr('fill', key === OBS_KEY ? '#9aa5ab' : key === AVG_KEY ? 'var(--text)' : (MODEL_COLORS[key] || '#888'))
       .attr('font-size', '0.7rem')
       .attr('font-weight', key === AVG_KEY ? 'bold' : null)
-      .text(key === OBS_KEY ? 'Obs' : key === AVG_KEY ? 'AVG' : key.toUpperCase());
+      .text(key === OBS_KEY ? 'Obs' : key === AVG_KEY ? 'REF' : key.toUpperCase());
   });
 
   // "Right now" vertical marker -- same as the main chart.
@@ -1200,9 +1200,31 @@ function renderWindDirectionChart(container, tooltip, models, byModel, obs, flag
 
   const columnDates = downsampleBySpacing(referenceSeries, referenceAccessor).map(referenceAccessor);
 
-  // For each shared column, look up each model's nearest real value and
-  // compute the circular mean across whichever models actually have
-  // data at that column.
+  // How close a real observation needs to be to a column's timestamp to
+  // count as "we actually have ground truth for this moment" rather
+  // than "closest we happen to have, but probably a different hour".
+  // Set generously enough to cover every observed source's own native
+  // cadence (MIT ~2min, NDBC ~10min, KBOS/METAR hourly) with margin.
+  const OBS_MATCH_TOLERANCE_MS = 65 * 60 * 1000;
+
+  // For each shared column: look up each model's nearest real value,
+  // the nearest real OBSERVATION (if one exists close enough in time),
+  // and the circular mean across models (still computed even when an
+  // observation exists, so hovering a model's arrow can always show
+  // "vs cross-model average" as a secondary data point in the tooltip).
+  //
+  // REFERENCE PRIORITY changed 2026-09-24 (user: "when observed data is
+  // available naturally use the observed data not an average of the
+  // models" -- i.e. for judging how "accurate" each model's arrow is,
+  // real ground truth should always win over an average of forecasts
+  // when we actually have it. Averaging models only stands in as an
+  // estimate of "the truth" for moments where there IS no real
+  // observation yet -- future forecast times, or CBI (no wind sensor at
+  // all). This naturally resolves itself per-column: past columns
+  // usually have a nearby real observation and use it; future columns
+  // (or any sensor-less location) have none and fall back to the
+  // cross-model average, with zero special-casing needed beyond "is
+  // there a close-enough real observation for this exact column".
   const columns = columnDates.map(colDate => {
     const perModel = {};
     models.forEach(m => {
@@ -1211,7 +1233,16 @@ function renderWindDirectionChart(container, tooltip, models, byModel, obs, flag
       if (nearest) perModel[m] = nearest.value;
     });
     const avgDeg = circularMeanDeg(Object.values(perModel));
-    return { date: colDate, perModel, avgDeg };
+    let obsDeg = null;
+    if (obsSorted.length) {
+      const nearestObs = nearestPoint(obsSorted, colDate, d => d.ts_utc_date);
+      if (nearestObs && Math.abs(nearestObs.ts_utc_date - colDate) <= OBS_MATCH_TOLERANCE_MS) {
+        obsDeg = nearestObs.value;
+      }
+    }
+    const referenceDeg = obsDeg != null ? obsDeg : avgDeg;
+    const referenceIsObserved = obsDeg != null;
+    return { date: colDate, perModel, avgDeg, obsDeg, referenceDeg, referenceIsObserved };
   });
 
   function drawArrows(key, colorFn, valueForColumn) {
@@ -1227,21 +1258,22 @@ function renderWindDirectionChart(container, tooltip, models, byModel, obs, flag
       .attr('class', 'wind-dir-arrow')
       .attr('d', 'M 0,-7 L 5,5 L 0,2 L -5,5 Z') // simple arrowhead, points "up" (0 deg) before rotation
       .attr('transform', d => `translate(${x(d.col.date)},${rowCenter}) rotate(${(d.value + 180) % 360})`)
-      .attr('fill', colorFn())
-      // Opacity encodes agreement with the cross-model average at this
-      // column: 1.0 when this model's direction exactly matches the
-      // average, fading down to a floor of 0.25 at 90+ degrees of
+      .attr('fill', d => (key === AVG_KEY && d.col.referenceIsObserved) ? '#9aa5ab' : colorFn())
+      // Opacity encodes agreement with this column's REFERENCE direction
+      // (real observation when one exists close enough in time,
+      // otherwise the cross-model average -- see the column-building
+      // comment above): 1.0 when a model's direction exactly matches
+      // the reference, fading down to a floor of 0.25 at 90+ degrees of
       // disagreement (a full 180-degree opposite reading floors out the
-      // same as a 90-degree crosswind disagreement -- the point is
-      // "how far from consensus", not a literal linear degree scale,
+      // same as a 90-degree crosswind disagreement -- the point is "how
+      // far from truth/consensus", not a literal linear degree scale,
       // since past ~90 degrees off it's already a clearly different
-      // call regardless of exactly how different). The AVG and Observed
-      // rows are always fully opaque -- there's no "how accurate is the
-      // average compared to itself" concept, and Observed is the real
-      // ground truth being compared AGAINST, not a competing forecast.
+      // call regardless of exactly how different). The AVG/reference
+      // row and Observed row are always fully opaque -- there's no
+      // "how accurate is the reference compared to itself" concept.
       .attr('data-base-opacity', d => {
-        if (key === AVG_KEY || key === OBS_KEY || d.col.avgDeg == null) return 1;
-        const diff = circularDiffDeg(d.value, d.col.avgDeg);
+        if (key === AVG_KEY || key === OBS_KEY || d.col.referenceDeg == null) return 1;
+        const diff = circularDiffDeg(d.value, d.col.referenceDeg);
         return Math.max(0.25, 1 - Math.min(diff, 90) / 90 * 0.75);
       })
       .attr('opacity', function () { return d3.select(this).attr('data-base-opacity'); })
@@ -1249,12 +1281,15 @@ function renderWindDirectionChart(container, tooltip, models, byModel, obs, flag
       .on('mouseenter', () => setRowHighlight(key))
       .on('mousemove', (event, d) => {
         const towardDeg = Math.round((d.value + 180) % 360);
-        const diffFromAvg = (key !== AVG_KEY && key !== OBS_KEY && d.col.avgDeg != null)
-          ? `<br>${Math.round(circularDiffDeg(d.value, d.col.avgDeg))}\u00b0 from cross-model average`
+        const refLabel = d.col.referenceIsObserved ? 'observed' : 'cross-model average';
+        const diffFromRef = (key !== AVG_KEY && key !== OBS_KEY && d.col.referenceDeg != null)
+          ? `<br>${Math.round(circularDiffDeg(d.value, d.col.referenceDeg))}\u00b0 from ${refLabel}`
           : '';
-        const label = key === OBS_KEY ? 'Observed' : key === AVG_KEY ? 'Cross-model average' : key.toUpperCase();
+        const label = key === OBS_KEY ? 'Observed'
+          : key === AVG_KEY ? (d.col.referenceIsObserved ? 'Observed (ground truth)' : 'Cross-model average')
+          : key.toUpperCase();
         tooltip.style('opacity', 1)
-          .html(`<b>${label}</b><br>${d.col.date.toISOString().slice(0, 16).replace('T', ' ')} UTC<br>from ${Math.round(d.value)}\u00b0 (blowing toward ${towardDeg}\u00b0)${diffFromAvg}`)
+          .html(`<b>${label}</b><br>${d.col.date.toISOString().slice(0, 16).replace('T', ' ')} UTC<br>from ${Math.round(d.value)}\u00b0 (blowing toward ${towardDeg}\u00b0)${diffFromRef}`)
           .style('left', (event.pageX + 12) + 'px')
           .style('top', (event.pageY - 10) + 'px');
       })
@@ -1272,7 +1307,7 @@ function renderWindDirectionChart(container, tooltip, models, byModel, obs, flag
     });
   }
 
-  drawArrows(AVG_KEY, () => '#e8e8e8', col => col.avgDeg);
+  drawArrows(AVG_KEY, () => '#e8e8e8', col => col.referenceDeg);
   models.forEach(m => {
     drawArrows(m, () => MODEL_COLORS[m] || '#888', col => col.perModel[m]);
   });
@@ -1314,7 +1349,7 @@ function renderWindDirectionChart(container, tooltip, models, byModel, obs, flag
   const legend = container.insert('div', 'svg').attr('class', 'legend');
   const avgItem = legend.append('div').attr('class', 'legend-item');
   avgItem.append('span').attr('class', 'legend-swatch').style('background', '#e8e8e8');
-  avgItem.append('span').text('AVG (cross-model)');
+  avgItem.append('span').text('REF (observed, or cross-model avg if none)');
   models.forEach(m => {
     const item = legend.append('div').attr('class', 'legend-item');
     item.append('span').attr('class', 'legend-swatch').style('background', MODEL_COLORS[m] || '#888');
@@ -1326,7 +1361,7 @@ function renderWindDirectionChart(container, tooltip, models, byModel, obs, flag
     item.append('span').text('Observed');
   }
   const note = container.insert('div', 'svg').attr('class', 'subsection-title');
-  note.text('Arrows point in the direction the wind is blowing TOWARD (hover for the raw "from" bearing). AVG row = circular mean direction across all models at each time; each model\'s arrow opacity fades from 1.0 (matches the average) down to 0.25 (90\u00b0+ off the average).');
+  note.text('Arrows point in the direction the wind is blowing TOWARD (hover for the raw "from" bearing). REF row = the real observed direction where available, falling back to the circular mean across all models only when no observation exists yet (future times, or a location with no wind sensor). Each model\'s arrow opacity fades from 1.0 (matches REF) down to 0.25 (90\u00b0+ off REF).');
 }
 
 // ---------------------------------------------------------------------------
