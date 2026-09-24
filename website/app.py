@@ -546,6 +546,29 @@ def _daypart(local_hour):
     return "day" if DAYPART_DAY_START_HOUR <= local_hour < DAYPART_DAY_END_HOUR else "night"
 
 
+WIND_PREDICTION_DIRECTIONS = 8  # 8-point compass (N/NE/E/SE/S/SW/W/NW, 45 deg each)
+_COMPASS_SECTOR_LABELS_8 = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+
+
+def _compass_sector_label(deg, n=WIND_PREDICTION_DIRECTIONS):
+    """Human-readable compass sector for api_wind_prediction's
+    direction conditioning (added 2026-09-24, user: "add in wind
+    direction to all the buckets"). Deliberately coarser (8 sectors,
+    45deg each) than the Wind Rose panel's 16 sectors -- every extra
+    conditioning dimension divides the same finite training data
+    further, and with only ~400 deduped real events per model/location
+    (see the training-pair dedup fix in api_wind_prediction), 16-way
+    direction on top of 2-way daypart and 5-6 wind buckets would spread
+    that data far too thin to mean anything. Reuses _compass_sector's
+    bucketing math but only supports n=8 (hardcoded label table) since
+    that's the only granularity this endpoint uses.
+    """
+    if n != WIND_PREDICTION_DIRECTIONS:
+        raise ValueError("_compass_sector_label only supports the 8-sector case")
+    idx = _compass_sector(deg, n=n)
+    return _COMPASS_SECTOR_LABELS_8[idx]
+
+
 def api_flag_prediction(params):
     """Bayesian flag-color prediction for CBI, driven by a selectable
     forecast model's wind-speed forecast.
@@ -769,12 +792,12 @@ def api_wind_prediction(params):
     uses flag color instead; these locations DO have real observed wind,
     so they predict P(actual wind bucket | model's forecast wind bucket)
     instead of a flag color). Deliberately mirrors that endpoint's shape
-    (stacked-probability-by-hour) per user direction 2026-09-11 (\"show a
-    very similar graph, but do wind prediction instead\").
+    (stacked-probability-by-hour) per user direction 2026-09-11 ("show a
+    very similar graph, but do wind prediction instead").
 
-        P(actual_bucket=b | forecast_bucket=f, daypart=d)
-            = P(forecast_bucket=f | actual_bucket=b, daypart=d) * P(actual_bucket=b | daypart=d)
-              / P(forecast_bucket=f | daypart=d)
+        P(actual_bucket=b | forecast_bucket=f, daypart=d, dir_sector=s)
+            = P(forecast_bucket=f, daypart=d, dir_sector=s | actual_bucket=b) * P(actual_bucket=b)
+              / P(forecast_bucket=f, daypart=d, dir_sector=s)
 
     ADDED time-of-day (daypart) conditioning 2026-09-24 (user: "how is it
     possible theres a chance of both 20knots and 0 knots, this isn't
@@ -782,31 +805,43 @@ def api_wind_prediction(params):
     chart). Investigated with a real query at MIT Pavilion/NAM: when NAM
     forecasts 12-16kt, actual outcomes split into two very different
     regimes -- daytime hours (roughly 9am-7pm EDT) frequently come in
-    MUCH lower (0-8kt, likely thermal/sea-breeze/convective effects this
-    river-basin location experiences that NAM's grid doesn't resolve),
-    while nighttime/early-morning hours reliably match or exceed the
-    forecast (12-20kt). The un-conditioned model was lumping both real
-    regimes into one joint distribution, which is honestly bimodal --
-    not a bug in the math, but avoidably confusing since "day" and
-    "night" are a known, cheap-to-condition-on confound. User confirmed
-    wanting this addressed: "yes, add time of day by bucket".
+    MUCH lower (0-8kt), while nighttime/early-morning hours reliably
+    match or exceed the forecast.
 
-    Fix: added a coarse 2-bucket daypart split (day ~7am-7pm local vs.
-    night otherwise, local = America/New_York so it tracks actual solar
-    time rather than a UTC offset that drifts with DST) as an extra
-    dimension in the joint count table, so historical pairs are only
-    compared against other pairs from the same daypart. Each future
-    forecast point is classified into a daypart from its OWN valid time
-    the same way, and looks up the posterior for (daypart, its forecast
-    bucket) instead of collapsing across day and night.
+    DEDUPED training pairs by real event 2026-09-24 (see below).
+
+    ADDED wind-direction conditioning 2026-09-24 (user: "add in wind
+    direction to all the buckets", after investigating one of the real
+    misses in this bucket directly: on 2026-09-14 14:00-15:00 UTC, NAM
+    forecast 12-14kt and was actually a good REGIONAL forecast -- NDBC
+    buoy showed 15.6kt and KBOS/Logan showed 17kt at the same time --
+    but MIT Pavilion itself stayed nearly calm (2.4-3.3kt) the whole
+    afternoon. MIT Pavilion sits tucked into the Charles River basin,
+    sheltered by surrounding buildings/terrain in a way gridded models
+    (13-25km+ resolution) can't resolve -- and that sheltering is
+    strongly direction-dependent: wind from a sheltered quadrant gets
+    blocked, wind from an open quadrant doesn't. Wind direction is a
+    real, physically-motivated confound the same way daypart was.
+
+    Fix: added an 8-sector compass-direction bucket (N/NE/E/SE/S/SW/W/NW,
+    45 degrees each -- coarser than the 16-sector Wind Rose panel, since
+    each extra dimension divides the same finite training data further;
+    see the "how many more weeks of data" investigation this was paired
+    with) as a third dimension in the joint count table, using the
+    model's OWN forecast wind_dir_deg for historical training pairs (so
+    the model is conditioned on what IT predicted the direction would
+    be, matching how it'll be looked up for future predictions) and each
+    future forecast point's own forecast wind_dir_deg the same way.
 
     Estimated the same way as the flag panel otherwise: build the joint
-    (daypart, forecast_bucket, actual_bucket) count table directly from
-    this location's own historical forecast-vs-observation pairs (same
-    nearest-observation-within-7.5min matching used by
-    v_accuracy_by_lead_time), add Dirichlet(alpha=1) smoothing per
-    (daypart, forecast-bucket) row, then look up each future forecast
-    point's (daypart, bucket) in that table to get a probability
+    (daypart, dir_sector, forecast_bucket, actual_bucket) count table
+    directly from this location's own historical forecast-vs-observation
+    pairs (same nearest-observation-within-7.5min matching used by
+    v_accuracy_by_lead_time, one row per real observed EVENT rather than
+    one row per forecast run that touched it -- see the dedup rationale
+    below), add Dirichlet(alpha=1) smoothing per (daypart, dir_sector,
+    forecast-bucket) row, then look up each future forecast point's own
+    (daypart, dir_sector, bucket) in that table to get a probability
     distribution over what the REAL wind is likely to be -- a genuine
     uncertainty band around the model's raw number, not just the number
     itself.
@@ -815,6 +850,7 @@ def api_wind_prediction(params):
     model = params.get("model")
     hours = int(params.get("hours", "48"))
     variable = "wind_speed_kt"
+    dir_variable = "wind_dir_deg"
     if not location or not model:
         return {"error": "location and model query params are required"}
     con = db()
@@ -822,8 +858,11 @@ def api_wind_prediction(params):
         # 1. Forecast wind for the selected model, forward-looking. Also
         # pull each point's LOCAL hour (America/New_York, so it tracks
         # real daylight rather than a fixed UTC offset that would drift
-        # across EDT/EST) to classify its daypart the same way training
-        # pairs are classified below.
+        # across EDT/EST) to classify its daypart, and this SAME model's
+        # OWN forecast wind direction at the same valid_time_utc (not
+        # observed direction -- for a future point we only have the
+        # model's own forecast to condition on, so training must use the
+        # same signal for consistency).
         forecast_rows = con.execute(
             """
             WITH latest_run AS (
@@ -833,62 +872,112 @@ def api_wind_prediction(params):
                 QUALIFY row_number() OVER (ORDER BY init_time_utc DESC) = 1
             )
             SELECT lr.init_time_utc, fv.valid_time_utc, fv.value,
-                   extract(hour FROM (fv.valid_time_utc AT TIME ZONE 'UTC' AT TIME ZONE 'America/New_York')) AS local_hour
+                   extract(hour FROM (fv.valid_time_utc AT TIME ZONE 'UTC' AT TIME ZONE 'America/New_York')) AS local_hour,
+                   fvdir.value AS forecast_dir_deg
             FROM forecast_values fv
             JOIN latest_run lr ON lr.run_id = fv.run_id
+            LEFT JOIN forecast_values fvdir
+                ON fvdir.run_id = fv.run_id
+               AND fvdir.valid_time_utc = fv.valid_time_utc
+               AND fvdir.variable = ?
             WHERE fv.variable = ?
               AND fv.valid_time_utc <= now() + (? * INTERVAL '1 hour')
               AND fv.valid_time_utc >= now()
             ORDER BY fv.valid_time_utc
             """,
-            [location, model, variable, hours],
+            [location, model, dir_variable, variable, hours],
         )
         forecast_points = rows_as_dicts(forecast_rows)
 
         # 2. Historical training pairs: this model's own past forecast
-        # values at this location, matched to the nearest real
-        # observation within 7.5 minutes (same tolerance as
-        # v_accuracy_by_lead_time), plus the observation's own local
-        # hour for daypart classification.
+        # values (wind speed AND direction) at this location, matched to
+        # the nearest real observation within 7.5 minutes (same
+        # tolerance as v_accuracy_by_lead_time), plus the observation's
+        # own local hour for daypart classification.
+        #
+        # DEDUPED BY REAL EVENT 2026-09-24 (user: "it should be more
+        # conclusive" / "why is 0 knots even showing up at all in
+        # daypart" -- investigated and found a real methodological flaw:
+        # a single real hour gets forecast by MANY different runs (a
+        # 6h-ahead run, a 12h-ahead run, a 24h-ahead run, etc, all
+        # predicting the SAME target valid_time_utc), and an earlier
+        # version of this query counted every one of those as an
+        # independent training example. Confirmed concretely: 41
+        # "0-4kt actual" rows in the (day, 12-16kt-forecast) cell turned
+        # out to be only 5 DISTINCT real hours, each re-forecast by ~8
+        # different NAM runs -- a handful of real forecast busts on just
+        # 2 calendar days was getting pseudo-replicated into 41 "pieces
+        # of evidence". Fix: for each real observed event, keep only the
+        # forecast from whichever run was CLOSEST to that valid_time
+        # (shortest lead time = the run's last, most-informed guess
+        # before the event), collapsing what used to be N rows (one per
+        # run that touched this hour) into exactly 1 row per real event.
         training_rows = con.execute(
             """
-            WITH candidates AS (
+            WITH nearest_obs AS (
                 SELECT
+                    fv.run_id,
+                    fv.valid_time_utc,
+                    fr.init_time_utc,
                     fv.value AS forecast_value,
+                    fvdir.value AS forecast_dir_deg,
                     o.value AS observed_value,
                     extract(hour FROM (o.ts_utc AT TIME ZONE 'UTC' AT TIME ZONE 'America/New_York')) AS local_hour,
                     row_number() OVER (
                         PARTITION BY fv.run_id, fv.valid_time_utc
                         ORDER BY abs(epoch(fv.valid_time_utc) - epoch(o.ts_utc))
-                    ) AS rn
+                    ) AS obs_rn
                 FROM forecast_values fv
                 JOIN forecast_runs fr ON fr.run_id = fv.run_id
+                LEFT JOIN forecast_values fvdir
+                    ON fvdir.run_id = fv.run_id
+                   AND fvdir.valid_time_utc = fv.valid_time_utc
+                   AND fvdir.variable = ?
                 JOIN observations o
                     ON o.location_id = fr.location_id
                    AND o.variable = fv.variable
                    AND o.ts_utc BETWEEN fv.valid_time_utc - INTERVAL '7.5 minutes'
                                      AND fv.valid_time_utc + INTERVAL '7.5 minutes'
                 WHERE fr.location_id = ? AND fr.model = ? AND fv.variable = ?
+            ),
+            one_per_real_event AS (
+                SELECT
+                    valid_time_utc, forecast_value, forecast_dir_deg, observed_value, local_hour,
+                    row_number() OVER (
+                        PARTITION BY valid_time_utc
+                        ORDER BY init_time_utc DESC
+                    ) AS event_rn
+                FROM nearest_obs
+                WHERE obs_rn = 1
             )
-            SELECT forecast_value, observed_value, local_hour FROM candidates WHERE rn = 1
+            SELECT forecast_value, forecast_dir_deg, observed_value, local_hour
+            FROM one_per_real_event
+            WHERE event_rn = 1
             """,
-            [location, model, variable],
+            [dir_variable, location, model, variable],
         ).fetchall()
         training_rows = [
-            (f, o, h) for (f, o, h) in training_rows if f is not None and o is not None and h is not None
+            (f, d, o, h) for (f, d, o, h) in training_rows
+            if f is not None and o is not None and h is not None
         ]
 
-        # 3. Build joint (daypart, forecast_bucket) -> {actual_bucket:
-        # count}, then compute the Dirichlet(alpha=1)-smoothed posterior
-        # per (daypart, forecast bucket) pair.
-        bucket_counts = {}  # (daypart, forecast_bucket) -> {actual_bucket: count}
+        # 3. Build joint (daypart, dir_sector, forecast_bucket) ->
+        # {actual_bucket: count}, then compute the Dirichlet(alpha=1)-
+        # smoothed posterior per (daypart, dir_sector, forecast bucket)
+        # tuple. A missing/null forecast direction (LEFT JOIN found no
+        # matching wind_dir_deg row for that run/valid_time) falls back
+        # to a dedicated "unknown" sector rather than being dropped, so
+        # a model that's missing direction data for some runs doesn't
+        # lose those speed pairs entirely.
+        bucket_counts = {}  # (daypart, dir_sector, forecast_bucket) -> {actual_bucket: count}
         all_actual_buckets = set()
-        for f_val, o_val, local_hour in training_rows:
+        for f_val, dir_deg, o_val, local_hour in training_rows:
             dp = _daypart(local_hour)
+            sector = _compass_sector_label(dir_deg) if dir_deg is not None else "unknown"
             fb = _wind_bucket(f_val)
             ob = _wind_bucket(o_val)
             all_actual_buckets.add(ob)
-            key = (dp, fb)
+            key = (dp, sector, fb)
             bucket_counts.setdefault(key, {})
             bucket_counts[key][ob] = bucket_counts[key].get(ob, 0) + 1
 
@@ -896,8 +985,8 @@ def api_wind_prediction(params):
         alpha = 1.0
         n_buckets = max(1, len(all_actual_buckets))
 
-        def posterior_for(daypart, fb):
-            counts = bucket_counts.get((daypart, fb), {})
+        def posterior_for(daypart, sector, fb):
+            counts = bucket_counts.get((daypart, sector, fb), {})
             total = sum(counts.values()) + alpha * n_buckets
             return {
                 b: round((counts.get(b, 0) + alpha) / total, 4)
@@ -905,18 +994,23 @@ def api_wind_prediction(params):
             }
 
         # 4. Attach a probability distribution (over ACTUAL wind buckets)
-        # to every forecast point, using ITS OWN local-hour daypart.
+        # to every forecast point, using ITS OWN local-hour daypart and
+        # ITS OWN forecast direction sector.
         predictions = []
         for row in forecast_points:
             forecast_wind = row["value"]
+            forecast_dir = row["forecast_dir_deg"]
             fb = _wind_bucket(forecast_wind) if forecast_wind is not None else None
             dp = _daypart(row["local_hour"]) if row["local_hour"] is not None else None
-            probs = posterior_for(dp, fb) if (fb is not None and dp is not None and all_actual_buckets) else None
+            sector = _compass_sector_label(forecast_dir) if forecast_dir is not None else "unknown"
+            probs = posterior_for(dp, sector, fb) if (fb is not None and dp is not None and all_actual_buckets) else None
             predictions.append({
                 "valid_time_utc": row["valid_time_utc"],
                 "forecast_wind_kt": forecast_wind,
                 "forecast_wind_bucket": fb,
                 "daypart": dp,
+                "forecast_dir_deg": forecast_dir,
+                "dir_sector": sector,
                 "actual_wind_probabilities": probs,
                 "most_likely_actual_bucket": max(probs, key=probs.get) if probs else None,
             })
@@ -926,6 +1020,7 @@ def api_wind_prediction(params):
             "model": model,
             "training_sample_size": len(training_rows),
             "wind_bucket_width_kt": WIND_BUCKET_WIDTH_KT,
+            "wind_prediction_directions": WIND_PREDICTION_DIRECTIONS,
             "actual_wind_buckets": all_actual_buckets,
             "predictions": predictions,
         }
