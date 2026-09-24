@@ -393,6 +393,27 @@ def api_forecast_stability(params):
         return {"error": "num_runs must be >= 2 to measure any stability"}
     con = db()
     try:
+        # MIN_RUNS_FOR_SPREAD (was: require count(*) == num_runs exactly)
+        # -- FIXED 2026-09-24 (user: "hrdps shows more on the top graph
+        # of forecast prediction than on forecast stability, seems
+        # trimmed"). Root cause: HRDPS only forecasts ~48h out per run
+        # (confirmed directly -- its runs' own max valid_time_utc is
+        # consistently init_time + 48h, vs. ECMWF/GFS/etc reaching 14+
+        # days), while this query previously required a target hour to
+        # appear in ALL `num_runs` selected runs before showing ANY
+        # spread for it. With num_runs=4 selected, any hour beyond
+        # HRDPS's OLDEST of those 4 runs' 48h horizon got silently
+        # dropped entirely -- even though 2-3 of the newer selected runs
+        # DID cover that hour just fine. This truncated HRDPS's visible
+        # stability range far short of its real forecast reach, and far
+        # short of what the (unconstrained) Forecast Time Series chart
+        # shows for the same model. Changed to only require at least 2
+        # of the selected runs cover an hour (the minimum needed to
+        # measure any spread at all) -- a short-horizon model's line now
+        # extends as far as its own real data does, using however many
+        # of the selected runs actually reach that far, rather than
+        # being capped by whichever selected run happens to be shortest.
+        MIN_RUNS_FOR_SPREAD = 2
         cur = con.execute(
             """
             WITH recent_runs AS (
@@ -423,10 +444,10 @@ def api_forecast_stability(params):
                    round(avg(value), 3) AS avg_value
             FROM values_across_runs
             GROUP BY model, valid_time_utc
-            HAVING count(*) = ?
+            HAVING count(*) >= ?
             ORDER BY model, valid_time_utc
             """,
-            [location, num_runs, variable, hours, num_runs],
+            [location, num_runs, variable, hours, MIN_RUNS_FOR_SPREAD],
         )
         rows = rows_as_dicts(cur)
 

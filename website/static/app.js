@@ -1529,11 +1529,27 @@ async function loadStabilityChart() {
       .style('cursor', 'pointer')
       .on('mouseenter', () => setStabilityHighlight(m))
       .on('mousemove', (event, d) => {
+        // n_runs_with_this_hour can now be LESS than the requested
+        // numRuns -- ADDED 2026-09-24 (user: "hrdps shows more on the
+        // top graph of forecast prediction than on forecast stability,
+        // seems trimmed"): the backend used to require an hour to
+        // appear in ALL numRuns selected runs before showing ANY spread
+        // for it, which truncated short-forecast-horizon models (HRDPS,
+        // ~48h reach per run) to whatever the OLDEST selected run
+        // happened to cover, even when 2-3 newer runs covered further.
+        // Now only requires >=2 runs, so a point CAN legitimately be
+        // backed by fewer runs than requested -- surfaced here so it's
+        // clear "this point exists but is a slightly less-informed
+        // spread estimate" rather than looking identical to a fully
+        // n-run-backed point.
+        const runsNote = d.n_runs_with_this_hour < +numRuns
+          ? `<br><span style="color:var(--muted)">(only ${d.n_runs_with_this_hour}/${numRuns} runs reach this far ahead)</span>`
+          : '';
         tooltip.style('opacity', 1)
           .html(`<b>${m.toUpperCase()}</b><br>${d.valid_time_utc}<br>` +
                 `avg: ${d.avg_value} ${fmtVarLabel(state.variable)}<br>` +
                 `range across last ${numRuns} runs: ${d.min_value} - ${d.max_value} (spread ${d.spread})<br>` +
-                `stddev: ${d.stddev_value}`)
+                `stddev: ${d.stddev_value}${runsNote}`)
           .style('left', (event.pageX + 12) + 'px')
           .style('top', (event.pageY - 10) + 'px');
       })
