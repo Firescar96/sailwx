@@ -272,7 +272,15 @@ def api_accuracy(params):
 
 def api_accuracy_variables(params):
     """Which (location, variable) combos actually have accuracy rows, so
-    the frontend only offers selectable options that have real data."""
+    the frontend only offers selectable options that have real data.
+
+    NOTE: this ONLY covers variables that some forecast model actually
+    predicts (accuracy = forecast-vs-observed comparison, so a variable
+    with zero forecast coverage can never appear here even if it has
+    real OBSERVED data). See api_variables_for_location below for the
+    complement -- ALL variables with any observed data at a location,
+    regardless of whether any model forecasts them.
+    """
     con = db()
     try:
         cur = con.execute(
@@ -511,23 +519,31 @@ def api_observations(params):
 
 
 def api_variables_for_location(params):
-    """Which observation variables exist for a given location (used to
-    grey out / hide selector options that have no data)."""
-    location = params.get("location")
-    if not location:
-        return {"error": "location query param is required"}
+    """Which observation variables exist, across ALL locations (used to
+    grey out / hide selector options that have no data, and -- as of
+    2026-09-25 -- to surface variables no forecast model predicts at
+    all, like MIT's solar radiation/humidity/dew point, which would
+    otherwise never appear via api_accuracy_variables since that
+    endpoint only covers variables SOME model forecasts).
+
+    Returns ALL (location_id, variable) pairs (same shape as
+    api_accuracy_variables) rather than a single location's flat list --
+    this endpoint was previously unused by the frontend (confirmed via
+    search 2026-09-25) and had a location-scoped signature that would
+    have required one fetch per location to build a full picture; since
+    nothing depended on the old per-location shape, broadened it here
+    rather than adding a near-duplicate endpoint.
+    """
     con = db()
     try:
         cur = con.execute(
             """
-            SELECT DISTINCT variable
+            SELECT DISTINCT location_id, variable
             FROM observations
-            WHERE location_id = ?
-            ORDER BY variable
-            """,
-            [location],
+            ORDER BY location_id, variable
+            """
         )
-        return [r[0] for r in cur.fetchall()]
+        return rows_as_dicts(cur)
     finally:
         con.close()
 

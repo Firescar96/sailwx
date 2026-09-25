@@ -73,13 +73,39 @@ NATIVE_RESOLUTION_MINUTES = (SPAN_HOURS * 60) / (PLOT_X_MAX - PLOT_X_MIN)  # ~2.
 CLIP_ROW_TOLERANCE = 1
 EDGE_TRIM_COLUMNS = 4  # ~9 minutes at ~2.27 min/column, each side (wind graph only)
 
-# graph filename -> (variable name, is_line_graph). is_line_graph=False
-# means "scattered dot markers on a fixed 0-360 axis" (wind direction).
+# graph filename -> (variable name, is_line_graph, target_color).
+# is_line_graph=False means "scattered dot markers on a fixed 0-360 axis"
+# (wind direction). target_color picks out ONE line from graphs that
+# plot multiple lines together (e.g. dayinouttempdew.png has 4 lines --
+# outside temp/dew point/inside temp/water temp -- we only want dew
+# point from it, since outside/water temp are already captured from
+# their own dedicated -hilo graphs).
+#
+# ADDED 2026-09-25 (user: "add to the mit scraper, you need to scrape
+# all of the charts in the daily scraper including radiation... this
+# page lists all the charts available", referring to
+# https://sailing.mit.edu/weather/history.html). Checked every chart on
+# that page: dayradiation.png (solar radiation, genuinely new data),
+# dayinouthum.png (outside/inside humidity, genuinely new), and the dew
+# point line within dayinouttempdew.png (genuinely new -- outside/water
+# temp from that same image were already covered by the dedicated -hilo
+# graphs, so only dew point needed pulling from it) are the 3 real new
+# data sources added. Explicitly SKIPPED per this same investigation:
+# daywindvec.png (wind vectors) and daytempchill.png (wind chill/heat
+# index) are just visual RECOMBINATIONS of data already captured
+# elsewhere (wind speed+direction; temp+humidity/wind), not new
+# information; dayrain.png and daylightning.png use a bar-chart style
+# (discrete per-hour bars, not a continuous traced line) that this
+# module's line/scatter extraction can't handle as-is -- left for a
+# future dedicated bar-chart extractor if ever needed.
 OTHER_GRAPHS = {
-    "daybarometer.png": ("pressure_hpa", True),
-    "dayouttemphilo.png": ("air_temp_f", True),
-    "daywatertemphilo.png": ("water_temp_f", True),
-    "daywinddir.png": ("wind_dir_deg", False),
+    "daybarometer.png": ("pressure_hpa", True, DARK_GREEN),
+    "dayouttemphilo.png": ("air_temp_f", True, DARK_GREEN),
+    "daywatertemphilo.png": ("water_temp_f", True, DARK_GREEN),
+    "daywinddir.png": ("wind_dir_deg", False, DARK_GREEN),
+    "dayradiation.png": ("solar_radiation_wm2", True, DARK_GREEN),
+    "dayinouthum.png": ("humidity_pct", True, DARK_GREEN),  # outside humidity specifically (dark green); inside humidity (light green) not captured
+    "dayinouttempdew.png": ("dew_point_f", True, LIGHT_GREEN),  # dew point is the LIGHT_GREEN line on this 4-line graph
 }
 
 ctx = ssl.create_default_context()
@@ -372,14 +398,21 @@ def process_wind_graph(con, existing_wind_timestamps):
 # ingest_mit_graphs.py, unchanged logic)
 # ---------------------------------------------------------------------------
 
-def extract_line_series(img, top_value, bottom_value):
+def extract_line_series(img, top_value, bottom_value, target_color=DARK_GREEN):
+    """Extracts a single line series matching `target_color`. Some MIT
+    graphs plot MULTIPLE lines together (e.g. dayinouttempdew.png shows
+    outside temp / dew point / inside temp / water temp as 4 different
+    colors on one chart) -- target_color lets a caller pick out just the
+    one line it actually wants from a multi-line graph, ignoring the
+    others entirely, the same way daywind.png already distinguishes
+    DARK_GREEN (sustained) from LIGHT_GREEN (gust)."""
     px = img.load()
     width = PLOT_X_MAX - PLOT_X_MIN
     series = [None] * width
     for col in range(width):
         x = PLOT_X_MIN + col
         for y in range(PLOT_Y_TOP, PLOT_Y_BOTTOM + 1):
-            if color_match(px[x, y][:3], DARK_GREEN):
+            if color_match(px[x, y][:3], target_color):
                 series[col] = round(y_to_value(y, top_value, bottom_value), 1)
                 break
     return series
@@ -411,14 +444,14 @@ def resample_other_to_native(timestamps, series):
     return {k: round(sum(vs) / len(vs), 2) for k, vs in buckets.items()}
 
 
-def process_other_graph(filename, variable, is_line_graph):
+def process_other_graph(filename, variable, is_line_graph, target_color=DARK_GREEN):
     data = fetch_bytes(f"{BASE}{filename}")
     img = Image.open(BytesIO(data))
     width = PLOT_X_MAX - PLOT_X_MIN
 
     if is_line_graph:
         top_value, bottom_value = read_axis_scale(img)
-        series = extract_line_series(img, top_value, bottom_value)
+        series = extract_line_series(img, top_value, bottom_value, target_color)
     else:
         series = extract_scatter_series(img)
 
@@ -481,9 +514,9 @@ def main():
         except Exception as e:
             errors.append(f"daywind.png: {e}")
 
-        for filename, (variable, is_line_graph) in OTHER_GRAPHS.items():
+        for filename, (variable, is_line_graph, target_color) in OTHER_GRAPHS.items():
             try:
-                rows = process_other_graph(filename, variable, is_line_graph)
+                rows = process_other_graph(filename, variable, is_line_graph, target_color)
                 new_count = write_other_rows_to_db(con, filename, variable, rows)
                 total_new += new_count
                 print(f"{filename} -> {variable}: {len(rows)} readings in 24h window, {new_count} new rows inserted")

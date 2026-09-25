@@ -24,6 +24,13 @@ const VARIABLE_LABELS = {
   air_temp_f: 'Air Temp (°F)',
   water_temp_f: 'Water Temp (°F)',
   water_level_ft_mllw: 'Water Level (ft MLLW)',
+  // ADDED 2026-09-25 (user: "add to the mit scraper, you need to scrape
+  // all of the charts... including radiation") -- 3 new MIT-only
+  // variables, see ingest_mit_all.py's OTHER_GRAPHS comment for the
+  // full rationale on which charts were added vs skipped.
+  solar_radiation_wm2: 'Solar Radiation (W/m²)',
+  humidity_pct: 'Humidity (%)',
+  dew_point_f: 'Dew Point (°F)',
 };
 
 // 'other' (negative lead-time / hindcast backfill rows -- past_days/
@@ -69,6 +76,7 @@ const state = {
   location: null,
   variable: 'wind_speed_kt',
   accuracyVarsByLocation: {}, // location_id -> Set(variable)
+  observedVarsByLocation: {}, // location_id -> Set(variable), ANY observed data regardless of forecast coverage (see allVariablesUnion)
   hours: 336, // matches the <select> default in index.html (Next 14 days) -- 14d is roughly GFS/ECMWF's own forecast horizon (the longest of the 6 models)
   pastHours: 168, // matches the <select> default in index.html (Last 7 days)
   hiddenModels: new Set(), // model keys (or 'observed') toggled off via legend click, Forecast Time Series chart
@@ -183,9 +191,10 @@ async function fetchJSON(url) {
 // ---------------------------------------------------------------------------
 
 async function init() {
-  const [locations, accuracyVars] = await Promise.all([
+  const [locations, accuracyVars, observedVars] = await Promise.all([
     fetchJSON('/api/locations'),
     fetchJSON('/api/accuracy-variables'),
+    fetchJSON('/api/variables-for-location'),
   ]);
 
   state.locations = locations;
@@ -194,6 +203,21 @@ async function init() {
       state.accuracyVarsByLocation[row.location_id] = new Set();
     }
     state.accuracyVarsByLocation[row.location_id].add(row.variable);
+  });
+  // ADDED 2026-09-25 (user: "add to the mit scraper, you need to scrape
+  // all of the charts... including radiation") -- solar radiation,
+  // humidity, and dew point are genuinely never forecast by any model,
+  // so they'd never appear via accuracyVars alone (that only covers
+  // variables SOME model predicts, since "accuracy" = forecast-vs-
+  // observed). observedVarsByLocation is the complement: ANY variable
+  // with real observed data, regardless of forecast coverage. Unioned
+  // together in allVariablesUnion() below so both kinds of variables
+  // are selectable.
+  observedVars.forEach(row => {
+    if (!state.observedVarsByLocation[row.location_id]) {
+      state.observedVarsByLocation[row.location_id] = new Set();
+    }
+    state.observedVarsByLocation[row.location_id].add(row.variable);
   });
 
   const locSelect = d3.select('#location-select');
@@ -377,6 +401,12 @@ function updatePredictionPanelVisibility() {
 function allVariablesUnion() {
   const s = new Set();
   Object.values(state.accuracyVarsByLocation).forEach(set => set.forEach(v => s.add(v)));
+  // ADDED 2026-09-25 -- see the comment in init() where
+  // observedVarsByLocation is populated. Without this, a variable with
+  // real observed data but zero forecast coverage (solar radiation,
+  // humidity, dew point -- none of which any model predicts) would be
+  // scraped/stored correctly but never selectable anywhere in the UI.
+  Object.values(state.observedVarsByLocation).forEach(set => set.forEach(v => s.add(v)));
   // Always ensure the two required variables are present as options even
   // if a given location has no accuracy rows yet for them.
   s.add('wind_speed_kt');
