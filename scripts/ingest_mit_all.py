@@ -65,6 +65,9 @@ CSV_PATH = os.path.join(DATA_DIR, "wind_native_res.csv")  # unchanged path/forma
 DARK_GREEN = (48, 160, 48)     # Wind Speed (sustained); also the single line
                                 # color used by barometer/temp/water-temp/wind-dir
 LIGHT_GREEN = (128, 208, 144)  # Gust Speed only
+BAR_FILL_GREEN = (144, 208, 144)  # rain/lightning bar-chart fill color (confirmed
+                                    # via monthrain.png/monthlightning.png, both
+                                    # a real solid fill distinct from LIGHT_GREEN)
 COLOR_TOLERANCE = 18
 
 SPAN_HOURS = 24
@@ -73,39 +76,50 @@ NATIVE_RESOLUTION_MINUTES = (SPAN_HOURS * 60) / (PLOT_X_MAX - PLOT_X_MIN)  # ~2.
 CLIP_ROW_TOLERANCE = 1
 EDGE_TRIM_COLUMNS = 4  # ~9 minutes at ~2.27 min/column, each side (wind graph only)
 
-# graph filename -> (variable name, is_line_graph, target_color).
-# is_line_graph=False means "scattered dot markers on a fixed 0-360 axis"
-# (wind direction). target_color picks out ONE line from graphs that
-# plot multiple lines together (e.g. dayinouttempdew.png has 4 lines --
-# outside temp/dew point/inside temp/water temp -- we only want dew
-# point from it, since outside/water temp are already captured from
-# their own dedicated -hilo graphs).
+# graph filename -> (variable name, kind, target_color).
+# kind is one of "line" (single traced line), "scatter" (dot markers on
+# a fixed 0-360 axis -- wind direction only), or "bar" (rain/lightning's
+# filled-bar-per-hour style, see extract_bar_series). target_color picks
+# out ONE line from graphs that plot multiple lines together (e.g.
+# dayinouttempdew.png has 4 lines -- outside temp/dew point/inside
+# temp/water temp -- we only want dew point from it, since outside/water
+# temp are already captured from their own dedicated -hilo graphs).
 #
 # ADDED 2026-09-25 (user: "add to the mit scraper, you need to scrape
 # all of the charts in the daily scraper including radiation... this
 # page lists all the charts available", referring to
 # https://sailing.mit.edu/weather/history.html). Checked every chart on
-# that page: dayradiation.png (solar radiation, genuinely new data),
-# dayinouthum.png (outside/inside humidity, genuinely new), and the dew
-# point line within dayinouttempdew.png (genuinely new -- outside/water
-# temp from that same image were already covered by the dedicated -hilo
-# graphs, so only dew point needed pulling from it) are the 3 real new
-# data sources added. Explicitly SKIPPED per this same investigation:
-# daywindvec.png (wind vectors) and daytempchill.png (wind chill/heat
-# index) are just visual RECOMBINATIONS of data already captured
-# elsewhere (wind speed+direction; temp+humidity/wind), not new
-# information; dayrain.png and daylightning.png use a bar-chart style
-# (discrete per-hour bars, not a continuous traced line) that this
-# module's line/scatter extraction can't handle as-is -- left for a
-# future dedicated bar-chart extractor if ever needed.
+# that page: dayradiation.png (solar radiation), dayinouthum.png
+# (outside humidity), and the dew point line within
+# dayinouttempdew.png are genuinely new data (outside/water temp from
+# that same image were already covered by the dedicated -hilo graphs).
+#
+# EXTENDED same day (user: "i want all the charts though, including
+# wind direction, temperature, rain, lightning, and water temp" -- wind
+# direction/temperature/water temp were already covered by this point
+# via daywinddir.png/dayouttemphilo.png/daywatertemphilo.png; rain and
+# lightning were the two genuinely missing ones, previously skipped
+# because they use a bar-chart style this module's line/scatter
+# extraction couldn't handle -- added extract_bar_series() to cover
+# them, confirmed the bar's fill+outline colors via a real historical
+# month-view rain/lightning chart (BAR_FILL_GREEN fill, DARK_GREEN
+# outline) since the live "today" graph happened to have zero rain to
+# test against directly.
+#
+# Explicitly SKIPPED, still: daywindvec.png (wind vectors) and
+# daytempchill.png (wind chill/heat index) are just visual
+# RECOMBINATIONS of data already captured elsewhere (wind speed+
+# direction; temp+humidity/wind), not new information.
 OTHER_GRAPHS = {
-    "daybarometer.png": ("pressure_hpa", True, DARK_GREEN),
-    "dayouttemphilo.png": ("air_temp_f", True, DARK_GREEN),
-    "daywatertemphilo.png": ("water_temp_f", True, DARK_GREEN),
-    "daywinddir.png": ("wind_dir_deg", False, DARK_GREEN),
-    "dayradiation.png": ("solar_radiation_wm2", True, DARK_GREEN),
-    "dayinouthum.png": ("humidity_pct", True, DARK_GREEN),  # outside humidity specifically (dark green); inside humidity (light green) not captured
-    "dayinouttempdew.png": ("dew_point_f", True, LIGHT_GREEN),  # dew point is the LIGHT_GREEN line on this 4-line graph
+    "daybarometer.png": ("pressure_hpa", "line", DARK_GREEN),
+    "dayouttemphilo.png": ("air_temp_f", "line", DARK_GREEN),
+    "daywatertemphilo.png": ("water_temp_f", "line", DARK_GREEN),
+    "daywinddir.png": ("wind_dir_deg", "scatter", DARK_GREEN),
+    "dayradiation.png": ("solar_radiation_wm2", "line", DARK_GREEN),
+    "dayinouthum.png": ("humidity_pct", "line", DARK_GREEN),  # outside humidity specifically (dark green); inside humidity (light green) not captured
+    "dayinouttempdew.png": ("dew_point_f", "line", LIGHT_GREEN),  # dew point is the LIGHT_GREEN line on this 4-line graph
+    "dayrain.png": ("rain_in", "bar", None),  # hourly total, inches -- target_color unused for "bar" kind (matches both DARK_GREEN outline and BAR_FILL_GREEN fill)
+    "daylightning.png": ("lightning_strikes", "bar", None),  # hourly strike count
 }
 
 ctx = ssl.create_default_context()
@@ -418,6 +432,37 @@ def extract_line_series(img, top_value, bottom_value, target_color=DARK_GREEN):
     return series
 
 
+def extract_bar_series(img, top_value, bottom_value):
+    """Extracts a bar-chart series (rain/lightning graphs) -- ADDED
+    2026-09-25 (user: "i want all the charts though, including...
+    rain, lightning"). These graphs draw each hour's value as a solid
+    FILLED bar (BAR_FILL_GREEN) with a DARK_GREEN outline, spanning
+    from the baseline (0) up to the value -- fundamentally different
+    from the other graphs' single traced LINE (one pixel-row match per
+    column). Extracting the bar's height still reduces to the same
+    "find the topmost matching pixel row in this column" logic as
+    extract_line_series, since the bar's outline/fill both start at the
+    top of the bar and the column is solid green all the way down to
+    the axis from there -- topmost-match correctly gives the bar's
+    height either way. A column with NO green at all (confirmed via a
+    real zero-rain day) correctly returns None here as "no bar this
+    hour" (equivalent to 0, but kept as None like every other graph's
+    "no data this column" so it doesn't silently invent a fake reading
+    for e.g. an edge column with no data yet).
+    """
+    px = img.load()
+    width = PLOT_X_MAX - PLOT_X_MIN
+    series = [None] * width
+    for col in range(width):
+        x = PLOT_X_MIN + col
+        for y in range(PLOT_Y_TOP, PLOT_Y_BOTTOM + 1):
+            px_color = px[x, y][:3]
+            if color_match(px_color, DARK_GREEN) or color_match(px_color, BAR_FILL_GREEN):
+                series[col] = round(y_to_value(y, top_value, bottom_value), 2)
+                break
+    return series
+
+
 def extract_scatter_series(img):
     px = img.load()
     width = PLOT_X_MAX - PLOT_X_MIN
@@ -444,16 +489,21 @@ def resample_other_to_native(timestamps, series):
     return {k: round(sum(vs) / len(vs), 2) for k, vs in buckets.items()}
 
 
-def process_other_graph(filename, variable, is_line_graph, target_color=DARK_GREEN):
+def process_other_graph(filename, variable, kind, target_color=DARK_GREEN):
     data = fetch_bytes(f"{BASE}{filename}")
     img = Image.open(BytesIO(data))
     width = PLOT_X_MAX - PLOT_X_MIN
 
-    if is_line_graph:
+    if kind == "line":
         top_value, bottom_value = read_axis_scale(img)
         series = extract_line_series(img, top_value, bottom_value, target_color)
-    else:
+    elif kind == "bar":
+        top_value, bottom_value = read_axis_scale(img)
+        series = extract_bar_series(img, top_value, bottom_value)
+    elif kind == "scatter":
         series = extract_scatter_series(img)
+    else:
+        raise ValueError(f"unknown graph kind: {kind!r}")
 
     now_utc = datetime.now(timezone.utc)
     timestamps = columns_to_timestamps(width, now_utc, SPAN_HOURS)
@@ -514,9 +564,9 @@ def main():
         except Exception as e:
             errors.append(f"daywind.png: {e}")
 
-        for filename, (variable, is_line_graph, target_color) in OTHER_GRAPHS.items():
+        for filename, (variable, kind, target_color) in OTHER_GRAPHS.items():
             try:
-                rows = process_other_graph(filename, variable, is_line_graph, target_color)
+                rows = process_other_graph(filename, variable, kind, target_color)
                 new_count = write_other_rows_to_db(con, filename, variable, rows)
                 total_new += new_count
                 print(f"{filename} -> {variable}: {len(rows)} readings in 24h window, {new_count} new rows inserted")

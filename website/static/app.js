@@ -31,6 +31,8 @@ const VARIABLE_LABELS = {
   solar_radiation_wm2: 'Solar Radiation (W/m²)',
   humidity_pct: 'Humidity (%)',
   dew_point_f: 'Dew Point (°F)',
+  rain_in: 'Rain (in/hr)',
+  lightning_strikes: 'Lightning Strikes',
 };
 
 // 'other' (negative lead-time / hindcast backfill rows -- past_days/
