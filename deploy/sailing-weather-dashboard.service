@@ -1,0 +1,21 @@
+[Unit]
+Description=Sailing Weather Dashboard (D3 web UI, read-only DuckDB backend)
+After=network.target
+
+[Service]
+Type=simple
+# PYTHONUNBUFFERED added 2026-09-27 (found while diagnosing a live 500
+# error) -- systemd captures stdout/stderr into the journal, but Python
+# fully-buffers stdout when it's not a TTY (as under systemd), so
+# print()'d log lines (including the new error-logging added to the
+# app's 500 handler that same day) could sit unflushed in the buffer
+# indefinitely instead of appearing in `journalctl` promptly, making
+# real production issues hard to diagnose after the fact.
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/firescar96/.pyenv/versions/3.11.1/bin/python3 /home/firescar96/.hermes/projects/sailing-weather/website/app.py
+Restart=always
+RestartSec=5
+WorkingDirectory=/home/firescar96/.hermes/projects/sailing-weather/website
+
+[Install]
+WantedBy=default.target

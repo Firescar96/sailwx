@@ -11,9 +11,13 @@ Run with:
 
 Listens on http://localhost:8420 by default (override with PORT env var).
 
-IMPORTANT: every DB connection is opened with read_only=True. This process
-never writes to the database, so it never conflicts with the ingestion
-cron jobs that also touch weather.duckdb on their own schedule.
+IMPORTANT: every DB connection is opened with read_only=True -- this
+process never WRITES to the database. That does NOT mean it can never
+conflict with the ingestion cron jobs though (see db()'s docstring
+below for the real story, found 2026-09-27 after a live 500 error) --
+DuckDB genuinely blocks concurrent readers while a writer holds the
+lock, so db() retries on lock contention rather than assuming none is
+possible.
 """
 import json
 import os
@@ -32,11 +36,12 @@ PORT = int(os.environ.get("PORT", "8420"))
 sys.path.insert(0, os.path.join(HERE, "..", "scripts"))
 from cbi_hours import is_cbi_open
 
+sys.path.insert(0, os.path.join(HERE, "..", "db"))
+from common import get_connection as _get_connection_with_retry  # noqa: E402
+
 
 def db():
-    """Open a fresh read-only connection. Cheap for this data volume and
-    avoids any question of duckdb connection thread-safety across
-    concurrent requests.
+    """Open a fresh read-only connection, WITH RETRY on lock contention.
 
     MUST set session TimeZone to UTC (found 2026-09-11): DuckDB's default
     session TimeZone is the OS local zone (America/New_York here), and
@@ -51,8 +56,34 @@ def db():
     so they don't extend before the graph start") -- the past_hours
     window was silently ~4h wider than asked. The ingestion side
     (db/common.py get_connection()) already does this for the same
-    reason; this was the one connection path that didn't."""
-    con = duckdb.connect(DB_PATH, read_only=True)
+    reason; this was the one connection path that didn't.
+
+    ADDED RETRY LOGIC 2026-09-27 (user: "i get a 500 error" on the live
+    public URL). Root cause: the docstring here previously claimed
+    "every DB connection is opened with read_only=True... this process
+    never writes to the database, so it never conflicts with the
+    ingestion cron jobs" -- true that THIS process never writes, but
+    FALSE that read-only connections can't conflict with a concurrent
+    WRITER. DuckDB is genuinely single-writer/no-concurrent-reader-
+    during-a-write (unlike e.g. SQLite's WAL mode) -- a read-only
+    connect() attempt made WHILE the Forecast Ingester cron job (5
+    locations x 6 models, tens of thousands of rows, several real
+    seconds of wall-clock write time every 4 hours) holds the write lock
+    gets an immediate duckdb.IOException, not a blocking wait. Confirmed
+    live via journalctl: a real burst of 500s on /api/locations,
+    /api/accuracy-variables, /api/variables-for-location lined up
+    exactly with cron job 7d8d1900e5c9 (Forecast Ingester) running at
+    the same minute, and the app had ZERO retry logic -- a single failed
+    connect() attempt went straight to a bare 500 with no retry, unlike
+    every ingestion script which already uses db/common.py's
+    get_connection() (parses the lock error's PID, distinguishes a live
+    writer -- back off and retry -- from a genuinely stale/dead lock).
+    Fix: reuse that exact same retry helper here instead of a bare
+    duckdb.connect() call, so a request that happens to land mid-write
+    now waits out the (typically sub-second to low-single-digit-second)
+    write window and succeeds, instead of failing outright.
+    """
+    con = _get_connection_with_retry(read_only=True, retries=6, retry_delay_s=0.5)
     con.execute("SET TimeZone='UTC'")
     return con
 
@@ -1361,6 +1392,13 @@ class Handler(BaseHTTPRequestHandler):
                 result = ROUTES[parsed.path](params)
                 self._send_json(result)
             except Exception as e:  # surface errors as JSON, not a stack trace to client
+                # ADDED 2026-09-27 (user: "i get a 500 error") -- previously
+                # a 500 left NO trace in the systemd journal at all (only
+                # the bare "GET ... 500" access-log line, no exception
+                # detail), making a real production 500 impossible to
+                # diagnose after the fact. print() goes to stdout, which
+                # systemd/journalctl already captures for this service.
+                print(f"[500] {parsed.path}?{parsed.query}: {type(e).__name__}: {e}", file=sys.stderr)
                 self._send_json({"error": str(e)}, 500)
             return
 
