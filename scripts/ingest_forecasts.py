@@ -143,8 +143,11 @@ def get_forecast(lat, lon, models_slug, extra_params):
 
 
 def ingest_model_location(con, model_key, models_slug, init_time, extra_params,
-                           location_id, lat, lon, retrieved_at):
-    data = get_forecast(lat, lon, models_slug, extra_params)
+                           location_id, lat, lon, retrieved_at, forecast_data=None):
+    """forecast_data may be pre-fetched (see main()'s fetch/write split) --
+    if None, fetches it here directly (kept for any other caller/backward
+    compat, though main() no longer calls it that way)."""
+    data = forecast_data if forecast_data is not None else get_forecast(lat, lon, models_slug, extra_params)
 
     hourly = data.get("hourly", {})
     times = hourly.get("time", [])
@@ -195,21 +198,55 @@ def ingest_model_location(con, model_key, models_slug, init_time, extra_params,
 
 def main():
     retrieved_at = datetime.now(timezone.utc)
-    con = get_connection()
     total = 0
     errors = []
+
+    # FETCH-THEN-WRITE split -- CHANGED 2026-09-27 (user: "i need more
+    # concurrency and less db locks"). Previously a single write
+    # connection was held open for this ENTIRE function, including all
+    # ~36 sequential HTTP calls (6 models x 1 metadata call + 5
+    # locations each) -- each a real network round-trip, easily several
+    # real seconds combined -- even though the actual DB work (a run-
+    # dedup lookup + one bulk insert per model/location) is fast. Fixed
+    # by fetching EVERYTHING first with no DB connection open at all,
+    # then opening ONE write connection only for the fast dedup-check +
+    # insert phase at the end.
+    init_times = {}  # model_key -> (init_time or None, error or None)
+    for model_key, (models_slug, meta_id, extra_params) in MODELS.items():
+        try:
+            init_times[model_key] = (get_init_time(meta_id), None)
+        except Exception as e:
+            init_times[model_key] = (None, e)
+            errors.append(f"{model_key} (metadata): {e}")
+
+    forecasts = {}  # (model_key, location_id) -> (data or None, error or None)
+    for model_key, (models_slug, meta_id, extra_params) in MODELS.items():
+        init_time, meta_err = init_times[model_key]
+        if meta_err is not None:
+            continue  # already recorded above; nothing to fetch for this model
+        for location_id, (lat, lon) in LOCATIONS.items():
+            try:
+                forecasts[(model_key, location_id)] = (get_forecast(lat, lon, models_slug, extra_params), None)
+            except Exception as e:
+                forecasts[(model_key, location_id)] = (None, e)
+
+    # Write phase: ONE connection, held only for the fast dedup-check +
+    # bulk-insert work -- no network calls happen anywhere in this block.
+    con = get_connection()
     try:
         for model_key, (models_slug, meta_id, extra_params) in MODELS.items():
-            try:
-                init_time = get_init_time(meta_id)
-            except Exception as e:
-                errors.append(f"{model_key} (metadata): {e}")
-                continue
+            init_time, meta_err = init_times[model_key]
+            if meta_err is not None:
+                continue  # already recorded in errors above
             for location_id, (lat, lon) in LOCATIONS.items():
+                data, fetch_err = forecasts[(model_key, location_id)]
+                if fetch_err is not None:
+                    errors.append(f"{model_key}/{location_id}: {fetch_err}")
+                    continue
                 try:
                     total += ingest_model_location(
                         con, model_key, models_slug, init_time, extra_params,
-                        location_id, lat, lon, retrieved_at,
+                        location_id, lat, lon, retrieved_at, forecast_data=data,
                     )
                 except Exception as e:
                     errors.append(f"{model_key}/{location_id}: {e}")

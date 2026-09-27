@@ -341,34 +341,65 @@ def append_wind_csv_rows(rows):
 
 def write_wind_rows_to_db(con, rows):
     """Upsert (not insert-if-new) -- a fresh re-read is always at least as
-    reliable as an older one, never less (see extract_wind.py history)."""
+    reliable as an older one, never less (see extract_wind.py history).
+
+    REWRITTEN 2026-09-27 (user: "i need more concurrency and less db
+    locks") -- previously did one con.execute() per row PER VARIABLE (up
+    to ~1,236 individual round-trips for a typical ~618-row run),
+    measured taking ~7.3 SECONDS on its own -- by far the single largest
+    contributor to how long this script holds the DB write lock, dwarfing
+    every other write in this script combined (each of those takes
+    ~20-30ms via bulk_insert). Rewritten to the same
+    stage-into-a-temp-table-then-single-set-based-statement pattern
+    already used by write_other_rows_to_db, but preserving genuine
+    UPSERT semantics (a fresh re-read of the same timestamp should always
+    win, even if a value already exists there) via one MERGE-style
+    DELETE-matching-rows-then-INSERT-all pair instead of a per-row
+    'ON CONFLICT DO UPDATE', which doesn't have a clean bulk/set-based
+    equivalent in DuckDB for this shape. Net effect: this function's own
+    share of the held write-lock time drops from ~7.3s to well under a
+    second for a typical run.
+    """
+    staged = []
     for ts, s, s_clip, g, g_clip in rows:
         if s is not None:
             quality = "clipped_high" if s_clip else None
-            con.execute(
-                """
-                INSERT INTO observations (location_id, ts_utc, variable, value, source, quality)
-                VALUES (?, ?, 'wind_speed_kt', ?, 'mit_pixel_scrape', ?)
-                ON CONFLICT (location_id, ts_utc, variable) DO UPDATE SET
-                    value = excluded.value, quality = excluded.quality, source = excluded.source
-                """,
-                [LOCATION_ID, ts, round(s * MPH_TO_KT, 1), quality],
-            )
+            staged.append((LOCATION_ID, ts, "wind_speed_kt", round(s * MPH_TO_KT, 1), "mit_pixel_scrape", quality))
         if g is not None:
             quality = "clipped_high" if g_clip else None
-            con.execute(
-                """
-                INSERT INTO observations (location_id, ts_utc, variable, value, source, quality)
-                VALUES (?, ?, 'wind_gust_kt', ?, 'mit_pixel_scrape', ?)
-                ON CONFLICT (location_id, ts_utc, variable) DO UPDATE SET
-                    value = excluded.value, quality = excluded.quality, source = excluded.source
-                """,
-                [LOCATION_ID, ts, round(g * MPH_TO_KT, 1), quality],
-            )
+            staged.append((LOCATION_ID, ts, "wind_gust_kt", round(g * MPH_TO_KT, 1), "mit_pixel_scrape", quality))
+    if not staged:
+        return
+
+    con.execute(
+        "CREATE OR REPLACE TEMP TABLE stage_wind "
+        "(location_id TEXT, ts_utc TIMESTAMP, variable TEXT, value DOUBLE, source TEXT, quality TEXT)"
+    )
+    bulk_insert(con, "stage_wind", ["location_id", "ts_utc", "variable", "value", "source", "quality"], staged)
+    # Delete any existing rows this batch will replace, then insert the
+    # whole batch fresh -- equivalent to the old per-row ON CONFLICT DO
+    # UPDATE (a fresh re-read always wins), but as 2 set-based statements
+    # instead of up to ~1,236 individual round-trips.
+    con.execute(
+        """
+        DELETE FROM observations o
+        USING stage_wind s
+        WHERE o.location_id = s.location_id AND o.ts_utc = s.ts_utc AND o.variable = s.variable
+        """
+    )
+    con.execute(
+        """
+        INSERT INTO observations (location_id, ts_utc, variable, value, source, quality)
+        SELECT location_id, ts_utc, variable, value, source, quality FROM stage_wind
+        """
+    )
+    con.execute("DROP TABLE stage_wind")
 
 
-def process_wind_graph(con, existing_wind_timestamps):
-    """Returns (new_row_count, clipped_count)."""
+def process_wind_graph(existing_wind_timestamps):
+    """Returns (db_rows, clipped_count) -- fetch/OCR/compute ONLY, no DB
+    connection involved at all (see main() for why).
+    """
     data = fetch_bytes(f"{BASE}daywind.png")
     img = Image.open(BytesIO(data))
     width = PLOT_X_MAX - PLOT_X_MIN
@@ -402,9 +433,7 @@ def process_wind_graph(con, existing_wind_timestamps):
 
     if csv_new_rows:
         append_wind_csv_rows(csv_new_rows)
-    if db_rows:
-        write_wind_rows_to_db(con, db_rows)
-    return len(db_rows), clipped_count
+    return db_rows, clipped_count
 
 
 # ---------------------------------------------------------------------------
@@ -550,28 +579,60 @@ def main():
     errors = []
     total_new = 0
 
-    # ONE connection for the whole run (this is the actual point of the
-    # merge -- was 2 separate get_connection() calls/lock acquisitions
-    # across 2 separate cron jobs before).
+    # FETCH-THEN-WRITE split -- CHANGED 2026-09-27 (user: "i need more
+    # concurrency and less db locks"). Previously a single write
+    # connection was held open for this entire function, including all
+    # 10 sequential HTTP fetches + OCR processing (each graph is a real
+    # network round-trip plus tesserocr axis-label reading, seconds of
+    # wall-clock time each, ~10+ seconds total for a full run) -- the
+    # write LOCK was held that whole time even though the actual writes
+    # at the end take a small fraction of that. Every dashboard read
+    # landing during that multi-second fetch phase would hit real lock
+    # contention (confirmed live 2026-09-26: a burst of 500s on the
+    # public dashboard exactly overlapping a similarly-shaped ingester
+    # run). Fixed by doing ALL fetching/OCR/computation FIRST with no DB
+    # connection open at all, then opening ONE write connection only at
+    # the very end for the brief insert phase -- the write lock is now
+    # held for a small fraction of the total run time instead of nearly
+    # all of it.
+    wind_result = None
+    wind_error = None
+    try:
+        wind_result = process_wind_graph(existing_wind_timestamps)
+    except Exception as e:
+        wind_error = e
+
+    other_results = {}  # filename -> (rows, error)
+    for filename, (variable, kind, target_color) in OTHER_GRAPHS.items():
+        try:
+            rows = process_other_graph(filename, variable, kind, target_color)
+            other_results[filename] = (rows, None)
+        except Exception as e:
+            other_results[filename] = (None, e)
+
+    # Write phase: ONE connection, held only for these fast local inserts.
     con = get_connection()
     try:
-        try:
-            n, clipped = process_wind_graph(con, existing_wind_timestamps)
+        if wind_error is not None:
+            errors.append(f"daywind.png: {wind_error}")
+        elif wind_result is not None:
+            db_rows, clipped = wind_result
+            if db_rows:
+                write_wind_rows_to_db(con, db_rows)
+            n = len(db_rows)
             print(f"daywind.png -> wind_speed_kt/wind_gust_kt: {n} new rows at "
                   f"~{NATIVE_RESOLUTION_MINUTES:.2f}-min native resolution "
                   f"({clipped} with a clipped/ceiling-hit reading)")
             total_new += n
-        except Exception as e:
-            errors.append(f"daywind.png: {e}")
 
         for filename, (variable, kind, target_color) in OTHER_GRAPHS.items():
-            try:
-                rows = process_other_graph(filename, variable, kind, target_color)
-                new_count = write_other_rows_to_db(con, filename, variable, rows)
-                total_new += new_count
-                print(f"{filename} -> {variable}: {len(rows)} readings in 24h window, {new_count} new rows inserted")
-            except Exception as e:
-                errors.append(f"{filename}: {e}")
+            rows, err = other_results[filename]
+            if err is not None:
+                errors.append(f"{filename}: {err}")
+                continue
+            new_count = write_other_rows_to_db(con, filename, variable, rows)
+            total_new += new_count
+            print(f"{filename} -> {variable}: {len(rows)} readings in 24h window, {new_count} new rows inserted")
     finally:
         con.close()
 

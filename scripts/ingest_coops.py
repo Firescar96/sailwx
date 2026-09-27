@@ -68,15 +68,28 @@ def fetch_json(product):
 
 
 def main():
+    # FETCH-THEN-WRITE split -- CHANGED 2026-09-27 (user: "i need more
+    # concurrency and less db locks"), applying the same fix used for
+    # ingest_mit_all.py/ingest_forecasts.py: fetch first with no DB
+    # connection open, then hold the write connection only for the
+    # actual (fast, local) inserts. This ingester's own 2 HTTP calls are
+    # small/quick individually, but it runs 4x/hour (7,22,37,52 * * * *),
+    # so even a brief lock window recurs often.
+    fetched = {}  # product -> (data, error)
+    for product, variable in PRODUCTS.items():
+        try:
+            fetched[product] = (fetch_json(product), None)
+        except Exception as e:
+            fetched[product] = (None, e)
+
     con = get_connection()
     inserted = 0
     errors = []
     try:
         for product, variable in PRODUCTS.items():
-            try:
-                data = fetch_json(product)
-            except Exception as e:
-                errors.append(f"{product}: {e}")
+            data, err = fetched[product]
+            if err is not None:
+                errors.append(f"{product}: {err}")
                 continue
             if "error" in data:
                 errors.append(f"{product}: {data['error'].get('message')}")
