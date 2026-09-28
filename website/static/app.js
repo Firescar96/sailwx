@@ -52,6 +52,18 @@ function fmtVarLabel(v) {
   return VARIABLE_LABELS[v] || v;
 }
 
+// Per-location display name for the "Observed" series -- ADDED
+// 2026-09-27 (user: "for the mit location change grey 'Observed' to
+// 'Sailing Pavilion'"). Every OTHER location keeps the plain generic
+// "Observed" label unchanged -- this only special-cases mit_pavilion,
+// so no other location's charts/legends/tooltips are affected.
+const OBSERVED_LABEL_BY_LOCATION = {
+  mit_pavilion: 'Sailing Pavilion',
+};
+function observedLabel(locationId) {
+  return OBSERVED_LABEL_BY_LOCATION[locationId] || 'Observed';
+}
+
 // Every chart's tooltip div was previously created via a bare
 // `d3.select('body').append('div').attr('class', '...')` inside that
 // chart's own load function -- since these load functions re-run on
@@ -645,6 +657,23 @@ async function loadForecastChart() {
   // reflects "right now" when past-hours is Off.
   const obsHours = pastHours;
   const showFlagBands = state.location === 'cbi_dockhouse'; // only CBI has flag data
+  // Harvard Bridge overlay -- ADDED 2026-09-27 (user: "on MIT location
+  // AND CBI location show 'Harvard Bridge' as line with wind data").
+  // Harvard Bridge (SailFlow spot #1834) reports wind_speed_kt,
+  // wind_gust_kt, wind_dir_deg, pressure_hpa (no temp sensor). Scoped to
+  // the normal line-chart path only (wind_speed_kt/wind_gust_kt/
+  // pressure_hpa) -- wind_dir_deg uses the separate row-per-model arrow
+  // chart (renderWindDirectionChart), which would need its own row/
+  // opacity treatment to add a second observed series cleanly; left out
+  // of scope for this change rather than bolted on as an unstyled
+  // afterthought. Only shown on the two locations physically close
+  // enough for it to be a meaningful comparison (MIT Sailing Pavilion
+  // and CBI, both a short distance up the Charles from Harvard Bridge).
+  // Skipped entirely when viewing harvard_bridge itself (that's just
+  // its own "Observed" series already).
+  const HARVARD_BRIDGE_VARS = new Set(['wind_speed_kt', 'wind_gust_kt', 'pressure_hpa']);
+  const showHarvardBridge = (state.location === 'mit_pavilion' || state.location === 'cbi_dockhouse')
+    && HARVARD_BRIDGE_VARS.has(state.variable);
   // Flag history window follows ONLY "Also show past" (obsHours), not
   // the forward-looking forecast window (`hours`) at all. Previously
   // used Math.max(hours, obsHours), which meant a large forward window
@@ -654,13 +683,16 @@ async function loadForecastChart() {
   // "the flag is still showing since beginning of data, not for the
   // time period I want"). Flags have no future data anyway, so there
   // was never a reason to couple this to the forward-looking `hours`.
-  let [forecast, obs, flagHistory] = await Promise.all([
+  let [forecast, obs, flagHistory, harvardBridge] = await Promise.all([
     fetchJSON(`/api/forecast?location=${state.location}&variable=${state.variable}&hours=${hours}&past_hours=${pastHours}`),
     obsHours > 0
       ? fetchJSON(`/api/observations?location=${state.location}&variable=${state.variable}&hours=${obsHours}`)
       : Promise.resolve([]), // Off (0) means genuinely no observed overlay, not "hours=0" API edge case
     showFlagBands
       ? fetchJSON(`/api/flags-history?location=${state.location}&hours=${obsHours}`)
+      : Promise.resolve([]),
+    showHarvardBridge && obsHours > 0
+      ? fetchJSON(`/api/observations?location=harvard_bridge&variable=${state.variable}&hours=${obsHours}`)
       : Promise.resolve([]),
   ]);
 
@@ -672,6 +704,7 @@ async function loadForecastChart() {
   forecast.forEach(d => { d.valid_time_utc_date = new Date(d.valid_time_utc + 'Z'); });
   obs.forEach(d => { d.ts_utc_date = new Date(d.ts_utc + 'Z'); });
   flagHistory.forEach(d => { d.ts_utc_date = new Date(d.ts_utc + 'Z'); });
+  harvardBridge.forEach(d => { d.ts_utc_date = new Date(d.ts_utc + 'Z'); });
 
   // X-axis domain: computed EXPLICITLY from the selected forward/backward
   // windows (now +/- hours), not derived from d3.extent() of whatever
@@ -708,6 +741,7 @@ async function loadForecastChart() {
   obs = obs.filter(d => d.ts_utc_date >= minDate && d.ts_utc_date <= maxDate);
   forecast = forecast.filter(d => d.valid_time_utc_date >= minDate && d.valid_time_utc_date <= maxDate);
   flagHistory = flagHistory.filter(d => d.ts_utc_date >= minDate && d.ts_utc_date <= maxDate);
+  harvardBridge = harvardBridge.filter(d => d.ts_utc_date >= minDate && d.ts_utc_date <= maxDate);
 
   const models = Array.from(new Set(forecast.map(d => d.model))).sort();
   const byModel = d3.group(forecast, d => d.model);
@@ -956,7 +990,53 @@ async function loadForecastChart() {
       .on('mouseenter', () => setHighlight(OBS_KEY))
       .on('mousemove', (event, d) => {
         tooltip.style('opacity', 1)
-          .html(`<b>Observed</b><br>${d.ts_utc}<br>value: ${d.value}`)
+          .html(`<b>${observedLabel(state.location)}</b><br>${d.ts_utc}<br>value: ${d.value}`)
+          .style('left', (event.pageX + 12) + 'px')
+          .style('top', (event.pageY - 10) + 'px');
+      })
+      .on('mouseleave', () => { tooltip.style('opacity', 0); setHighlight(null); });
+  }
+
+  // Harvard Bridge overlay -- ADDED 2026-09-27 (user: "on MIT location
+  // AND CBI location show 'Harvard Bridge' as line with wind data").
+  // Same visual treatment as the main "Observed" overlay above (dashed
+  // line + dots, participates in hover-to-highlight/legend toggle), but
+  // a distinct color (amber) so it's never confused with the location's
+  // own Observed series when both are visible at once.
+  const HB_KEY = 'harvard_bridge';
+  const HB_COLOR = '#d9822b';
+  if (showHarvardBridge && harvardBridge.length && !state.hiddenModels.has(HB_KEY)) {
+    const hbLine = d3.line()
+      .x(d => x(d.ts_utc_date))
+      .y(d => y(d.value))
+      .defined(d => d.value != null);
+    svg.append('path')
+      .datum(HB_KEY)
+      .attr('class', 'model-line')
+      .attr('fill', 'none')
+      .attr('stroke', HB_COLOR)
+      .attr('stroke-width', 1.5)
+      .attr('stroke-dasharray', '2,2')
+      .attr('d', () => hbLine(harvardBridge))
+      .style('cursor', 'pointer')
+      .on('mouseenter', () => setHighlight(HB_KEY))
+      .on('mouseleave', () => setHighlight(null));
+
+    harvardBridge.forEach(d => { d.__model = HB_KEY; });
+    svg.append('g')
+      .selectAll('circle')
+      .data(harvardBridge.filter(d => d.value != null))
+      .join('circle')
+      .attr('class', 'model-dot')
+      .attr('cx', d => x(d.ts_utc_date))
+      .attr('cy', d => y(d.value))
+      .attr('r', 2.5)
+      .attr('fill', HB_COLOR)
+      .style('cursor', 'pointer')
+      .on('mouseenter', () => setHighlight(HB_KEY))
+      .on('mousemove', (event, d) => {
+        tooltip.style('opacity', 1)
+          .html(`<b>Harvard Bridge</b><br>${d.ts_utc}<br>value: ${d.value}`)
           .style('left', (event.pageX + 12) + 'px')
           .style('top', (event.pageY - 10) + 'px');
       })
@@ -995,7 +1075,17 @@ async function loadForecastChart() {
       .on('mouseleave', () => setHighlight(null))
       .on('click', () => toggleModel(OBS_KEY));
     item.append('span').attr('class', 'legend-swatch').style('background', '#9aa5ab');
-    item.append('span').text('Observed');
+    item.append('span').text(observedLabel(state.location));
+  }
+  if (showHarvardBridge && harvardBridge.length) {
+    const item = legend.append('div').attr('class', 'legend-item')
+      .classed('legend-disabled', state.hiddenModels.has(HB_KEY))
+      .style('cursor', 'pointer')
+      .on('mouseenter', () => setHighlight(HB_KEY))
+      .on('mouseleave', () => setHighlight(null))
+      .on('click', () => toggleModel(HB_KEY));
+    item.append('span').attr('class', 'legend-swatch').style('background', HB_COLOR);
+    item.append('span').text('Harvard Bridge');
   }
 
   if (flagHistory.length) {
@@ -1313,12 +1403,12 @@ function renderWindDirectionChart(container, tooltip, models, byModel, obs, flag
       .on('mouseenter', () => setRowHighlight(key))
       .on('mousemove', (event, d) => {
         const towardDeg = Math.round((d.value + 180) % 360);
-        const refLabel = d.col.referenceIsObserved ? 'observed' : 'cross-model average';
+        const refLabel = d.col.referenceIsObserved ? observedLabel(state.location).toLowerCase() : 'cross-model average';
         const diffFromRef = (key !== AVG_KEY && key !== OBS_KEY && d.col.referenceDeg != null)
           ? `<br>${Math.round(circularDiffDeg(d.value, d.col.referenceDeg))}\u00b0 from ${refLabel}`
           : '';
-        const label = key === OBS_KEY ? 'Observed'
-          : key === AVG_KEY ? (d.col.referenceIsObserved ? 'Observed (ground truth)' : 'Cross-model average')
+        const label = key === OBS_KEY ? observedLabel(state.location)
+          : key === AVG_KEY ? (d.col.referenceIsObserved ? `${observedLabel(state.location)} (ground truth)` : 'Cross-model average')
           : key.toUpperCase();
         tooltip.style('opacity', 1)
           .html(`<b>${label}</b><br>${d.col.date.toISOString().slice(0, 16).replace('T', ' ')} UTC<br>from ${Math.round(d.value)}\u00b0 (blowing toward ${towardDeg}\u00b0)${diffFromRef}`)
@@ -1390,7 +1480,7 @@ function renderWindDirectionChart(container, tooltip, models, byModel, obs, flag
   if (obs.length) {
     const item = legend.append('div').attr('class', 'legend-item');
     item.append('span').attr('class', 'legend-swatch').style('background', '#9aa5ab');
-    item.append('span').text('Observed');
+    item.append('span').text(observedLabel(state.location));
   }
   const note = container.insert('div', 'svg').attr('class', 'subsection-title');
   note.text('Arrows point in the direction the wind is blowing TOWARD (hover for the raw "from" bearing). REF row = the real observed direction where available, falling back to the circular mean across all models only when no observation exists yet (future times, or a location with no wind sensor). Each model\'s arrow opacity fades from 1.0 (matches REF) down to 0.25 (90\u00b0+ off REF).');

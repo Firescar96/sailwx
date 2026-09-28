@@ -15,6 +15,11 @@ LOCATIONS = [
     ("coops_8443970", "NOAA CO-OPS 8443970 - Boston (Long Wharf)", 42.3539, -71.0503, "buoy"),
     ("kbos",          "Logan International Airport (KBOS)", 42.3656, -71.0096, "airport"),
     ("cbi_dockhouse", "Community Boating Inc. Dockhouse (Charles River Basin)", 42.3598, -71.0731, "coastal_station"),
+    # ADDED 2026-09-27 (user: "start tracking the harvard bridge
+    # location ... that's available for free"). SailFlow spot #1834,
+    # a real WeatherFlow-network station on the Charles River between
+    # MIT and CBI -- see scripts/ingest_harvard_bridge.py.
+    ("harvard_bridge", "Harvard Bridge (SailFlow, Charles River)", 42.35475, -71.09131, "coastal_station"),
 ]
 
 
