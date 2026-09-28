@@ -925,6 +925,24 @@ def api_wind_prediction(params):
     blocked, wind from an open quadrant doesn't. Wind direction is a
     real, physically-motivated confound the same way daypart was.
 
+    GROUND-TRUTH OVERRIDE for mit_pavilion -- ADDED 2026-09-28 (user:
+    "the wind prediction on MIT should be using the observed data from
+    Harvard bridge"). Same rationale/mechanism as the accuracy view's
+    substitution (db/schema.sql's v_accuracy_by_lead_time, and this same
+    file's api_accuracy): MIT's own pixel-scraped sensor reads
+    noticeably calmer than the surrounding region during real events
+    (the exact "MIT sheltering" phenomenon this whole daypart/direction-
+    conditioning feature was built around) -- training this predictor
+    on MIT's own sensor bakes that same local anomaly into "what
+    actually happened," which is circular when the whole point is
+    judging whether a model's regional forecast was right. Harvard
+    Bridge is a professional-grade WeatherFlow station a short distance
+    up the Charles with no comparable sheltering issue, so both the
+    TRAINING observations (what actually happened, historically) and
+    ANY future ground-truth comparison now come from Harvard Bridge
+    instead of MIT's own sensor, for mit_pavilion only -- every other
+    location's wind prediction is completely untouched.
+
     Fix: added an 8-sector compass-direction bucket (N/NE/E/SE/S/SW/W/NW,
     45 degrees each -- coarser than the 16-sector Wind Rose panel, since
     each extra dimension divides the same finite training data further;
@@ -955,6 +973,13 @@ def api_wind_prediction(params):
     dir_variable = "wind_dir_deg"
     if not location or not model:
         return {"error": "location and model query params are required"}
+    # Ground-truth override for mit_pavilion -- see the docstring above
+    # ("GROUND-TRUTH OVERRIDE...") for the full rationale. forecast_runs/
+    # forecast_values below are still queried with location = the
+    # ORIGINAL requested location (mit_pavilion) as normal -- this only
+    # substitutes which location's real OBSERVATIONS are used as ground
+    # truth for training + comparison.
+    ground_truth_location = "harvard_bridge" if location == "mit_pavilion" else location
     con = db()
     try:
         # 1. Forecast wind for the selected model, forward-looking. Also
@@ -1036,7 +1061,7 @@ def api_wind_prediction(params):
                    AND fvdir.valid_time_utc = fv.valid_time_utc
                    AND fvdir.variable = ?
                 JOIN observations o
-                    ON o.location_id = fr.location_id
+                    ON o.location_id = ?
                    AND o.variable = fv.variable
                    AND o.ts_utc BETWEEN fv.valid_time_utc - INTERVAL '7.5 minutes'
                                      AND fv.valid_time_utc + INTERVAL '7.5 minutes'
@@ -1056,7 +1081,7 @@ def api_wind_prediction(params):
             FROM one_per_real_event
             WHERE event_rn = 1
             """,
-            [dir_variable, location, model, variable],
+            [dir_variable, ground_truth_location, location, model, variable],
         ).fetchall()
         training_rows = [
             (f, d, o, h) for (f, d, o, h) in training_rows
