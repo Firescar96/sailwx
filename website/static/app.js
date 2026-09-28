@@ -674,6 +674,13 @@ async function loadForecastChart() {
   const HARVARD_BRIDGE_VARS = new Set(['wind_speed_kt', 'wind_gust_kt', 'pressure_hpa']);
   const showHarvardBridge = (state.location === 'mit_pavilion' || state.location === 'cbi_dockhouse')
     && HARVARD_BRIDGE_VARS.has(state.variable);
+  // Wind-direction overlay -- ADDED 2026-09-27 (user: "build in that
+  // wind direction scraping ... show that data overlayed mit wind
+  // data"). Handled as its own flag (not folded into HARVARD_BRIDGE_VARS
+  // above) since wind_dir_deg renders through the completely separate
+  // renderWindDirectionChart row/arrow layout, not this function's own
+  // line-chart rendering -- see the dedicated overlay row added there.
+  const showHarvardBridgeDir = state.location === 'mit_pavilion' && state.variable === 'wind_dir_deg';
   // Flag history window follows ONLY "Also show past" (obsHours), not
   // the forward-looking forecast window (`hours`) at all. Previously
   // used Math.max(hours, obsHours), which meant a large forward window
@@ -691,7 +698,7 @@ async function loadForecastChart() {
     showFlagBands
       ? fetchJSON(`/api/flags-history?location=${state.location}&hours=${obsHours}`)
       : Promise.resolve([]),
-    showHarvardBridge && obsHours > 0
+    (showHarvardBridge || showHarvardBridgeDir) && obsHours > 0
       ? fetchJSON(`/api/observations?location=harvard_bridge&variable=${state.variable}&hours=${obsHours}`)
       : Promise.resolve([]),
   ]);
@@ -779,7 +786,7 @@ async function loadForecastChart() {
   // false "high vs low" numeric axis for a value that has no natural
   // ordering.
   if (state.variable === 'wind_dir_deg') {
-    renderWindDirectionChart(container, tooltip, models, byModel, obs, flagHistory, x, width, height, margin, minDate, maxDate, hours, pastHours, showFlagBands);
+    renderWindDirectionChart(container, tooltip, models, byModel, obs, flagHistory, x, width, height, margin, minDate, maxDate, hours, pastHours, showFlagBands, harvardBridge, showHarvardBridgeDir);
     return;
   }
 
@@ -1122,11 +1129,20 @@ async function loadForecastChart() {
 // meteorological wind_dir_deg, "from" convention) so nothing else on
 // the dashboard (Wind Rose, Wind Prediction's direction sectors, etc)
 // is affected.
-function renderWindDirectionChart(container, tooltip, models, byModel, obs, flagHistory, x, width, height, margin, minDate, maxDate, hours, pastHours, showFlagBands) {
+function renderWindDirectionChart(container, tooltip, models, byModel, obs, flagHistory, x, width, height, margin, minDate, maxDate, hours, pastHours, showFlagBands, harvardBridge, showHarvardBridgeDir) {
   const OBS_KEY = 'observed';
   const AVG_KEY = '__avg__'; // synthetic row: circular mean direction across all models at each shared column, added 2026-09-24 (see below)
+  const HB_KEY = 'harvard_bridge';
   const rowKeys = [AVG_KEY, ...models];
   if (obs.length) rowKeys.push(OBS_KEY);
+  // Harvard Bridge direction row -- ADDED 2026-09-27 (user: "build in
+  // that wind direction scraping ... show that data overlayed mit wind
+  // data"). Only added when actually showing data for it (mit_pavilion
+  // only, see showHarvardBridgeDir in loadForecastChart) and only when
+  // the fetch actually returned real rows -- an always-present-but-
+  // empty row would be a confusing dead row label.
+  const hbSorted = (harvardBridge || []).filter(d => d.value != null).slice().sort((a, b) => a.ts_utc_date - b.ts_utc_date);
+  if (showHarvardBridgeDir && hbSorted.length) rowKeys.push(HB_KEY);
 
   const rowHeight = 34;
   const rowsTop = margin.top + 10;
@@ -1189,10 +1205,10 @@ function renderWindDirectionChart(container, tooltip, models, byModel, obs, flag
     svg.append('text')
       .attr('x', margin.left - 6).attr('y', rowCenter + 3)
       .attr('text-anchor', 'end')
-      .attr('fill', key === OBS_KEY ? '#9aa5ab' : key === AVG_KEY ? 'var(--text)' : (MODEL_COLORS[key] || '#888'))
+      .attr('fill', key === OBS_KEY ? '#9aa5ab' : key === HB_KEY ? '#d9822b' : key === AVG_KEY ? 'var(--text)' : (MODEL_COLORS[key] || '#888'))
       .attr('font-size', '0.7rem')
       .attr('font-weight', key === AVG_KEY ? 'bold' : null)
-      .text(key === OBS_KEY ? 'Obs' : key === AVG_KEY ? 'REF' : key.toUpperCase());
+      .text(key === OBS_KEY ? 'Obs' : key === HB_KEY ? 'Hrvd Br' : key === AVG_KEY ? 'REF' : key.toUpperCase());
   });
 
   // "Right now" vertical marker -- same as the main chart.
@@ -1456,7 +1472,36 @@ function renderWindDirectionChart(container, tooltip, models, byModel, obs, flag
       .on('mousemove', (event, d) => {
         const towardDeg = Math.round((d.value + 180) % 360);
         tooltip.style('opacity', 1)
-          .html(`<b>Observed</b><br>${d.ts_utc}<br>from ${Math.round(d.value)}\u00b0 (blowing toward ${towardDeg}\u00b0)`)
+          .html(`<b>${observedLabel(state.location)}</b><br>${d.ts_utc}<br>from ${Math.round(d.value)}\u00b0 (blowing toward ${towardDeg}\u00b0)`)
+          .style('left', (event.pageX + 12) + 'px')
+          .style('top', (event.pageY - 10) + 'px');
+      })
+      .on('mouseleave', () => { tooltip.style('opacity', 0); setRowHighlight(null); });
+  }
+
+  if (showHarvardBridgeDir && hbSorted.length) {
+    // Same treatment as the Observed row (own native cadence, not
+    // snapped to the model columns -- Harvard Bridge polls independently
+    // of any model run schedule).
+    const hbPoints = downsampleBySpacing(hbSorted, d => d.ts_utc_date);
+    const rowCenter = rowY(HB_KEY) + rowY.bandwidth() / 2;
+    svg.append('g')
+      .attr('data-row-key', HB_KEY)
+      .selectAll('path.wind-dir-arrow')
+      .data(hbPoints)
+      .join('path')
+      .attr('class', 'wind-dir-arrow')
+      .attr('d', 'M 0,-7 L 5,5 L 0,2 L -5,5 Z')
+      .attr('transform', d => `translate(${x(d.ts_utc_date)},${rowCenter}) rotate(${(d.value + 180) % 360})`)
+      .attr('fill', '#d9822b')
+      .attr('data-base-opacity', 1)
+      .attr('opacity', 1)
+      .style('cursor', 'default')
+      .on('mouseenter', () => setRowHighlight(HB_KEY))
+      .on('mousemove', (event, d) => {
+        const towardDeg = Math.round((d.value + 180) % 360);
+        tooltip.style('opacity', 1)
+          .html(`<b>Harvard Bridge</b><br>${d.ts_utc}<br>from ${Math.round(d.value)}\u00b0 (blowing toward ${towardDeg}\u00b0)`)
           .style('left', (event.pageX + 12) + 'px')
           .style('top', (event.pageY - 10) + 'px');
       })
