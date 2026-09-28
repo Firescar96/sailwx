@@ -91,6 +91,24 @@ CREATE INDEX IF NOT EXISTS idx_flags_ts ON flags(ts_utc);
 -- raw data) -- no separate snapshot table, no generated files. Query it
 -- directly any time: SELECT * FROM v_accuracy_by_lead_time;
 -- Nearest-observation matching mirrors db/verify.py's tolerance (7.5 min).
+--
+-- GROUND-TRUTH OVERRIDE for mit_pavilion -- ADDED 2026-09-28 (user: "I
+-- want mae on MIT to use calculation from Harvard bridge not
+-- pavilion"). MIT's own pixel-scraped sensor reads noticeably calmer
+-- than the surrounding region during real events this project has
+-- tracked all week (thermal sheltering in the Charles River basin --
+-- see the sea-breeze/land-breeze investigation and the recurring
+-- "MIT stays calm while NDBC/KBOS build" pattern). Harvard Bridge
+-- (SailFlow spot #1834, added 2026-09-27) is a professional-grade
+-- WeatherFlow station a short distance up the Charles from MIT, with
+-- no comparable sheltering issue -- the user wants MIT's forecast
+-- accuracy judged against THAT sensor instead of MIT's own.
+-- Implemented as a ground-truth SUBSTITUTION at the observation JOIN
+-- (fv/fr still keyed on location_id='mit_pavilion' as normal -- the
+-- output rows are still genuinely "how good is [model]'s forecast FOR
+-- mit_pavilion", only the observation used to judge them changes) --
+-- every OTHER location's accuracy computation is completely untouched
+-- (this CASE only fires for the literal string 'mit_pavilion').
 CREATE OR REPLACE VIEW v_accuracy_by_lead_time AS
 WITH matched AS (
     WITH candidates AS (
@@ -109,7 +127,7 @@ WITH matched AS (
         FROM forecast_values fv
         JOIN forecast_runs fr ON fr.run_id = fv.run_id
         JOIN observations o
-            ON o.location_id = fr.location_id
+            ON o.location_id = CASE WHEN fr.location_id = 'mit_pavilion' THEN 'harvard_bridge' ELSE fr.location_id END
            AND o.variable = fv.variable
            AND o.ts_utc BETWEEN fv.valid_time_utc - INTERVAL '7.5 minutes'
                              AND fv.valid_time_utc + INTERVAL '7.5 minutes'

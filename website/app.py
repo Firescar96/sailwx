@@ -232,6 +232,16 @@ def api_accuracy(params):
                 [location, variable],
             )
         else:
+            # Ground-truth override for mit_pavilion -- see the matching
+            # comment in db/schema.sql's v_accuracy_by_lead_time (the
+            # ALL-TIME path just above, hours is None) for the full
+            # rationale (user: "I want mae on MIT to use calculation
+            # from Harvard bridge not pavilion"). This windowed path
+            # re-implements that view's logic inline (it can't be
+            # parameterized by hours), so the same substitution needs
+            # applying here too, or the two code paths would silently
+            # disagree depending on whether a time window was selected.
+            ground_truth_location = "harvard_bridge" if location == "mit_pavilion" else location
             cur = con.execute(
                 """
                 WITH candidates AS (
@@ -248,7 +258,7 @@ def api_accuracy(params):
                     FROM forecast_values fv
                     JOIN forecast_runs fr ON fr.run_id = fv.run_id
                     JOIN observations o
-                        ON o.location_id = fr.location_id
+                        ON o.location_id = ?
                        AND o.variable = fv.variable
                        AND o.ts_utc BETWEEN fv.valid_time_utc - INTERVAL '7.5 minutes'
                                          AND fv.valid_time_utc + INTERVAL '7.5 minutes'
@@ -294,7 +304,7 @@ def api_accuracy(params):
                 GROUP BY model, lead_bucket
                 ORDER BY model, lead_bucket
                 """,
-                [location, variable, hours],
+                [ground_truth_location, location, variable, hours],
             )
         return rows_as_dicts(cur)
     finally:
