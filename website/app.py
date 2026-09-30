@@ -1182,12 +1182,31 @@ def api_wind_rose(params):
     observations (user 2026-09-11: "wind rose comparison... but only on
     places with observed wind data") -- CBI has neither (no wind sensor),
     so this endpoint is not offered there.
+
+    GROUND-TRUTH OVERRIDE for mit_pavilion -- ADDED 2026-09-28 (user:
+    "I think it's because the MIT sailing pavilion observed direction is
+    blocked, we should be using the Harvard bridge sensor" -- reported
+    after noticing the Wind Prediction panel's forecast-vs-actual looked
+    persistently bad for MIT). Directly measured: MIT's own wind_dir_deg
+    readings differ from Harvard Bridge's by an average of ~25.6 degrees
+    (circular distance) across ~17,700 matched timestamps -- a large,
+    systematic divergence, not just sampling noise, strongly consistent
+    with MIT's own direction sensor being physically obstructed/
+    miscalibrated by nearby structures (the sailing pavilion building
+    itself, docks, etc). Same substitution pattern as the accuracy/
+    wind-prediction fixes: OBSERVED direction+speed pairs for mit_pavilion
+    now come from harvard_bridge instead of MIT's own sensor; every
+    other location is untouched. The FORECAST rose (model's own
+    prediction) is intentionally left alone -- that's still genuinely
+    "what did this model predict for the mit_pavilion grid point,"
+    unaffected by which sensor judges it.
     """
     location = params.get("location")
     model = params.get("model")  # optional; if omitted, observed-only
     hours = int(params.get("hours", "720"))  # default 30 days of history
     if not location:
         return {"error": "location query param is required"}
+    ground_truth_location = "harvard_bridge" if location == "mit_pavilion" else location
     con = db()
     try:
         obs_rows = con.execute(
@@ -1201,7 +1220,7 @@ def api_wind_rose(params):
             WHERE o_dir.location_id = ? AND o_dir.variable = 'wind_dir_deg'
               AND o_dir.ts_utc >= now() - (? * INTERVAL '1 hour')
             """,
-            [location, hours],
+            [ground_truth_location, hours],
         ).fetchall()
 
         def bucket_rows(rows):
