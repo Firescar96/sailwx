@@ -690,15 +690,14 @@ def api_flag_prediction(params):
     marginal P(wind) (which would require picking a parametric wind
     distribution), we directly estimate the joint P(wind_bucket, flag)
     empirically from CBI's own history (matching each flag reading to
-    the nearest real MIT Pavilion wind observation within 20 minutes --
-    MIT is the venue's own on-site sensor, a few hundred meters from the
-    CBI dockhouse on the same basin) and add a symmetric Dirichlet(alpha)
-    prior (Laplace/additive smoothing) over the 4 flag colors within
-    each wind bucket. This IS an explicit Bayesian posterior update
-    (prior=uniform over colors, likelihood=observed per-bucket counts),
-    not just a raw frequency table -- and the smoothing matters a lot
-    here specifically because the training set is small (~130 flag
-    readings as of 2026-09-15), so buckets with 0-2 real examples would
+    the nearest real wind observation within 20 minutes -- see the
+    GROUND-TRUTH SENSOR note below for which station) and add a
+    symmetric Dirichlet(alpha) prior (Laplace/additive smoothing) over
+    the 4 flag colors within each wind bucket. This IS an explicit
+    Bayesian posterior update (prior=uniform over colors,
+    likelihood=observed per-bucket counts), not just a raw frequency
+    table -- and the smoothing matters a lot here specifically because
+    the training set is small, so buckets with 0-2 real examples would
     otherwise give overconfident all-or-nothing probabilities. alpha=1
     (add-one smoothing) pulls sparse buckets toward the overall marginal
     P(flag=c) instead.
@@ -733,6 +732,25 @@ def api_flag_prediction(params):
     location = "cbi_dockhouse"  # the only location with flag data
     variable = "wind_speed_kt"
     gust_variable = "wind_gust_kt"
+    # GROUND-TRUTH SENSOR for CBI's training data -- CHANGED 2026-09-29/30
+    # (user: "cbi is red flag right now with the wind and gusts, i would
+    # expect green flag probability to be about 0%" -> "switch the
+    # readings to harvard bridge, do that first"). This panel has no
+    # wind sensor of its own, so it was matching each historical flag
+    # reading to MIT Pavilion's wind/gust observations as a stand-in --
+    # the same "wrong sensor" issue already found and fixed in 3 other
+    # panels this week (accuracy MAE/RMSE, Wind Prediction, Wind Rose),
+    # just missed here. MIT's own sensor reads calmer than the
+    # surrounding region/is direction-obstructed (see those earlier
+    # fixes' commit messages for the measured evidence), so training on
+    # it understates how windy a "red flag" afternoon really gets --
+    # directly confirmed live: the 20-24kt forecast bucket had ZERO real
+    # green-flag training examples (red=4, yellow=1, closed=6) yet still
+    # produced a nonzero green probability purely from Dirichlet(alpha=1)
+    # smoothing's flat floor. Harvard Bridge is a real professional-grade
+    # WeatherFlow station a short walk from CBI with no comparable
+    # sheltering/obstruction issue.
+    ground_truth_location = "harvard_bridge"
     if not model:
         return {"error": "model query param is required"}
     con = db()
@@ -772,19 +790,19 @@ def api_flag_prediction(params):
             """
             SELECT f.flag_color,
                    (SELECT o.value FROM observations o
-                    WHERE o.location_id = 'mit_pavilion' AND o.variable = ?
+                    WHERE o.location_id = ? AND o.variable = ?
                       AND abs(epoch(o.ts_utc) - epoch(f.ts_utc)) <= 1200
                     ORDER BY abs(epoch(o.ts_utc) - epoch(f.ts_utc))
                     LIMIT 1) AS wind_kt,
                    (SELECT o.value FROM observations o
-                    WHERE o.location_id = 'mit_pavilion' AND o.variable = ?
+                    WHERE o.location_id = ? AND o.variable = ?
                       AND abs(epoch(o.ts_utc) - epoch(f.ts_utc)) <= 1200
                     ORDER BY abs(epoch(o.ts_utc) - epoch(f.ts_utc))
                     LIMIT 1) AS gust_kt
             FROM flags f
             WHERE f.location_id = ?
             """,
-            [variable, gust_variable, location],
+            [ground_truth_location, variable, ground_truth_location, gust_variable, location],
         ).fetchall()
         # Effective wind = max(sustained, gust) -- see docstring above.
         # Falls back to whichever of the two is actually available if
