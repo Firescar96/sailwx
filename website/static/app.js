@@ -52,6 +52,25 @@ function fmtVarLabel(v) {
   return VARIABLE_LABELS[v] || v;
 }
 
+// Shared x-axis tick formatter for the Forecast Time Series charts
+// (both the normal line chart and the Wind Direction row/arrow chart
+// use this identically -- was previously duplicated in each). SIMPLIFIED
+// 2026-09-29 (user: "better here, need day of week, don't need year or
+// +/- hours" -- reacting to a real mobile screenshot where the rotated
+// labels were long enough to crowd/overlap each other). Dropped the
+// year (redundant -- this dashboard only ever shows recent/near-future
+// dates) and the "(+Nh)" relative-offset suffix (redundant with the
+// dashed "now" line already drawn on the chart itself), and added the
+// day-of-week abbreviation, which is genuinely useful context a bare
+// date doesn't give at a glance. Previous format (for reference):
+// "2026-09-09 15:30 (-3h)" -- new format: "Tue 09-09 15:30".
+const WEEKDAY_ABBREV = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+function formatAxisTick(d) {
+  const pad = n => String(n).padStart(2, '0');
+  const weekday = WEEKDAY_ABBREV[d.getUTCDay()];
+  return `${weekday} ${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
+}
+
 // Per-location display name for the "Observed" series -- ADDED
 // 2026-09-27 (user: "for the mit location change grey 'Observed' to
 // 'Sailing Pavilion'"). Every OTHER location keeps the plain generic
@@ -883,18 +902,9 @@ async function loadForecastChart() {
   }
 
 
-  // X-axis tick format: previously "%m/%d %Hh" (e.g. "09/09 06h") was
-  // ambiguous about which day/year and gave no sense of "how far from
-  // now" at a glance -- replaced with an absolute timestamp plus a
-  // relative offset from the current moment, e.g.
-  // "2026-09-09 15:30 (-3h)" / "2026-09-11 09:00 (+41h)".
-  function formatAxisTick(d) {
-    const pad = n => String(n).padStart(2, '0');
-    const abs = `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
-    const diffHours = Math.round((d.getTime() - Date.now()) / 3600000);
-    const sign = diffHours >= 0 ? '+' : '';
-    return `${abs} (${sign}${diffHours}h)`;
-  }
+  // X-axis tick format: now shared via the top-level formatAxisTick()
+  // defined near fmtVarLabel() -- see that definition's comment for
+  // the full rationale/history.
 
   svg.append('g')
     .attr('class', 'axis')
@@ -1229,13 +1239,9 @@ function renderWindDirectionChart(container, tooltip, models, byModel, obs, flag
       .text('now');
   }
 
-  function formatAxisTick(d) {
-    const pad = n => String(n).padStart(2, '0');
-    const abs = `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
-    const diffHours = Math.round((d.getTime() - Date.now()) / 3600000);
-    const sign = diffHours >= 0 ? '+' : '';
-    return `${abs} (${sign}${diffHours}h)`;
-  }
+  // X-axis tick format: shared top-level formatAxisTick() defined near
+  // fmtVarLabel() -- see that definition's comment for the full
+  // rationale/history.
 
   svg.append('g')
     .attr('class', 'axis')
