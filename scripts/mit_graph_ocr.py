@@ -105,15 +105,32 @@ def read_axis_scale(img):
     # a straight median if there are only 2-3 real ticks). The mode is
     # more robust: even with one contaminating value, the real ticks'
     # consistent step will win as long as there are >= 2 of them.
+    #
+    # FIXED 2026-10-03 (found via a real production failure: MIT's own
+    # wind scraper silently stopped updating for ~20 hours). Root cause:
+    # with only 3 OCR'd values (common on a calm-wind day with a small
+    # axis range, e.g. "20.0, 10.0, 15.0" where the true third tick is
+    # "0.0" but OCR misread it as "15.0"), there are only 2 diffs:
+    # [10.0, -5.0] -- a COUNT TIE (1 vs 1). The old tiebreak
+    # (`-abs(d)`, preferring the smaller-magnitude step) picked -5.0,
+    # a negative step, which then failed the `step <= 0` sanity check
+    # below and aborted the whole fetch. But a negative step is
+    # physically impossible for these always-descending-top-to-bottom
+    # weewx axes -- it can ONLY ever be OCR noise, never a real
+    # candidate. Fixed by excluding non-positive diffs from the
+    # mode-counting entirely before picking among ties, so a tie
+    # between a real positive step and bogus OCR noise always resolves
+    # to the real one instead of coin-flipping (and sometimes losing).
     diffs = [round(values[i] - values[i + 1], 4) for i in range(len(values) - 1)]
     if not diffs:
         raise ValueError(f"Not enough ticks to compute a step: {values}")
+    positive_diffs = [d for d in diffs if d > 0]
+    if not positive_diffs:
+        raise ValueError(f"Axis ticks not descending as expected: {values} (diffs={diffs})")
     step_counts = {}
-    for d in diffs:
+    for d in positive_diffs:
         step_counts[d] = step_counts.get(d, 0) + 1
     step = max(step_counts, key=lambda d: (step_counts[d], -abs(d)))
-    if step <= 0:
-        raise ValueError(f"Axis ticks not descending as expected: {values} (diffs={diffs})")
 
     # Keep only the leading run of values consistent with `step` --
     # drops any trailing contamination (e.g. a stray "12" from the x-axis
