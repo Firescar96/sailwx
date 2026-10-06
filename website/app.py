@@ -686,10 +686,10 @@ def api_flag_prediction(params):
     at some future hour, what's the probability the flag will be each
     color at that time".
 
-    CORE MODEL: a Bayesian ordinal logistic regression over 2 separate
-    features (sustained wind_kt, gust_kt) -- see
-    website/ordinal_flag_model.py's module docstring for the full
-    rationale, the "Bayesian" fitting details (MAP + Laplace
+    CORE MODEL: a Bayesian ordinal logistic regression over 4 features
+    (sustained wind_kt, gust_kt, sin(wind_dir_deg), cos(wind_dir_deg))
+    -- see website/ordinal_flag_model.py's module docstring for the
+    full rationale, the "Bayesian" fitting details (MAP + Laplace
     approximation), and real cross-validated log-loss numbers. CLOSED is
     NOT part of that model at all -- it's handled entirely by CBI's
     known 9am-sunset operating hours (see step 4 below), since closure
@@ -734,12 +734,14 @@ def api_flag_prediction(params):
     location = "cbi_dockhouse"  # the only location with flag data
     variable = "wind_speed_kt"
     gust_variable = "wind_gust_kt"
+    dir_variable = "wind_dir_deg"
     ground_truth_location = "harvard_bridge"
     if not model:
         return {"error": "model query param is required"}
     con = db()
     try:
-        # 1. Forecast wind AND gust for the selected model, forward-looking.
+        # 1. Forecast wind, gust AND direction for the selected model,
+        # forward-looking.
         forecast_rows = con.execute(
             """
             WITH latest_run AS (
@@ -749,25 +751,29 @@ def api_flag_prediction(params):
                 QUALIFY row_number() OVER (ORDER BY init_time_utc DESC) = 1
             )
             SELECT lr.init_time_utc, fv_wind.valid_time_utc, fv_wind.value AS wind_kt,
-                   fv_gust.value AS gust_kt
+                   fv_gust.value AS gust_kt, fv_dir.value AS dir_deg
             FROM forecast_values fv_wind
             JOIN latest_run lr ON lr.run_id = fv_wind.run_id
             LEFT JOIN forecast_values fv_gust
                 ON fv_gust.run_id = fv_wind.run_id
                AND fv_gust.valid_time_utc = fv_wind.valid_time_utc
                AND fv_gust.variable = ?
+            LEFT JOIN forecast_values fv_dir
+                ON fv_dir.run_id = fv_wind.run_id
+               AND fv_dir.valid_time_utc = fv_wind.valid_time_utc
+               AND fv_dir.variable = ?
             WHERE fv_wind.variable = ?
               AND fv_wind.valid_time_utc <= now() + (? * INTERVAL '1 hour')
               AND fv_wind.valid_time_utc >= now()
             ORDER BY fv_wind.valid_time_utc
             """,
-            [location, model, gust_variable, variable, hours],
+            [location, model, gust_variable, dir_variable, variable, hours],
         )
         forecast_points = rows_as_dicts(forecast_rows)
 
         # 2. Historical training rows: each flag reading (timestamp +
-        # color) matched to the nearest real Harvard Bridge wind AND
-        # gust observations within 20 minutes.
+        # color) matched to the nearest real Harvard Bridge wind, gust
+        # AND direction observations within 20 minutes.
         training_rows_raw = con.execute(
             """
             SELECT f.flag_color, f.ts_utc,
@@ -780,30 +786,41 @@ def api_flag_prediction(params):
                     WHERE o.location_id = ? AND o.variable = ?
                       AND abs(epoch(o.ts_utc) - epoch(f.ts_utc)) <= 1200
                     ORDER BY abs(epoch(o.ts_utc) - epoch(f.ts_utc))
-                    LIMIT 1) AS gust_kt
+                    LIMIT 1) AS gust_kt,
+                   (SELECT o.value FROM observations o
+                    WHERE o.location_id = ? AND o.variable = ?
+                      AND abs(epoch(o.ts_utc) - epoch(f.ts_utc)) <= 1200
+                    ORDER BY abs(epoch(o.ts_utc) - epoch(f.ts_utc))
+                    LIMIT 1) AS dir_deg
             FROM flags f
             WHERE f.location_id = ?
             """,
-            [ground_truth_location, variable, ground_truth_location, gust_variable, location],
+            [
+                ground_truth_location, variable,
+                ground_truth_location, gust_variable,
+                ground_truth_location, dir_variable,
+                location,
+            ],
         ).fetchall()
         # Drop any training row from outside CBI's real operating hours
         # -- see the "TRAINING DATA IS FILTERED" docstring note above.
         training_rows = [
-            (color, wind, gust)
-            for (color, ts, wind, gust) in training_rows_raw
+            (color, wind, gust, dir_deg)
+            for (color, ts, wind, gust, dir_deg) in training_rows_raw
             if is_cbi_open(ts.replace(tzinfo=timezone.utc))
         ]
 
         # 3. Fit the Bayesian ordinal logistic regression model on
-        # (wind, gust) -> flag_color -- see website/ordinal_flag_model.py.
+        # (wind, gust, direction) -> flag_color -- see
+        # website/ordinal_flag_model.py.
         marginal_counts = {c: 0 for c in FLAG_COLORS_ALL}
         ordinal_training_rows = []
-        for color, wind, gust in training_rows:
+        for color, wind, gust, dir_deg in training_rows:
             if color not in FLAG_COLORS_ALL:
                 continue
             marginal_counts[color] += 1
             if color != "closed":
-                ordinal_training_rows.append((wind, gust, color))
+                ordinal_training_rows.append((wind, gust, dir_deg, color))
 
         ordinal_model = ordinal_flag_model.fit(ordinal_training_rows)
         # Fallback used only if there's not enough data/color variety to
@@ -814,10 +831,10 @@ def api_flag_prediction(params):
             c: marginal_counts[c] / _marginal_total for c in ("red", "yellow", "green")
         }
 
-        def posterior_for_wind_gust(wind_kt, gust_kt):
+        def posterior_for_wind_gust(wind_kt, gust_kt, dir_deg):
             if ordinal_model is None or (wind_kt is None and gust_kt is None):
                 return {**_marginal_fallback, "closed": 0.0}
-            probs = ordinal_flag_model.predict(ordinal_model, wind_kt, gust_kt)
+            probs = ordinal_flag_model.predict(ordinal_model, wind_kt, gust_kt, dir_deg)
             return {**probs, "closed": 0.0}
 
         # 4. Attach a probability distribution to every forecast point.
@@ -834,6 +851,7 @@ def api_flag_prediction(params):
         for row in forecast_points:
             wind = row["wind_kt"]
             gust = row.get("gust_kt")
+            dir_deg = row.get("dir_deg")
             effective_wind = max((v for v in (wind, gust) if v is not None), default=None)
             valid_dt = row["valid_time_utc"]
             if isinstance(valid_dt, str):
@@ -849,6 +867,7 @@ def api_flag_prediction(params):
                     "valid_time_utc": row["valid_time_utc"],
                     "wind_kt": wind,
                     "gust_kt": gust,
+                    "dir_deg": dir_deg,
                     "wind_bucket": bucket,
                     "flag_probabilities": probs,
                     "most_likely_flag": "closed",
@@ -856,7 +875,7 @@ def api_flag_prediction(params):
                 continue
 
             bucket = _wind_bucket(effective_wind) if effective_wind is not None else None
-            probs = posterior_for_wind_gust(wind, gust)
+            probs = posterior_for_wind_gust(wind, gust, dir_deg)
             # During open hours: drop "closed" entirely and renormalize
             # the remaining 3 colors so they sum to 1.
             remaining = {c: probs[c] for c in FLAG_COLORS_ALL if c != "closed"}
@@ -871,6 +890,7 @@ def api_flag_prediction(params):
                 "valid_time_utc": row["valid_time_utc"],
                 "wind_kt": wind,
                 "gust_kt": gust,
+                "dir_deg": dir_deg,
                 "wind_bucket": bucket,
                 "flag_probabilities": probs,
                 "most_likely_flag": max(probs, key=probs.get) if probs else None,

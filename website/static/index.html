@@ -162,8 +162,8 @@
   </section>
 
   <section id="flag-prediction-panel" class="panel">
-    <h2>CBI Flag Prediction <span class="subtitle">(Bayesian: P(flag color | forecast wind + gust), from one selected model)</span></h2>
-    <p class="subtitle">Not the same as the accuracy chart above -- this doesn't measure model error, it estimates "given this model's wind AND gust forecast, how likely is each flag color" using CBI's own historical wind/gust-vs-flag pairing (bucketed by the higher of the two, since a gusty light-wind hour behaves like a stronger steady wind), with Bayesian smoothing so sparse wind ranges don't look falsely certain.</p>
+    <h2>CBI Flag Prediction <span class="subtitle">(Bayesian ordinal logistic regression: P(flag color | forecast wind, gust, direction), from one selected model)</span></h2>
+    <p class="subtitle">Not the same as the accuracy chart above -- this doesn't measure model error, it estimates "given this model's forecast wind, gust, and wind direction, how likely is each flag color" by fitting a smooth curve to CBI's own historical wind/gust/direction-vs-flag pairing (wind and gust are each their own input, not combined into one number; direction is a real factor too, encoded so 359&deg; and 1&deg; are correctly treated as nearly the same heading), with a Bayesian posterior average so sparse wind ranges don't look falsely certain. Driven purely by the forecast at each hour -- it does not use the flag's own recent history to predict its near-term future.</p>
     <div class="controls inline">
       <label>
         Model
@@ -186,8 +186,8 @@
   </section>
 
   <section id="wind-prediction-panel" class="panel" hidden>
-    <h2>Wind Prediction <span class="subtitle">(Bayesian: P(actual wind bucket | forecast wind), from one selected model)</span></h2>
-    <p class="subtitle">Not the same as the accuracy chart above -- instead of "how far off is the model on average", this estimates "given this model's forecast wind, how likely is the REAL wind to fall in each range", using this location's own historical forecast-vs-observed wind pairing, with Bayesian smoothing.</p>
+    <h2>Wind Prediction <span class="subtitle">(Bayesian linear regression: P(actual wind bucket | forecast wind, daypart, direction), from one selected model)</span></h2>
+    <p class="subtitle">Not the same as the accuracy chart above -- instead of "how far off is the model on average", this estimates "given this model's forecast wind, time of day, and wind direction, how likely is the REAL wind to fall in each range", by fitting a smooth curve to this location's own historical forecast-vs-observed wind pairing (time of day and direction matter because local sheltering/terrain effects behave differently depending on both), with a Bayesian posterior-predictive distribution around that fitted curve.</p>
     <div class="controls inline">
       <label>
         Model
