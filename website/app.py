@@ -36,6 +36,8 @@ PORT = int(os.environ.get("PORT", "8420"))
 sys.path.insert(0, os.path.join(HERE, "..", "scripts"))
 from cbi_hours import is_cbi_open
 
+import ordinal_flag_model
+
 sys.path.insert(0, os.path.join(HERE, "..", "db"))
 from common import get_connection as _get_connection_with_retry  # noqa: E402
 
@@ -852,26 +854,34 @@ def api_flag_prediction(params):
             if wind is not None or gust is not None
         ]
 
-        # 3. Build the joint bucket->color count table, then the Bayesian
-        # posterior P(flag=c | wind_bucket=b) with Dirichlet(alpha=1)
-        # smoothing per bucket.
-        bucket_counts = {}  # bucket -> {color: count}
+        # 3. Fit the Bayesian ordinal logistic regression model (replaces
+        # the old wind-bucket + Dirichlet-smoothing table -- see
+        # website/ordinal_flag_model.py's module docstring for the full
+        # rationale, validation numbers, and what "Bayesian" means here).
         marginal_counts = {c: 0 for c in FLAG_COLORS_ALL}
+        ordinal_training_pairs = []
         for color, effective_wind in training_rows:
             if color not in FLAG_COLORS_ALL:
                 continue
-            b = _wind_bucket(effective_wind)
-            bucket_counts.setdefault(b, {c: 0 for c in FLAG_COLORS_ALL})
-            bucket_counts[b][color] += 1
             marginal_counts[color] += 1
+            if color != "closed":
+                ordinal_training_pairs.append((effective_wind, color))
 
-        alpha = 1.0
-        n_colors = len(FLAG_COLORS_ALL)
+        ordinal_model = ordinal_flag_model.fit(ordinal_training_pairs)
+        # Fallback used only if there's not enough data/color variety to
+        # fit the ordinal model at all (e.g. a brand-new deployment) --
+        # the plain marginal frequency, same spirit as the old alpha=1
+        # Dirichlet prior degenerate case.
+        _marginal_total = max(1, sum(marginal_counts[c] for c in ("red", "yellow", "green")))
+        _marginal_fallback = {
+            c: marginal_counts[c] / _marginal_total for c in ("red", "yellow", "green")
+        }
 
-        def posterior_for_bucket(bucket):
-            counts = bucket_counts.get(bucket, {c: 0 for c in FLAG_COLORS_ALL})
-            total = sum(counts.values()) + alpha * n_colors
-            return {c: round((counts[c] + alpha) / total, 4) for c in FLAG_COLORS_ALL}
+        def posterior_for_wind(effective_wind):
+            if ordinal_model is None or effective_wind is None:
+                return {**_marginal_fallback, "closed": 0.0}
+            probs = ordinal_flag_model.predict(ordinal_model, effective_wind)
+            return {**probs, "closed": 0.0}
 
         # 3b. Markov persistence: P(next_hour_color | current_color),
         # estimated from real consecutive flag readings ~1 hour apart
@@ -895,12 +905,14 @@ def api_flag_prediction(params):
             if 1800 <= gap_seconds <= 5400 and prev_color in FLAG_COLORS_ALL and cur_color in FLAG_COLORS_ALL:
                 transition_counts[prev_color][cur_color] += 1
 
+        markov_alpha = 1.0  # Dirichlet smoothing for the transition matrix only
+        n_colors = len(FLAG_COLORS_ALL)
         transition_matrix = {}
         for prev_color in FLAG_COLORS_ALL:
             row_counts = transition_counts[prev_color]
-            total = sum(row_counts.values()) + alpha * n_colors
+            total = sum(row_counts.values()) + markov_alpha * n_colors
             transition_matrix[prev_color] = {
-                c: (row_counts[c] + alpha) / total for c in FLAG_COLORS_ALL
+                c: (row_counts[c] + markov_alpha) / total for c in FLAG_COLORS_ALL
             }
 
         def markov_project(current_color, n_steps):
@@ -987,7 +999,7 @@ def api_flag_prediction(params):
                 continue
 
             bucket = _wind_bucket(effective_wind) if effective_wind is not None else None
-            probs = posterior_for_bucket(bucket) if bucket is not None else None
+            probs = posterior_for_wind(effective_wind)
             if probs is not None:
                 # During open hours: drop "closed" entirely and
                 # renormalize the remaining 3 colors so they sum to 1.
