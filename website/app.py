@@ -37,6 +37,7 @@ sys.path.insert(0, os.path.join(HERE, "..", "scripts"))
 from cbi_hours import is_cbi_open
 
 import ordinal_flag_model
+import wind_regression_model
 
 sys.path.insert(0, os.path.join(HERE, "..", "db"))
 from common import get_connection as _get_connection_with_retry  # noqa: E402
@@ -1090,37 +1091,30 @@ def api_wind_prediction(params):
             if f is not None and o is not None and h is not None
         ]
 
-        # 3. Build joint (daypart, dir_sector, forecast_bucket) ->
-        # {actual_bucket: count}, then compute the Dirichlet(alpha=1)-
-        # smoothed posterior per (daypart, dir_sector, forecast bucket)
-        # tuple. A missing/null forecast direction (LEFT JOIN found no
-        # matching wind_dir_deg row for that run/valid_time) falls back
-        # to a dedicated "unknown" sector rather than being dropped, so
-        # a model that's missing direction data for some runs doesn't
-        # lose those speed pairs entirely.
-        bucket_counts = {}  # (daypart, dir_sector, forecast_bucket) -> {actual_bucket: count}
-        all_actual_buckets = set()
-        for f_val, dir_deg, o_val, local_hour in training_rows:
-            dp = _daypart(local_hour)
-            sector = _compass_sector_label(dir_deg) if dir_deg is not None else "unknown"
-            fb = _wind_bucket(f_val)
-            ob = _wind_bucket(o_val)
-            all_actual_buckets.add(ob)
-            key = (dp, sector, fb)
-            bucket_counts.setdefault(key, {})
-            bucket_counts[key][ob] = bucket_counts[key].get(ob, 0) + 1
+        # 3. Fit the Bayesian linear regression model (replaces the old
+        # (daypart, dir_sector, forecast_bucket) -> {actual_bucket:
+        # count} Dirichlet-smoothed table -- see
+        # website/wind_regression_model.py's module docstring for the
+        # full rationale and real cross-validated log-loss comparisons).
+        # all_actual_buckets still needs to be computed directly from
+        # the training data (NOT assumed/hardcoded), since the set of
+        # buckets that have ever actually occurred varies by location
+        # (e.g. NDBC's buoy never sees as high a top bucket as a storm
+        # at KBOS might) -- the frontend's bucket legend is built from
+        # this list.
+        all_actual_buckets = sorted(
+            {_wind_bucket(o_val) for (_, _, o_val, _) in training_rows},
+            key=lambda b: int(b.split("-")[0]),
+        )
+        regression_model = wind_regression_model.fit(training_rows)
 
-        all_actual_buckets = sorted(all_actual_buckets, key=lambda b: int(b.split("-")[0]))
-        alpha = 1.0
-        n_buckets = max(1, len(all_actual_buckets))
-
-        def posterior_for(daypart, sector, fb):
-            counts = bucket_counts.get((daypart, sector, fb), {})
-            total = sum(counts.values()) + alpha * n_buckets
-            return {
-                b: round((counts.get(b, 0) + alpha) / total, 4)
-                for b in all_actual_buckets
-            }
+        def posterior_for(forecast_wind, forecast_dir, local_hour):
+            if regression_model is None or not all_actual_buckets:
+                return None
+            return wind_regression_model.predict_distribution(
+                regression_model, forecast_wind, forecast_dir, local_hour,
+                all_actual_buckets, WIND_BUCKET_WIDTH_KT,
+            )
 
         # 4. Attach a probability distribution (over ACTUAL wind buckets)
         # to every forecast point, using ITS OWN local-hour daypart and
@@ -1132,7 +1126,7 @@ def api_wind_prediction(params):
             fb = _wind_bucket(forecast_wind) if forecast_wind is not None else None
             dp = _daypart(row["local_hour"]) if row["local_hour"] is not None else None
             sector = _compass_sector_label(forecast_dir) if forecast_dir is not None else "unknown"
-            probs = posterior_for(dp, sector, fb) if (fb is not None and dp is not None and all_actual_buckets) else None
+            probs = posterior_for(forecast_wind, forecast_dir, row["local_hour"]) if forecast_wind is not None else None
             predictions.append({
                 "valid_time_utc": row["valid_time_utc"],
                 "forecast_wind_kt": forecast_wind,
