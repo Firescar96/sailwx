@@ -726,6 +726,45 @@ def api_flag_prediction(params):
     the marginal prior. Revisit the full 2D grid once there's roughly
     200-350+ training examples (some months of accumulated CBI-open-hours
     history at the current hourly-poll rate).
+
+    MARKOV PERSISTENCE BLENDING -- ADDED 2026-10-06 (user: "I need a
+    better algorithm to make the cbi flag prediction more accurate,
+    green shouldn't be so high when it predicts for this afternoon,
+    should be near 0"). Root cause of the specific complaint: the flag
+    was ACTUALLY RED right now (confirmed live), yet the prediction for
+    just 1-2 hours out showed 72% green -- because the wind-bucket
+    posterior above is a pure "P(flag | forecast wind bucket)" estimate
+    that has ZERO awareness of the flag's CURRENT color. It treats every
+    forecast hour as an independent draw from history, ignoring that
+    flag colors have strong real short-term persistence (confirmed via a
+    direct query of consecutive ~1-hour-apart flag readings: red is
+    followed by red 75.7% of the time and by green only 2.7% of the
+    time; green is followed by green 78.6% of the time). A gust-driven
+    wind-bucket estimate alone genuinely can't capture this, since two
+    different hours can have an identical forecast wind bucket while the
+    REAL flag trend going into that hour is completely different (e.g.
+    a gusty hour right after a calm stretch vs. the same gusty hour
+    right after a red-flagged squall that hasn't fully let up yet).
+
+    Fix: built an empirical first-order Markov TRANSITION matrix
+    P(next_hour_color | current_color) from real consecutive ~1-hour-
+    apart flag reading pairs (same Dirichlet(alpha=1) smoothing
+    treatment as the wind-bucket table), then matrix-powered it forward
+    by each forecast point's actual lead time in hours to get
+    P(color at lead h | current color). This is combined with the
+    wind-bucket posterior via a product-of-experts (multiply the two
+    independent probability estimates together per color, then
+    renormalize) -- NOT a simple average, because a product correctly
+    lets either source veto a color both estimates disagree on (e.g.
+    wind-bucket says "plausible" but Markov says "very unlikely given
+    current red" pulls the combined probability down much more than
+    an average would), which is the behavior that actually fixes the
+    reported complaint. The Markov component's influence decays
+    naturally with lead time (verified: converges back to the
+    stationary/marginal distribution by ~8-12 hours out, matching how
+    little the CURRENT flag color should matter for a forecast a day
+    away) -- no separate decay/weighting schedule needed, it falls out
+    of the matrix power itself.
     """
     model = params.get("model")
     hours = int(params.get("hours", "48"))
@@ -834,6 +873,84 @@ def api_flag_prediction(params):
             total = sum(counts.values()) + alpha * n_colors
             return {c: round((counts[c] + alpha) / total, 4) for c in FLAG_COLORS_ALL}
 
+        # 3b. Markov persistence: P(next_hour_color | current_color),
+        # estimated from real consecutive flag readings ~1 hour apart
+        # (the flag poller runs hourly -- see "CBI Flag Color Ingester").
+        # Same Dirichlet(alpha=1) smoothing as the wind-bucket table. See
+        # the "MARKOV PERSISTENCE BLENDING" docstring note above for the
+        # full rationale.
+        flag_history_rows = con.execute(
+            "SELECT ts_utc, flag_color FROM flags WHERE location_id = ? ORDER BY ts_utc",
+            [location],
+        ).fetchall()
+        transition_counts = {c: {c2: 0 for c2 in FLAG_COLORS_ALL} for c in FLAG_COLORS_ALL}
+        for i in range(1, len(flag_history_rows)):
+            prev_ts, prev_color = flag_history_rows[i - 1]
+            cur_ts, cur_color = flag_history_rows[i]
+            gap_seconds = (cur_ts - prev_ts).total_seconds()
+            # Only count genuine ~1-hour-apart consecutive pairs (the
+            # real poll cadence) -- a gap from a missed poll or a long
+            # overnight/closed stretch isn't a real "1 step" transition
+            # and would corrupt the matrix if included.
+            if 1800 <= gap_seconds <= 5400 and prev_color in FLAG_COLORS_ALL and cur_color in FLAG_COLORS_ALL:
+                transition_counts[prev_color][cur_color] += 1
+
+        transition_matrix = {}
+        for prev_color in FLAG_COLORS_ALL:
+            row_counts = transition_counts[prev_color]
+            total = sum(row_counts.values()) + alpha * n_colors
+            transition_matrix[prev_color] = {
+                c: (row_counts[c] + alpha) / total for c in FLAG_COLORS_ALL
+            }
+
+        def markov_project(current_color, n_steps):
+            """P(color after n_steps hourly transitions | starts at
+            current_color), via repeated matrix-vector multiplication.
+            n_steps=0 returns certainty on current_color (identity)."""
+            dist = {c: (1.0 if c == current_color else 0.0) for c in FLAG_COLORS_ALL}
+            for _ in range(max(0, n_steps)):
+                new_dist = {c: 0.0 for c in FLAG_COLORS_ALL}
+                for prev_c, p_prev in dist.items():
+                    if p_prev == 0.0:
+                        continue
+                    for c, p_trans in transition_matrix[prev_c].items():
+                        new_dist[c] += p_prev * p_trans
+                dist = new_dist
+            return dist
+
+        # Current flag color (most recent real reading) anchors the
+        # Markov projection -- None if there's no flag history at all
+        # yet (brand-new deployment), in which case the Markov term is
+        # skipped entirely and this falls back to pure wind-bucket
+        # behavior, same as before this change.
+        current_flag_row = con.execute(
+            "SELECT ts_utc, flag_color FROM flags WHERE location_id = ? "
+            "ORDER BY ts_utc DESC LIMIT 1",
+            [location],
+        ).fetchone()
+        current_flag_ts, current_flag_color = current_flag_row if current_flag_row else (None, None)
+
+        def combine_product_of_experts(wind_probs, markov_probs, colors):
+            """Product-of-experts over the given color subset (e.g. the
+            3 open-hours colors, or all 4) -- multiply each source's
+            probability for a color together, then renormalize over the
+            subset. A product (not an average) is used deliberately: if
+            either source considers a color very unlikely, the combined
+            result should reflect that strongly, not get diluted by the
+            other source alone -- which is exactly the behavior needed to
+            pull a wind-bucket-driven high green probability back down
+            when the Markov term (anchored on a currently-red flag)
+            considers green very unlikely right now."""
+            raw = {c: wind_probs.get(c, 0.0) * markov_probs.get(c, 0.0) for c in colors}
+            total = sum(raw.values())
+            if total <= 0:
+                # Both sources agree this color set is essentially
+                # impossible (shouldn't normally happen with Dirichlet
+                # smoothing keeping every probability > 0, but guard
+                # anyway) -- fall back to the wind-only estimate.
+                return {c: wind_probs.get(c, 0.0) for c in colors}
+            return {c: v / total for c, v in raw.items()}
+
         # 4. Attach a probability distribution to every forecast point.
         # CBI only operates 9am-sunset (per user 2026-09-11); outside
         # that window it's ALWAYS closed regardless of wind, and during
@@ -882,6 +999,19 @@ def api_flag_prediction(params):
                     # degenerate case (shouldn't happen with Dirichlet smoothing,
                     # but guard anyway): fall back to uniform over the 3 open-hour colors
                     probs = {**{c: round(1 / 3, 4) for c in remaining}, "closed": 0.0}
+
+                # Blend in the Markov persistence term -- see the
+                # "MARKOV PERSISTENCE BLENDING" docstring note above.
+                # Skipped if there's no current flag reading at all yet
+                # (brand-new deployment with zero history).
+                if current_flag_color is not None and current_flag_ts is not None:
+                    lead_hours = round((valid_dt - current_flag_ts.replace(tzinfo=timezone.utc)).total_seconds() / 3600)
+                    markov_full = markov_project(current_flag_color, lead_hours)
+                    markov_remaining = {c: markov_full[c] for c in FLAG_COLORS_ALL if c != "closed"}
+                    open_hour_colors = [c for c in FLAG_COLORS_ALL if c != "closed"]
+                    wind_only_probs = {c: probs[c] for c in open_hour_colors}
+                    combined = combine_product_of_experts(wind_only_probs, markov_remaining, open_hour_colors)
+                    probs = {**{c: round(v, 4) for c, v in combined.items()}, "closed": 0.0}
             predictions.append({
                 "valid_time_utc": row["valid_time_utc"],
                 "wind_kt": wind,
@@ -895,6 +1025,8 @@ def api_flag_prediction(params):
             "model": model,
             "training_sample_size": len(training_rows),
             "wind_bucket_width_kt": WIND_BUCKET_WIDTH_KT,
+            "current_flag_color": current_flag_color,
+            "current_flag_ts_utc": current_flag_ts.isoformat() if current_flag_ts else None,
             "marginal_flag_distribution": {
                 c: round(marginal_counts[c] / max(1, sum(marginal_counts.values())), 4)
                 for c in FLAG_COLORS_ALL
