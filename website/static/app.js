@@ -696,6 +696,23 @@ async function loadAccuracyChart() {
   // wind_speed_kt for wind_combo) rather than attempting a combined
   // MAE chart that was never asked for. See VARIABLE_GROUPS' comment
   // for the full rationale on what IS/isn't in scope for the merge.
+  //
+  // VISIBLE NOTE ADDED 2026-10-07 (user: "Model Accuracy by Lead Time
+  // broken for the combined wind and temp charts"). This chart was
+  // never actually broken for combo variables -- it correctly fell
+  // back to the first member -- but gave ZERO visible indication that
+  // it was only showing half of what the Variable dropdown said was
+  // selected, which understandably reads as "broken" rather than
+  // "scoped". Now shows an explicit note whenever a combo variable is
+  // active, naming exactly which member is being charted.
+  const comboNote = d3.select('#accuracy-combo-note');
+  if (isComboVariable(state.variable)) {
+    const group = VARIABLE_GROUPS[state.variable];
+    comboNote.attr('hidden', null)
+      .text(`"${group.label}" isn't combined here -- showing ${fmtVarLabel(group.members[0])} only (its other member, ${fmtVarLabel(group.members[1])}, isn't charted on this panel).`);
+  } else {
+    comboNote.attr('hidden', true);
+  }
   const accuracyVariable = isComboVariable(state.variable)
     ? VARIABLE_GROUPS[state.variable].members[0]
     : state.variable;
@@ -705,8 +722,17 @@ async function loadAccuracyChart() {
   const data = await fetchJSON(url);
   const container = d3.select('#accuracy-chart');
   container.selectAll('*').remove();
-  d3.select('#accuracy-empty').attr('hidden', data.length ? true : null);
-  if (!data.length) return;
+  const empty = d3.select('#accuracy-empty');
+  empty.attr('hidden', data.length ? true : null);
+  if (!data.length) {
+    // BUG FIXED 2026-10-07 (same report as above): separately, this
+    // empty state was ALWAYS just an unhidden blank div with no text
+    // at all, for ANY zero-data case -- not combo-specific, but the
+    // combo note above explains the combo half of the confusion, and
+    // this explains the genuinely-no-data-exists half.
+    empty.text(`No accuracy data for ${fmtVarLabel(accuracyVariable)} at this location/window.`);
+    return;
+  }
 
   const buckets = LEAD_BUCKET_ORDER.filter(b => data.some(d => d.lead_bucket === b));
   const models = Array.from(new Set(data.map(d => d.model))).sort();
