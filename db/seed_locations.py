@@ -20,6 +20,20 @@ LOCATIONS = [
     # a real WeatherFlow-network station on the Charles River between
     # MIT and CBI -- see scripts/ingest_harvard_bridge.py.
     ("harvard_bridge", "Harvard Bridge (SailFlow, Charles River)", 42.35475, -71.09131, "coastal_station"),
+    # ADDED 2026-10-06 (user: "I think courageous sailing is on
+    # sailflow, can they be added as data source" -> "yes, add the new
+    # location"). SailFlow spot #1842, "Courageous Sailing Center" --
+    # found via Courageous Sailing's own public "Whiteboard" conditions
+    # page (https://courageoussailing.org/whiteboard/), which embeds
+    # this exact spot_id in a live SailFlow widget iframe. Unlike every
+    # other location in this table, this is on BOSTON HARBOR (Pier 4,
+    # Charlestown Navy Yard), not the Charles River basin -- a
+    # genuinely different body of water, not a ground-truth substitute
+    # for any existing Charles River location. Coordinates confirmed
+    # via Nominatim lookup for "Courageous Sailing, Pier 4,
+    # Charlestown". Same ingestion mechanism/48h-window limitation as
+    # Harvard Bridge -- see scripts/ingest_courageous_sailing.py.
+    ("courageous_sailing", "Courageous Sailing Center (SailFlow, Boston Harbor)", 42.3715, -71.0509, "coastal_station"),
 ]
 
 

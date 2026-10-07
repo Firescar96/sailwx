@@ -42,6 +42,17 @@ LOCATIONS = {
     "coops_8443970": (42.3539, -71.0503),
     "kbos": (42.3656, -71.0096),
     "cbi_dockhouse": (42.3598, -71.0731),
+    # ADDED 2026-10-06 (user: "I think courageous sailing is on
+    # sailflow, can they be added as data source" -> "yes, add the new
+    # location" -> "yes" to also adding full forecast/accuracy
+    # tracking, matching every other location here). Coordinates match
+    # db/seed_locations.py's entry for this location (Pier 4,
+    # Charlestown Navy Yard, Boston Harbor -- confirmed via Nominatim
+    # geocoding). NOT the same body of water as the Charles River
+    # cluster (mit_pavilion/cbi_dockhouse/harvard_bridge) -- this is
+    # its own genuine forecast grid point, same spirit as ndbc_44013
+    # or kbos being their own distinct spots.
+    "courageous_sailing": (42.3715, -71.0509),
 }
 
 HOURLY_VARS = "wind_speed_10m,wind_gusts_10m,wind_direction_10m,pressure_msl,temperature_2m"
