@@ -94,6 +94,63 @@ function isComboVariable(v) {
   return Object.prototype.hasOwnProperty.call(VARIABLE_GROUPS, v);
 }
 
+// DISPLAY-SIDE SMOOTHING FOR WIND SPEED/GUST OVERLAYS -- ADDED 2026-10-07
+// (user: "this gust chart looks like a mess, too many random dots, is
+// there a way to smooth harvard bridge data out" -> "display side
+// smoothing, taking the high values for wind and high values for
+// gusts" -> "do 30m instead of 15m, and go ahead do it"). Applies ONLY
+// to the raw-sensor overlays on the Forecast Time Series chart
+// (Observed + Harvard Bridge) for wind_speed_kt/wind_gust_kt -- NOT a
+// database change, NOT applied to any other variable, and NOT applied
+// to the sparse hourly model-forecast lines (which never had this
+// density problem in the first place).
+//
+// ROOT CAUSE CONFIRMED (measured 2026-10-07): Harvard Bridge polls at
+// 5-minute native resolution (~565 points/48h), MIT's own Observed
+// sensor is even denser (~1,198 points/48h). A direct browser-console
+// count found these 2 overlays alone accounted for 12,868 of 16,848
+// total SVG circles drawn on a single chart render (76%) -- plotting
+// literally every raw reading as its own <circle> is both the visual
+// "messy cloud of dots" complaint AND a real rendering-cost problem
+// (though NOT a network/API slowness problem -- total page load was
+// separately measured at a consistent ~1.15-1.17s across repeated cold
+// loads, confirmed healthy).
+//
+// METHOD: rolling MAX (not average/median) over fixed 30-minute
+// buckets, per user's explicit "take the high values" direction --
+// this is a genuine "peak tracker" showing the real highest gust that
+// occurred in each window, not a smoothed-out average that would blur
+// away real gust spikes (which is exactly the kind of oversmoothing
+// the user separately pushed back against for MIT's own ingest-side
+// smoothing in an earlier session -- see ingest_mit_all.py's
+// SMOOTH_OUTLIER_MAD_MULTIPLIER comment). Applied identically to BOTH
+// Observed and Harvard Bridge (user: "Both -- same fix, same
+// underlying density problem") and to BOTH wind_speed_kt and
+// wind_gust_kt (not just gust). DISPLAY-ONLY: the raw 5-minute data in
+// the database is completely untouched; this only transforms what
+// gets plotted/drawn. Dots are KEPT on the bucketed series (user:
+// "Keep dots but only one per resampled window") -- just 1 per 30min
+// bucket instead of 1 per 5min raw reading, roughly a 6x reduction.
+const WIND_SMOOTH_VARS = new Set(['wind_speed_kt', 'wind_gust_kt']);
+const WIND_SMOOTH_BUCKET_MINUTES = 30;
+
+function bucketMaxSeries(rows, tsField, bucketMinutes) {
+  const bucketMs = bucketMinutes * 60000;
+  const byBucket = new Map();
+  rows.forEach(d => {
+    if (d.value == null) return;
+    const bucketStart = Math.floor(d[`${tsField}_date`].getTime() / bucketMs) * bucketMs;
+    const existing = byBucket.get(bucketStart);
+    // Keep whichever row in this bucket has the HIGHEST value -- a
+    // real peak-tracker, not an average. The row's OWN original
+    // timestamp is preserved (not snapped to the bucket boundary), so
+    // tooltips/hover still show exactly when the real peak reading
+    // occurred, not a synthetic bucket-start time.
+    if (!existing || d.value > existing.value) byBucket.set(bucketStart, d);
+  });
+  return Array.from(byBucket.values()).sort((a, b) => a[`${tsField}_date`] - b[`${tsField}_date`]);
+}
+
 // 'other' (negative lead-time / hindcast backfill rows -- past_days/
 // past_hours data added so the forecast time-series chart can show
 // historical model context, see ingest_forecasts.py) is intentionally
@@ -847,6 +904,25 @@ async function loadForecastChart() {
   obs.forEach(d => { d.ts_utc_date = new Date(d.ts_utc + 'Z'); });
   flagHistory.forEach(d => { d.ts_utc_date = new Date(d.ts_utc + 'Z'); });
   harvardBridge.forEach(d => { d.ts_utc_date = new Date(d.ts_utc + 'Z'); });
+
+  // DISPLAY-SIDE WIND/GUST SMOOTHING -- see bucketMaxSeries()'s
+  // definition near the top of this file for the full rationale.
+  // Bucketed PER MEMBER (a combo variable's obs/harvardBridge arrays
+  // contain rows from multiple member variables concatenated together
+  // -- bucketing the whole array at once would let a wind_speed_kt
+  // reading and a wind_gust_kt reading in the same 30-min window
+  // compete against each other for "the max", which is meaningless
+  // since they're different units/quantities). Only wind_speed_kt/
+  // wind_gust_kt get bucketed; every other variable (including
+  // temp_combo's members) passes through completely unchanged.
+  obs = [].concat(...memberVars.map(mv => {
+    const memberRows = obs.filter(d => d.__member === mv);
+    return WIND_SMOOTH_VARS.has(mv) ? bucketMaxSeries(memberRows, 'ts_utc', WIND_SMOOTH_BUCKET_MINUTES) : memberRows;
+  }));
+  harvardBridge = [].concat(...memberVars.map(mv => {
+    const memberRows = harvardBridge.filter(d => d.__member === mv);
+    return WIND_SMOOTH_VARS.has(mv) ? bucketMaxSeries(memberRows, 'ts_utc', WIND_SMOOTH_BUCKET_MINUTES) : memberRows;
+  }));
 
   // X-axis domain: computed EXPLICITLY from the selected forward/backward
   // windows (now +/- hours), not derived from d3.extent() of whatever
