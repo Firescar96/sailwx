@@ -35,6 +35,65 @@ const VARIABLE_LABELS = {
   lightning_strikes: 'Lightning Strikes',
 };
 
+// COMBINED-VARIABLE GROUPS -- ADDED 2026-10-06 (user: "most of the
+// variables dont touch but i want to show air temp and water temp on
+// the same chart under Forecast Time Series and Forecast Stability...
+// similarly Wind Gust and Wind Speed should be on the same chart").
+// Each group replaces its 2 member variables as separate Variable
+// dropdown entries with ONE combined entry (user confirmed: "Replace
+// the 4 individual entries with 2 combined entries" -- the old
+// individual air_temp_f/water_temp_f/wind_speed_kt/wind_gust_kt
+// options are gone from the dropdown entirely, see
+// allVariablesUnion()/refreshVariableOptions() below). Both members of
+// a group share one Y-axis (user: "shared y axis" -- both pairs are
+// already same-unit, °F and kt respectively, so this was the natural
+// choice anyway). Each group's 2 members are visually distinguished by
+// LINE STYLE, not color (user: "Solid line = first variable... dashed
+// line = second variable... same color per model") -- color still
+// encodes model (or Observed/Harvard Bridge) exactly as every other
+// chart on this dashboard already does, so a combined chart stays
+// visually consistent with every single-variable chart instead of
+// introducing a second, conflicting color scheme.
+//
+// SCOPE (user confirmed): ONLY these 2 pairs combine. Every other
+// variable (pressure, direction, humidity, solar radiation, etc.)
+// stays exactly as it was -- individually selectable, completely
+// unaffected by any of this.
+//
+// Water temp is available at MIT Pavilion AND NDBC 44013 (confirmed
+// via a direct query: mit_pavilion has 17270 water_temp_f readings,
+// ndbc_44013 has 10454) -- both locations' temp_combo charts show
+// real water temp data, not just MIT's.
+const VARIABLE_GROUPS = {
+  temp_combo: {
+    label: 'Air + Water Temp',
+    members: ['air_temp_f', 'water_temp_f'],
+    unitLabel: '°F',
+  },
+  wind_combo: {
+    label: 'Wind Speed + Gust',
+    members: ['wind_speed_kt', 'wind_gust_kt'],
+    unitLabel: 'kt',
+  },
+};
+// Solid for the group's first member, dashed for its second -- applied
+// identically to EVERY series type (model forecast lines, the
+// Observed overlay, the Harvard Bridge overlay) when rendering a
+// combo variable. This repurposes the dash pattern that single-
+// variable charts use to mean "this is the Observed overlay, not a
+// model forecast" -- that distinction is still made via color (grey
+// for Observed, amber for Harvard Bridge, MODEL_COLORS for models) and
+// the legend labels, so no information is actually lost, just
+// re-encoded since dash is now needed for the variable-member signal
+// instead. Single-variable charts (the vast majority of this
+// dashboard) are completely unaffected -- this array is only consulted
+// on the new combo-aware rendering paths.
+const MEMBER_DASH_PATTERNS = [null, '5,3'];
+
+function isComboVariable(v) {
+  return Object.prototype.hasOwnProperty.call(VARIABLE_GROUPS, v);
+}
+
 // 'other' (negative lead-time / hindcast backfill rows -- past_days/
 // past_hours data added so the forecast time-series chart can show
 // historical model context, see ingest_forecasts.py) is intentionally
@@ -49,6 +108,7 @@ function getCssVar(name) {
 }
 
 function fmtVarLabel(v) {
+  if (isComboVariable(v)) return VARIABLE_GROUPS[v].label;
   return VARIABLE_LABELS[v] || v;
 }
 
@@ -444,6 +504,18 @@ function allVariablesUnion() {
   // if a given location has no accuracy rows yet for them.
   s.add('wind_speed_kt');
   s.add('wind_gust_kt');
+
+  // COMBINED-VARIABLE GROUPS -- ADDED 2026-10-06, see VARIABLE_GROUPS'
+  // definition above for the full rationale. Each group's 2 individual
+  // member variables are REMOVED from the selectable set and replaced
+  // with ONE combined entry (the group's own key, e.g. "temp_combo")
+  // -- per explicit user direction, the old individual
+  // air_temp_f/water_temp_f/wind_speed_kt/wind_gust_kt options are
+  // gone entirely, not kept alongside the combined ones.
+  Object.entries(VARIABLE_GROUPS).forEach(([groupKey, group]) => {
+    group.members.forEach(m => s.delete(m));
+    s.add(groupKey);
+  });
   return Array.from(s);
 }
 
@@ -560,9 +632,19 @@ async function loadCurrentConditions() {
 
 async function loadAccuracyChart() {
   const hours = d3.select('#accuracy-hours-select').property('value');
+  // Model Accuracy wasn't part of the combined-variable request (user
+  // named Forecast Time Series and Forecast Stability specifically) --
+  // when a combo variable is selected, this chart shows accuracy for
+  // just the group's FIRST member (e.g. air_temp_f for temp_combo,
+  // wind_speed_kt for wind_combo) rather than attempting a combined
+  // MAE chart that was never asked for. See VARIABLE_GROUPS' comment
+  // for the full rationale on what IS/isn't in scope for the merge.
+  const accuracyVariable = isComboVariable(state.variable)
+    ? VARIABLE_GROUPS[state.variable].members[0]
+    : state.variable;
   const url = hours
-    ? `/api/accuracy?location=${state.location}&variable=${state.variable}&hours=${hours}`
-    : `/api/accuracy?location=${state.location}&variable=${state.variable}&hours=`;
+    ? `/api/accuracy?location=${state.location}&variable=${accuracyVariable}&hours=${hours}`
+    : `/api/accuracy?location=${state.location}&variable=${accuracyVariable}&hours=`;
   const data = await fetchJSON(url);
   const container = d3.select('#accuracy-chart');
   container.selectAll('*').remove();
@@ -691,14 +773,26 @@ async function loadForecastChart() {
   // Skipped entirely when viewing harvard_bridge itself (that's just
   // its own "Observed" series already).
   const HARVARD_BRIDGE_VARS = new Set(['wind_speed_kt', 'wind_gust_kt', 'pressure_hpa']);
+  // COMBINED VARIABLES -- ADDED 2026-10-06, see VARIABLE_GROUPS'
+  // definition for the full rationale. A combo variable (e.g.
+  // "temp_combo") isn't a real backend variable name -- the API only
+  // knows about its individual MEMBERS (air_temp_f, water_temp_f).
+  // `memberVars` is [state.variable] for a normal single variable (the
+  // existing, unchanged behavior) or the group's 2 real member
+  // variable names when a combo is selected. Defined early (before
+  // showHarvardBridge below) since that check now needs to consider
+  // every member, not just state.variable itself.
+  const memberVars = isComboVariable(state.variable) ? VARIABLE_GROUPS[state.variable].members : [state.variable];
   const showHarvardBridge = (state.location === 'mit_pavilion' || state.location === 'cbi_dockhouse')
-    && HARVARD_BRIDGE_VARS.has(state.variable);
+    && memberVars.some(v => HARVARD_BRIDGE_VARS.has(v));
   // Wind-direction overlay -- ADDED 2026-09-27 (user: "build in that
   // wind direction scraping ... show that data overlayed mit wind
   // data"). Handled as its own flag (not folded into HARVARD_BRIDGE_VARS
   // above) since wind_dir_deg renders through the completely separate
   // renderWindDirectionChart row/arrow layout, not this function's own
   // line-chart rendering -- see the dedicated overlay row added there.
+  // wind_dir_deg is never part of a combo group, so state.variable is
+  // used directly here (unchanged from before).
   const showHarvardBridgeDir = state.location === 'mit_pavilion' && state.variable === 'wind_dir_deg';
   // Flag history window follows ONLY "Also show past" (obsHours), not
   // the forward-looking forecast window (`hours`) at all. Previously
@@ -709,18 +803,40 @@ async function loadForecastChart() {
   // "the flag is still showing since beginning of data, not for the
   // time period I want"). Flags have no future data anyway, so there
   // was never a reason to couple this to the forward-looking `hours`.
-  let [forecast, obs, flagHistory, harvardBridge] = await Promise.all([
-    fetchJSON(`/api/forecast?location=${state.location}&variable=${state.variable}&hours=${hours}&past_hours=${pastHours}`),
-    obsHours > 0
-      ? fetchJSON(`/api/observations?location=${state.location}&variable=${state.variable}&hours=${obsHours}`)
-      : Promise.resolve([]), // Off (0) means genuinely no observed overlay, not "hours=0" API edge case
+  //
+  // Every fetch below runs ONCE PER MEMBER (in parallel, memberVars was
+  // defined above alongside showHarvardBridge) and each returned row
+  // gets a `__member` tag so the rendering code below knows which of
+  // the 2 lines/dash-patterns it belongs to (or just state.variable
+  // itself, tagged the same way, for the normal non-combo case).
+
+  const fetchForMember = async (memberVar) => {
+    const memberHarvardBridgeVars = HARVARD_BRIDGE_VARS.has(memberVar);
+    const [fc, ob, hb] = await Promise.all([
+      fetchJSON(`/api/forecast?location=${state.location}&variable=${memberVar}&hours=${hours}&past_hours=${pastHours}`),
+      obsHours > 0
+        ? fetchJSON(`/api/observations?location=${state.location}&variable=${memberVar}&hours=${obsHours}`)
+        : Promise.resolve([]), // Off (0) means genuinely no observed overlay, not "hours=0" API edge case
+      (showHarvardBridge || showHarvardBridgeDir) && memberHarvardBridgeVars && obsHours > 0
+        ? fetchJSON(`/api/observations?location=harvard_bridge&variable=${memberVar}&hours=${obsHours}`)
+        : Promise.resolve([]),
+    ]);
+    fc.forEach(d => { d.__member = memberVar; });
+    ob.forEach(d => { d.__member = memberVar; });
+    hb.forEach(d => { d.__member = memberVar; });
+    return [fc, ob, hb];
+  };
+
+  const [memberResults, flagHistoryFetched] = await Promise.all([
+    Promise.all(memberVars.map(fetchForMember)),
     showFlagBands
       ? fetchJSON(`/api/flags-history?location=${state.location}&hours=${obsHours}`)
       : Promise.resolve([]),
-    (showHarvardBridge || showHarvardBridgeDir) && obsHours > 0
-      ? fetchJSON(`/api/observations?location=harvard_bridge&variable=${state.variable}&hours=${obsHours}`)
-      : Promise.resolve([]),
   ]);
+  let forecast = [].concat(...memberResults.map(r => r[0]));
+  let obs = [].concat(...memberResults.map(r => r[1]));
+  let harvardBridge = [].concat(...memberResults.map(r => r[2]));
+  let flagHistory = flagHistoryFetched;
 
   const container = d3.select('#forecast-chart');
   container.selectAll('*').remove();
@@ -770,7 +886,16 @@ async function loadForecastChart() {
   harvardBridge = harvardBridge.filter(d => d.ts_utc_date >= minDate && d.ts_utc_date <= maxDate);
 
   const models = Array.from(new Set(forecast.map(d => d.model))).sort();
-  const byModel = d3.group(forecast, d => d.model);
+  // Grouped by (model, member) -- a combo variable renders 2 lines per
+  // model (one per member, e.g. GFS's air temp AND GFS's water temp),
+  // distinguished by dash pattern (see MEMBER_DASH_PATTERNS) rather
+  // than color, since color still means "which model" exactly as every
+  // other chart on this dashboard. For a normal single variable,
+  // memberVars has exactly 1 entry, so this nested grouping reduces to
+  // the previous plain byModel behavior.
+  const byModelMember = d3.group(forecast, d => d.model, d => d.__member);
+  const memberDash = memberVar => MEMBER_DASH_PATTERNS[memberVars.indexOf(memberVar)] || null;
+  const memberSuffix = memberVar => memberVars.length > 1 ? ` (${fmtVarLabel(memberVar)})` : '';
 
   const width = Math.min(900, container.node().clientWidth || 900);
   const flagStripSpace = showFlagBands ? 22 : 0; // extra room below the axis for the flag strip + its own label
@@ -803,16 +928,21 @@ async function loadForecastChart() {
   // this entirely -- each one is drawn at a fixed row (one per model +
   // observed) and simply rotated to point the real direction, with no
   // false "high vs low" numeric axis for a value that has no natural
-  // ordering.
+  // ordering. (wind_dir_deg is never part of a combo group, so this
+  // check against state.variable directly is unaffected by any of the
+  // combo-variable changes above.)
   if (state.variable === 'wind_dir_deg') {
-    renderWindDirectionChart(container, tooltip, models, byModel, obs, flagHistory, x, width, height, margin, minDate, maxDate, hours, pastHours, showFlagBands, harvardBridge, showHarvardBridgeDir);
+    renderWindDirectionChart(container, tooltip, models, d3.group(forecast, d => d.model), obs, flagHistory, x, width, height, margin, minDate, maxDate, hours, pastHours, showFlagBands, harvardBridge, showHarvardBridgeDir);
     return;
   }
 
   // Y-axis domain only considers currently-VISIBLE series (respecting
   // hiddenModels) so toggling a model off via the legend rescales the
   // chart sensibly around what's actually shown, instead of leaving
-  // dead space sized for a hidden series' range.
+  // dead space sized for a hidden series' range. SHARED across both
+  // members of a combo variable (user: "shared y axis") -- forecast/obs
+  // here already include every member's rows (concatenated above), so
+  // this one domain naturally spans both.
   const visibleForecast = forecast.filter(d => !state.hiddenModels.has(d.model));
   const visibleObs = state.hiddenModels.has('observed') ? [] : obs;
   const allValues = visibleForecast.map(d => d.value).concat(visibleObs.map(d => d.value)).filter(v => v != null);
@@ -938,80 +1068,99 @@ async function loadForecastChart() {
 
   models.forEach(m => {
     if (state.hiddenModels.has(m)) return; // toggled off via legend click
-    const series = (byModel.get(m) || []).slice().sort((a, b) => a.valid_time_utc_date - b.valid_time_utc_date);
-    svg.append('path')
-      .datum(m)
-      .attr('class', 'model-line')
-      .attr('fill', 'none')
-      .attr('stroke', MODEL_COLORS[m] || '#888')
-      .attr('stroke-width', 2)
-      .attr('d', () => line(series))
-      .style('cursor', 'pointer')
-      .on('mouseenter', () => setHighlight(m))
-      .on('mouseleave', () => setHighlight(null));
+    memberVars.forEach(memberVar => {
+      const series = ((byModelMember.get(m) || new Map()).get(memberVar) || []).slice()
+        .sort((a, b) => a.valid_time_utc_date - b.valid_time_utc_date);
+      if (!series.length) return; // this model has no data for this member (e.g. no water temp forecast)
+      svg.append('path')
+        .datum(m)
+        .attr('class', 'model-line')
+        .attr('fill', 'none')
+        .attr('stroke', MODEL_COLORS[m] || '#888')
+        .attr('stroke-width', 2)
+        .attr('stroke-dasharray', memberDash(memberVar))
+        .attr('d', () => line(series))
+        .style('cursor', 'pointer')
+        .on('mouseenter', () => setHighlight(m))
+        .on('mouseleave', () => setHighlight(null));
 
-    series.forEach(d => { d.__model = m; });
-    svg.append('g')
-      .selectAll('circle')
-      .data(series)
-      .join('circle')
-      .attr('class', 'model-dot')
-      .attr('cx', d => x(d.valid_time_utc_date))
-      .attr('cy', d => y(d.value))
-      .attr('r', 3)
-      .attr('fill', MODEL_COLORS[m] || '#888')
-      .style('cursor', 'default')
-      .on('mouseenter', () => setHighlight(m))
-      .on('mousemove', (event, d) => {
-        tooltip.style('opacity', 1)
-          .html(`<b>${m.toUpperCase()}</b><br>${d.valid_time_utc}<br>value: ${d.value}`)
-          .style('left', (event.pageX + 12) + 'px')
-          .style('top', (event.pageY - 10) + 'px');
-      })
-      .on('mouseleave', () => { tooltip.style('opacity', 0); setHighlight(null); });
+      series.forEach(d => { d.__model = m; });
+      svg.append('g')
+        .selectAll('circle')
+        .data(series)
+        .join('circle')
+        .attr('class', 'model-dot')
+        .attr('cx', d => x(d.valid_time_utc_date))
+        .attr('cy', d => y(d.value))
+        .attr('r', 3)
+        .attr('fill', MODEL_COLORS[m] || '#888')
+        .style('cursor', 'default')
+        .on('mouseenter', () => setHighlight(m))
+        .on('mousemove', (event, d) => {
+          tooltip.style('opacity', 1)
+            .html(`<b>${m.toUpperCase()}${memberSuffix(memberVar)}</b><br>${d.valid_time_utc}<br>value: ${d.value}`)
+            .style('left', (event.pageX + 12) + 'px')
+            .style('top', (event.pageY - 10) + 'px');
+        })
+        .on('mouseleave', () => { tooltip.style('opacity', 0); setHighlight(null); });
+    });
   });
 
   // observation overlay (dashed grey line + dots), participates in the
   // same hover-to-highlight system as the model lines -- previously had
   // no interactive elements at all, so hovering it (or its legend entry)
   // did nothing.
+  //
+  // COMBO VARIABLES: the Observed overlay already uses a dash pattern
+  // to mean "this is observed data, not a model forecast" (every
+  // single-variable chart). For a combo variable, each member gets its
+  // OWN sub-line, so the base dash means "Observed" and a secondary
+  // dash variant (OBS_MEMBER_DASH) layers the member distinction on top
+  // -- both still grey, still toggle/highlight together as one
+  // "Observed" legend entry, just 2 visually distinct dash rhythms for
+  // the 2 members.
   const OBS_KEY = 'observed';
+  const OBS_MEMBER_DASH = ['4,3', '2,2,6,2']; // [first member, second member] -- only used when memberVars.length > 1
   if (obs.length && !state.hiddenModels.has(OBS_KEY)) {
     const obsLine = d3.line()
       .x(d => x(d.ts_utc_date))
       .y(d => y(d.value))
       .defined(d => d.value != null);
-    svg.append('path')
-      .datum(OBS_KEY)
-      .attr('class', 'model-line')
-      .attr('fill', 'none')
-      .attr('stroke', '#9aa5ab')
-      .attr('stroke-width', 1.5)
-      .attr('stroke-dasharray', '4,3')
-      .attr('d', () => obsLine(obs))
-      .style('cursor', 'pointer')
-      .on('mouseenter', () => setHighlight(OBS_KEY))
-      .on('mouseleave', () => setHighlight(null));
+    memberVars.forEach((memberVar, i) => {
+      const series = obs.filter(d => d.__member === memberVar);
+      if (!series.length) return;
+      svg.append('path')
+        .datum(OBS_KEY)
+        .attr('class', 'model-line')
+        .attr('fill', 'none')
+        .attr('stroke', '#9aa5ab')
+        .attr('stroke-width', 1.5)
+        .attr('stroke-dasharray', memberVars.length > 1 ? OBS_MEMBER_DASH[i] : '4,3')
+        .attr('d', () => obsLine(series))
+        .style('cursor', 'pointer')
+        .on('mouseenter', () => setHighlight(OBS_KEY))
+        .on('mouseleave', () => setHighlight(null));
 
-    obs.forEach(d => { d.__model = OBS_KEY; });
-    svg.append('g')
-      .selectAll('circle')
-      .data(obs.filter(d => d.value != null))
-      .join('circle')
-      .attr('class', 'model-dot')
-      .attr('cx', d => x(d.ts_utc_date))
-      .attr('cy', d => y(d.value))
-      .attr('r', 2.5)
-      .attr('fill', '#9aa5ab')
-      .style('cursor', 'pointer')
-      .on('mouseenter', () => setHighlight(OBS_KEY))
-      .on('mousemove', (event, d) => {
-        tooltip.style('opacity', 1)
-          .html(`<b>${observedLabel(state.location)}</b><br>${d.ts_utc}<br>value: ${d.value}`)
-          .style('left', (event.pageX + 12) + 'px')
-          .style('top', (event.pageY - 10) + 'px');
-      })
-      .on('mouseleave', () => { tooltip.style('opacity', 0); setHighlight(null); });
+      series.forEach(d => { d.__model = OBS_KEY; });
+      svg.append('g')
+        .selectAll('circle')
+        .data(series.filter(d => d.value != null))
+        .join('circle')
+        .attr('class', 'model-dot')
+        .attr('cx', d => x(d.ts_utc_date))
+        .attr('cy', d => y(d.value))
+        .attr('r', 2.5)
+        .attr('fill', '#9aa5ab')
+        .style('cursor', 'pointer')
+        .on('mouseenter', () => setHighlight(OBS_KEY))
+        .on('mousemove', (event, d) => {
+          tooltip.style('opacity', 1)
+            .html(`<b>${observedLabel(state.location)}${memberSuffix(memberVar)}</b><br>${d.ts_utc}<br>value: ${d.value}`)
+            .style('left', (event.pageX + 12) + 'px')
+            .style('top', (event.pageY - 10) + 'px');
+        })
+        .on('mouseleave', () => { tooltip.style('opacity', 0); setHighlight(null); });
+    });
   }
 
   // Harvard Bridge overlay -- ADDED 2026-09-27 (user: "on MIT location
@@ -1019,45 +1168,53 @@ async function loadForecastChart() {
   // Same visual treatment as the main "Observed" overlay above (dashed
   // line + dots, participates in hover-to-highlight/legend toggle), but
   // a distinct color (amber) so it's never confused with the location's
-  // own Observed series when both are visible at once.
+  // own Observed series when both are visible at once. Harvard Bridge
+  // has no temperature sensor, so it only ever applies to wind_combo,
+  // never temp_combo -- but the same per-member loop below handles
+  // either case correctly regardless.
   const HB_KEY = 'harvard_bridge';
   const HB_COLOR = '#d9822b';
+  const HB_MEMBER_DASH = ['2,2', '1,1,4,1']; // [first member, second member]
   if (showHarvardBridge && harvardBridge.length && !state.hiddenModels.has(HB_KEY)) {
     const hbLine = d3.line()
       .x(d => x(d.ts_utc_date))
       .y(d => y(d.value))
       .defined(d => d.value != null);
-    svg.append('path')
-      .datum(HB_KEY)
-      .attr('class', 'model-line')
-      .attr('fill', 'none')
-      .attr('stroke', HB_COLOR)
-      .attr('stroke-width', 1.5)
-      .attr('stroke-dasharray', '2,2')
-      .attr('d', () => hbLine(harvardBridge))
-      .style('cursor', 'pointer')
-      .on('mouseenter', () => setHighlight(HB_KEY))
-      .on('mouseleave', () => setHighlight(null));
+    memberVars.forEach((memberVar, i) => {
+      const series = harvardBridge.filter(d => d.__member === memberVar);
+      if (!series.length) return;
+      svg.append('path')
+        .datum(HB_KEY)
+        .attr('class', 'model-line')
+        .attr('fill', 'none')
+        .attr('stroke', HB_COLOR)
+        .attr('stroke-width', 1.5)
+        .attr('stroke-dasharray', memberVars.length > 1 ? HB_MEMBER_DASH[i] : '2,2')
+        .attr('d', () => hbLine(series))
+        .style('cursor', 'pointer')
+        .on('mouseenter', () => setHighlight(HB_KEY))
+        .on('mouseleave', () => setHighlight(null));
 
-    harvardBridge.forEach(d => { d.__model = HB_KEY; });
-    svg.append('g')
-      .selectAll('circle')
-      .data(harvardBridge.filter(d => d.value != null))
-      .join('circle')
-      .attr('class', 'model-dot')
-      .attr('cx', d => x(d.ts_utc_date))
-      .attr('cy', d => y(d.value))
-      .attr('r', 2.5)
-      .attr('fill', HB_COLOR)
-      .style('cursor', 'pointer')
-      .on('mouseenter', () => setHighlight(HB_KEY))
-      .on('mousemove', (event, d) => {
-        tooltip.style('opacity', 1)
-          .html(`<b>Harvard Bridge</b><br>${d.ts_utc}<br>value: ${d.value}`)
-          .style('left', (event.pageX + 12) + 'px')
-          .style('top', (event.pageY - 10) + 'px');
-      })
-      .on('mouseleave', () => { tooltip.style('opacity', 0); setHighlight(null); });
+      series.forEach(d => { d.__model = HB_KEY; });
+      svg.append('g')
+        .selectAll('circle')
+        .data(series.filter(d => d.value != null))
+        .join('circle')
+        .attr('class', 'model-dot')
+        .attr('cx', d => x(d.ts_utc_date))
+        .attr('cy', d => y(d.value))
+        .attr('r', 2.5)
+        .attr('fill', HB_COLOR)
+        .style('cursor', 'pointer')
+        .on('mouseenter', () => setHighlight(HB_KEY))
+        .on('mousemove', (event, d) => {
+          tooltip.style('opacity', 1)
+            .html(`<b>Harvard Bridge${memberSuffix(memberVar)}</b><br>${d.ts_utc}<br>value: ${d.value}`)
+            .style('left', (event.pageX + 12) + 'px')
+            .style('top', (event.pageY - 10) + 'px');
+        })
+        .on('mouseleave', () => { tooltip.style('opacity', 0); setHighlight(null); });
+    });
   }
 
   // Legend: hover-to-highlight (existing behavior) PLUS click-to-toggle
@@ -1112,6 +1269,24 @@ async function loadForecastChart() {
       item.append('span').attr('class', 'legend-swatch')
         .style('background', FLAG_COLORS[color] || '#888');
       item.append('span').text(`${color.toUpperCase()} flag`);
+    });
+  }
+
+  // COMBO VARIABLE dash-style key -- ADDED 2026-10-06. Color already
+  // means "which model/Observed/Harvard Bridge" (unchanged); when 2
+  // variables share this chart, line style (solid vs dashed) is the
+  // ONLY remaining visual signal for "which variable", so it needs its
+  // own small explanatory legend rather than relying on the user to
+  // infer the convention from the tooltip text alone.
+  if (memberVars.length > 1) {
+    const dashKey = container.append('div').attr('class', 'legend').style('margin-top', '-4px');
+    memberVars.forEach((memberVar, i) => {
+      const item = dashKey.append('div').attr('class', 'legend-item').style('cursor', 'default');
+      const swatch = item.append('span').attr('class', 'legend-swatch')
+        .style('background', 'none')
+        .style('border-top', i === 0 ? '2px solid var(--text)' : '2px dashed var(--text)')
+        .style('height', '0');
+      item.append('span').text(fmtVarLabel(memberVar));
     });
   }
 }
@@ -1563,20 +1738,35 @@ async function loadStabilityChart() {
   const hours = d3.select('#stability-hours-select').property('value');
   if (!state.location || !state.variable) return;
 
-  const data = await fetchJSON(
-    `/api/forecast-stability?location=${state.location}&variable=${state.variable}&num_runs=${numRuns}&hours=${hours}`
-  );
+  // COMBINED VARIABLES -- ADDED 2026-10-06, see VARIABLE_GROUPS'
+  // definition for the full rationale. Same approach as the Forecast
+  // Time Series chart: fetch each member variable's own stability data
+  // in parallel and tag every row with which member it came from, so
+  // this single chart can render both on one shared Y-axis.
+  const memberVars = isComboVariable(state.variable) ? VARIABLE_GROUPS[state.variable].members : [state.variable];
+  const memberDash = memberVar => MEMBER_DASH_PATTERNS[memberVars.indexOf(memberVar)] || null;
+  const memberSuffix = memberVar => memberVars.length > 1 ? ` (${fmtVarLabel(memberVar)})` : '';
+
+  const memberResults = await Promise.all(memberVars.map(async (memberVar) => {
+    const d = await fetchJSON(
+      `/api/forecast-stability?location=${state.location}&variable=${memberVar}&num_runs=${numRuns}&hours=${hours}`
+    );
+    if (d.rows) d.rows.forEach(r => { r.__member = memberVar; });
+    return d;
+  }));
   if (myToken !== stabilityRequestToken) return; // a newer request has since started/finished
 
   const container = d3.select('#stability-chart');
   container.selectAll('*').remove();
   const empty = d3.select('#stability-empty');
 
-  if (data.error) {
-    empty.attr('hidden', null).text(data.error);
+  const firstError = memberResults.find(d => d.error);
+  if (firstError) {
+    empty.attr('hidden', null).text(firstError.error);
     return;
   }
-  if (!data.rows || !data.rows.length) {
+  const rows = [].concat(...memberResults.map(d => d.rows || []));
+  if (!rows.length) {
     empty.attr('hidden', null).text(
       `Not enough forecast run history yet to compare the last ${numRuns} runs for this location/variable.`
     );
@@ -1584,14 +1774,23 @@ async function loadStabilityChart() {
   }
   empty.attr('hidden', true);
 
-  const rows = data.rows;
   rows.forEach(d => { d.valid_time_utc_date = new Date(d.valid_time_utc + 'Z'); });
   const models = Array.from(new Set(rows.map(d => d.model))).sort();
-  const byModel = d3.group(rows, d => d.model);
+  // Grouped by (model, member) -- mirrors the Forecast Time Series
+  // chart's byModelMember, see that comment for the full rationale.
+  const byModelMember = d3.group(rows, d => d.model, d => d.__member);
+  // runs_used_by_model (for the legend's "(N runs)" note) only needs to
+  // come from ONE member's response when combined -- both members of a
+  // combo variable share the same underlying forecast_runs for a given
+  // model, so this is identical across members regardless of which one
+  // is used here.
+  const runsUsedByModel = (memberResults.find(d => d.runs_used_by_model) || {}).runs_used_by_model || {};
   // Recompute the Y-axis domain from only VISIBLE models' rows (matches
   // the Forecast Time Series chart's behavior: hiding a model rescales
   // the chart to fit what's actually still shown, instead of leaving
-  // dead space sized for a hidden series).
+  // dead space sized for a hidden series). SHARED across both members
+  // of a combo variable (user: "shared y axis") -- rows here already
+  // include every member's data (concatenated above).
   const visibleRows = rows.filter(d => !state.hiddenStabilityModels.has(d.model));
   const yDomainRows = visibleRows.length ? visibleRows : rows;
 
@@ -1664,69 +1863,74 @@ async function loadStabilityChart() {
 
   models.forEach(m => {
     if (state.hiddenStabilityModels.has(m)) return; // toggled off via legend click
-    const series = (byModel.get(m) || []).slice().sort((a, b) => a.valid_time_utc_date - b.valid_time_utc_date);
-    const color = MODEL_COLORS[m] || '#888';
+    memberVars.forEach(memberVar => {
+      const series = ((byModelMember.get(m) || new Map()).get(memberVar) || []).slice()
+        .sort((a, b) => a.valid_time_utc_date - b.valid_time_utc_date);
+      if (!series.length) return; // this model has no data for this member
+      const color = MODEL_COLORS[m] || '#888';
 
-    // shaded min-max spread band -- the actual "stability" signal: wide =
-    // this model's own predictions for that hour disagreed across its
-    // last few runs, tight = it's been consistent.
-    svg.append('path')
-      .datum(m)
-      .attr('class', 'stability-band')
-      .attr('fill', color)
-      .attr('opacity', 0.28)
-      .attr('d', () => areaGen(series))
-      .style('pointer-events', 'none');
+      // shaded min-max spread band -- the actual "stability" signal: wide =
+      // this model's own predictions for that hour disagreed across its
+      // last few runs, tight = it's been consistent.
+      svg.append('path')
+        .datum(m)
+        .attr('class', 'stability-band')
+        .attr('fill', color)
+        .attr('opacity', 0.28)
+        .attr('d', () => areaGen(series))
+        .style('pointer-events', 'none');
 
-    // average-value line on top, for a clean reference of "where the
-    // model currently sits" independent of the band's width.
-    svg.append('path')
-      .datum(m)
-      .attr('class', 'stability-line')
-      .attr('fill', 'none')
-      .attr('stroke', color)
-      .attr('stroke-width', 1.75)
-      .attr('d', () => lineGen(series))
-      .style('cursor', 'pointer')
-      .on('mouseenter', () => setStabilityHighlight(m))
-      .on('mouseleave', () => setStabilityHighlight(null));
+      // average-value line on top, for a clean reference of "where the
+      // model currently sits" independent of the band's width.
+      svg.append('path')
+        .datum(m)
+        .attr('class', 'stability-line')
+        .attr('fill', 'none')
+        .attr('stroke', color)
+        .attr('stroke-width', 1.75)
+        .attr('stroke-dasharray', memberDash(memberVar))
+        .attr('d', () => lineGen(series))
+        .style('cursor', 'pointer')
+        .on('mouseenter', () => setStabilityHighlight(m))
+        .on('mouseleave', () => setStabilityHighlight(null));
 
-    svg.append('g')
-      .selectAll('circle')
-      .data(series)
-      .join('circle')
-      .attr('cx', d => x(d.valid_time_utc_date))
-      .attr('cy', d => y(d.avg_value))
-      .attr('r', 3)
-      .attr('fill', color)
-      .style('cursor', 'pointer')
-      .on('mouseenter', () => setStabilityHighlight(m))
-      .on('mousemove', (event, d) => {
-        // n_runs_with_this_hour can now be LESS than the requested
-        // numRuns -- ADDED 2026-09-24 (user: "hrdps shows more on the
-        // top graph of forecast prediction than on forecast stability,
-        // seems trimmed"): the backend used to require an hour to
-        // appear in ALL numRuns selected runs before showing ANY spread
-        // for it, which truncated short-forecast-horizon models (HRDPS,
-        // ~48h reach per run) to whatever the OLDEST selected run
-        // happened to cover, even when 2-3 newer runs covered further.
-        // Now only requires >=2 runs, so a point CAN legitimately be
-        // backed by fewer runs than requested -- surfaced here so it's
-        // clear "this point exists but is a slightly less-informed
-        // spread estimate" rather than looking identical to a fully
-        // n-run-backed point.
-        const runsNote = d.n_runs_with_this_hour < +numRuns
-          ? `<br><span style="color:var(--muted)">(only ${d.n_runs_with_this_hour}/${numRuns} runs reach this far ahead)</span>`
-          : '';
-        tooltip.style('opacity', 1)
-          .html(`<b>${m.toUpperCase()}</b><br>${d.valid_time_utc}<br>` +
-                `avg: ${d.avg_value} ${fmtVarLabel(state.variable)}<br>` +
-                `range across last ${numRuns} runs: ${d.min_value} - ${d.max_value} (spread ${d.spread})<br>` +
-                `stddev: ${d.stddev_value}${runsNote}`)
-          .style('left', (event.pageX + 12) + 'px')
-          .style('top', (event.pageY - 10) + 'px');
-      })
-      .on('mouseleave', () => { tooltip.style('opacity', 0); setStabilityHighlight(null); });
+      svg.append('g')
+        .selectAll('circle')
+        .data(series)
+        .join('circle')
+        .attr('cx', d => x(d.valid_time_utc_date))
+        .attr('cy', d => y(d.avg_value))
+        .attr('r', 3)
+        .attr('fill', color)
+        .style('cursor', 'pointer')
+        .on('mouseenter', () => setStabilityHighlight(m))
+        .on('mousemove', (event, d) => {
+          // n_runs_with_this_hour can now be LESS than the requested
+          // numRuns -- ADDED 2026-09-24 (user: "hrdps shows more on the
+          // top graph of forecast prediction than on forecast stability,
+          // seems trimmed"): the backend used to require an hour to
+          // appear in ALL numRuns selected runs before showing ANY spread
+          // for it, which truncated short-forecast-horizon models (HRDPS,
+          // ~48h reach per run) to whatever the OLDEST selected run
+          // happened to cover, even when 2-3 newer runs covered further.
+          // Now only requires >=2 runs, so a point CAN legitimately be
+          // backed by fewer runs than requested -- surfaced here so it's
+          // clear "this point exists but is a slightly less-informed
+          // spread estimate" rather than looking identical to a fully
+          // n-run-backed point.
+          const runsNote = d.n_runs_with_this_hour < +numRuns
+            ? `<br><span style="color:var(--muted)">(only ${d.n_runs_with_this_hour}/${numRuns} runs reach this far ahead)</span>`
+            : '';
+          tooltip.style('opacity', 1)
+            .html(`<b>${m.toUpperCase()}${memberSuffix(memberVar)}</b><br>${d.valid_time_utc}<br>` +
+                  `avg: ${d.avg_value} ${fmtVarLabel(memberVar)}<br>` +
+                  `range across last ${numRuns} runs: ${d.min_value} - ${d.max_value} (spread ${d.spread})<br>` +
+                  `stddev: ${d.stddev_value}${runsNote}`)
+            .style('left', (event.pageX + 12) + 'px')
+            .style('top', (event.pageY - 10) + 'px');
+        })
+        .on('mouseleave', () => { tooltip.style('opacity', 0); setStabilityHighlight(null); });
+    });
   });
 
   // Legend: hover-to-highlight (existing behavior) PLUS click-to-toggle
@@ -1751,9 +1955,24 @@ async function loadStabilityChart() {
       .on('mouseleave', () => setStabilityHighlight(null))
       .on('click', () => toggleStabilityModel(m));
     item.append('span').attr('class', 'legend-swatch').style('background', MODEL_COLORS[m] || '#888');
-    const runsForModel = (data.runs_used_by_model && data.runs_used_by_model[m]) || [];
+    const runsForModel = runsUsedByModel[m] || [];
     item.append('span').text(`${m.toUpperCase()}${runsForModel.length ? ` (${runsForModel.length} runs)` : ''}`);
   });
+
+  // COMBO VARIABLE dash-style key -- see the matching note in
+  // loadForecastChart() for the full rationale (color = model, line
+  // style = which of the 2 combined variables).
+  if (memberVars.length > 1) {
+    const dashKey = container.append('div').attr('class', 'legend').style('margin-top', '-4px');
+    memberVars.forEach((memberVar, i) => {
+      const item = dashKey.append('div').attr('class', 'legend-item').style('cursor', 'default');
+      item.append('span').attr('class', 'legend-swatch')
+        .style('background', 'none')
+        .style('border-top', i === 0 ? '2px solid var(--text)' : '2px dashed var(--text)')
+        .style('height', '0');
+      item.append('span').text(fmtVarLabel(memberVar));
+    });
+  }
 }
 
 // ---------------------------------------------------------------------------
