@@ -23,7 +23,16 @@ reasonable timeliness. Cadence history: started at every 30 min, dialed
 back to every 4 hours (6x/day) on 2026-09-08 per user request to avoid
 overloading the endpoint, then increased to hourly on 2026-09-10 per
 user request -- now the flag-band chart overlay has much finer time
-resolution to show exactly when conditions changed. Every poll's result
+resolution to show exactly when conditions changed. Increased AGAIN to
+every 15 minutes on 2026-10-08 per user request ("you should be
+checking flag color at least every 15 minutes") -- catches a flag
+change within 15 min of it happening instead of up to an hour late,
+and also gives the Bayesian flag-prediction model (ordinal_flag_model.py)
+4x as many real training examples per day, with no cadence-specific
+assumptions anywhere downstream to break (the training query's
+wind/gust/direction matching tolerance is a fixed 20-minute window
+regardless of poll frequency; more frequent flag readings just means
+more, more-tightly-matched examples). Every poll's result
 is stored, whether or not the color changed since the last poll --
 unlike the observation ingesters, this is NOT deduplicated to
 changes-only, because it also lets you infer "flag was still X as of this
