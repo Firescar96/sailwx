@@ -904,7 +904,21 @@ async function loadForecastChart() {
   // line-chart rendering -- see the dedicated overlay row added there.
   // wind_dir_deg is never part of a combo group, so state.variable is
   // used directly here (unchanged from before).
-  const showHarvardBridgeDir = state.location === 'mit_pavilion' && state.variable === 'wind_dir_deg';
+  //
+  // EXTENDED TO CBI 2026-10-08 (user: "make sure community boating is
+  // pulling from harvard station for wind preditions not mit sailing
+  // pavilion" -> clarified: "i mean the forecast panel, should show
+  // models thoughts on cbi location, but also use the harvard bridge
+  // for the observed data/ref data item for wind direction"). This was
+  // hardcoded to mit_pavilion ONLY -- CBI's Forecast Time Series for
+  // Wind Direction had the model forecast lines (correctly, CBI's own
+  // forecast grid point -- see api_forecast, untouched) but was
+  // MISSING the Harvard Bridge reference row entirely, unlike
+  // showHarvardBridge just above (which already correctly included
+  // cbi_dockhouse for wind_speed_kt/wind_gust_kt/pressure_hpa -- this
+  // was the one place that substitution was missed for CBI).
+  const showHarvardBridgeDir = (state.location === 'mit_pavilion' || state.location === 'cbi_dockhouse')
+    && state.variable === 'wind_dir_deg';
   // Flag history window follows ONLY "Also show past" (obsHours), not
   // the forward-looking forecast window (`hours`) at all. Previously
   // used Math.max(hours, obsHours), which meant a large forward window
@@ -923,12 +937,27 @@ async function loadForecastChart() {
 
   const fetchForMember = async (memberVar) => {
     const memberHarvardBridgeVars = HARVARD_BRIDGE_VARS.has(memberVar);
+    // FIXED 2026-10-08 (user: "make sure community boating is pulling
+    // from harvard station for wind preditions not mit sailing
+    // pavilion" -> "...should also use the harvard bridge for the
+    // observed data/ref data item for wind direction"). The original
+    // gate (showHarvardBridge || showHarvardBridgeDir) &&
+    // memberHarvardBridgeVars required memberVar to be one of
+    // wind_speed_kt/wind_gust_kt/pressure_hpa -- but wind_dir_deg is
+    // NEVER in that set (it's deliberately excluded, see
+    // HARVARD_BRIDGE_VARS' own comment), so the Harvard Bridge
+    // direction fetch could never actually fire even when
+    // showHarvardBridgeDir was true. wind_dir_deg needs its own check
+    // here instead of relying on memberHarvardBridgeVars.
+    const shouldFetchHarvardBridge = memberVar === 'wind_dir_deg'
+      ? showHarvardBridgeDir
+      : showHarvardBridge && memberHarvardBridgeVars;
     const [fc, ob, hb] = await Promise.all([
       fetchJSON(`/api/forecast?location=${state.location}&variable=${memberVar}&hours=${hours}&past_hours=${pastHours}`),
       obsHours > 0
         ? fetchJSON(`/api/observations?location=${state.location}&variable=${memberVar}&hours=${obsHours}`)
         : Promise.resolve([]), // Off (0) means genuinely no observed overlay, not "hours=0" API edge case
-      (showHarvardBridge || showHarvardBridgeDir) && memberHarvardBridgeVars && obsHours > 0
+      shouldFetchHarvardBridge && obsHours > 0
         ? fetchJSON(`/api/observations?location=harvard_bridge&variable=${memberVar}&hours=${obsHours}`)
         : Promise.resolve([]),
     ]);
@@ -951,8 +980,21 @@ async function loadForecastChart() {
 
   const container = d3.select('#forecast-chart');
   container.selectAll('*').remove();
-  d3.select('#forecast-empty').attr('hidden', forecast.length ? true : null);
-  if (!forecast.length) { forecastXScale = null; return; }
+  // BUG FIXED 2026-10-08 (user: "Forecast Time Series is blank for
+  // most variables including wind for harvard location"). Root cause:
+  // this early-return only checked forecast.length, so ANY location
+  // with real observed data but zero forecast_runs (Harvard Bridge --
+  // confirmed via direct query: it has never been added to
+  // ingest_forecasts.py's LOCATIONS dict, unlike every other location
+  // -- see that file's comment for which locations ARE covered) showed
+  // a completely blank chart even though 1,877 real observation rows
+  // existed for the exact same query. Now renders as long as EITHER
+  // forecast OR obs has data -- a location with observations but no
+  // forecast model coverage still gets a genuinely useful chart (just
+  // the Observed line, no model lines), instead of nothing at all.
+  const hasAnyData = forecast.length > 0 || obs.length > 0;
+  d3.select('#forecast-empty').attr('hidden', hasAnyData ? true : null);
+  if (!hasAnyData) { forecastXScale = null; return; }
 
   forecast.forEach(d => { d.valid_time_utc_date = new Date(d.valid_time_utc + 'Z'); });
   obs.forEach(d => { d.ts_utc_date = new Date(d.ts_utc + 'Z'); });
@@ -1689,8 +1731,30 @@ function renderWindDirectionChart(container, tooltip, models, byModel, obs, flag
         obsDeg = nearestObs.value;
       }
     }
-    const referenceDeg = obsDeg != null ? obsDeg : avgDeg;
-    const referenceIsObserved = obsDeg != null;
+    // FIXED 2026-10-08 (user: "make sure community boating is pulling
+    // from harvard station for wind preditions not mit sailing
+    // pavilion" -> "...also use the harvard bridge for the observed
+    // data/ref data item for wind direction"). CBI has no wind sensor
+    // of its own (obsSorted is always empty there), so the REF row
+    // previously fell straight through to the cross-model average --
+    // never actually using Harvard Bridge's real observed direction
+    // even on the one chart (this one) where Harvard Bridge direction
+    // data was already being fetched specifically for CBI. Now falls
+    // back to Harvard Bridge (when available, i.e. showHarvardBridgeDir
+    // is true for this location) BEFORE falling back to the
+    // cross-model average -- same "prefer a real observation over a
+    // model-only estimate" priority as the obsDeg branch above, just
+    // with Harvard Bridge as a second-tier real-observation source
+    // when the location's own sensor doesn't exist.
+    let hbDeg = null;
+    if (showHarvardBridgeDir && hbSorted.length) {
+      const nearestHb = nearestPoint(hbSorted, colDate, d => d.ts_utc_date);
+      if (nearestHb && Math.abs(nearestHb.ts_utc_date - colDate) <= OBS_MATCH_TOLERANCE_MS) {
+        hbDeg = nearestHb.value;
+      }
+    }
+    const referenceDeg = obsDeg != null ? obsDeg : (hbDeg != null ? hbDeg : avgDeg);
+    const referenceIsObserved = obsDeg != null || hbDeg != null;
     return { date: colDate, perModel, avgDeg, obsDeg, referenceDeg, referenceIsObserved };
   });
 
@@ -1707,7 +1771,7 @@ function renderWindDirectionChart(container, tooltip, models, byModel, obs, flag
       .attr('class', 'wind-dir-arrow')
       .attr('d', 'M 0,-7 L 5,5 L 0,2 L -5,5 Z') // simple arrowhead, points "up" (0 deg) before rotation
       .attr('transform', d => `translate(${x(d.col.date)},${rowCenter}) rotate(${(d.value + 180) % 360})`)
-      .attr('fill', d => (key === AVG_KEY && d.col.referenceIsObserved) ? '#9aa5ab' : colorFn())
+      .attr('fill', d => (key === AVG_KEY && d.col.referenceIsObserved) ? (d.col.obsDeg != null ? '#9aa5ab' : '#d9822b') : colorFn())
       // Opacity encodes agreement with this column's REFERENCE direction
       // (real observation when one exists close enough in time,
       // otherwise the cross-model average -- see the column-building
@@ -1730,12 +1794,20 @@ function renderWindDirectionChart(container, tooltip, models, byModel, obs, flag
       .on('mouseenter', () => setRowHighlight(key))
       .on('mousemove', (event, d) => {
         const towardDeg = Math.round((d.value + 180) % 360);
-        const refLabel = d.col.referenceIsObserved ? observedLabel(state.location).toLowerCase() : 'cross-model average';
+        // FIXED 2026-10-08 (same report as the referenceDeg fix above):
+        // the reference label previously always assumed "observed"
+        // meant this location's own sensor -- now correctly names
+        // Harvard Bridge when THAT's actually where the reference
+        // value came from (obsDeg is null but hbDeg wasn't, i.e. a
+        // sensor-less location like CBI falling back to Harvard
+        // Bridge rather than this location's own nonexistent sensor).
+        const refSourceLabel = d.col.obsDeg != null ? observedLabel(state.location) : 'Harvard Bridge';
+        const refLabel = d.col.referenceIsObserved ? refSourceLabel.toLowerCase() : 'cross-model average';
         const diffFromRef = (key !== AVG_KEY && key !== OBS_KEY && d.col.referenceDeg != null)
           ? `<br>${Math.round(circularDiffDeg(d.value, d.col.referenceDeg))}\u00b0 from ${refLabel}`
           : '';
         const label = key === OBS_KEY ? observedLabel(state.location)
-          : key === AVG_KEY ? (d.col.referenceIsObserved ? `${observedLabel(state.location)} (ground truth)` : 'Cross-model average')
+          : key === AVG_KEY ? (d.col.referenceIsObserved ? `${refSourceLabel} (ground truth)` : 'Cross-model average')
           : key.toUpperCase();
         tooltip.style('opacity', 1)
           .html(`<b>${label}</b><br>${formatLocalDateTime(d.col.date)}<br>from ${Math.round(d.value)}\u00b0 (blowing toward ${towardDeg}\u00b0)${diffFromRef}`)
