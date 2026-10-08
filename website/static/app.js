@@ -181,11 +181,39 @@ function fmtVarLabel(v) {
 // day-of-week abbreviation, which is genuinely useful context a bare
 // date doesn't give at a glance. Previous format (for reference):
 // "2026-09-09 15:30 (-3h)" -- new format: "Tue 09-09 15:30".
+//
+// SWITCHED FROM UTC TO BROWSER-LOCAL TIME -- 2026-10-07 (user: "what
+// timezone is the site in? it should be local to each buoy" -> after
+// confirming every current location is actually in the same real
+// timezone (America/New_York) so a genuine per-buoy timezone would be
+// identical everywhere -> "keep backend same, but show website in
+// local time to the browser"). The BACKEND is completely unchanged --
+// DuckDB connections still force `SET TimeZone='UTC'` (see db() in
+// app.py, a real fix from 2026-09-11 for a `now()` comparison bug) and
+// every stored/computed timestamp is still naive UTC. Only the
+// DISPLAY layer changed: every `getUTC*()` call below became a plain
+// `get*()` call, which JavaScript's Date object automatically resolves
+// using the BROWSER's own local timezone (read from the OS/browser
+// settings, via Intl under the hood) -- not a hardcoded "America/
+// New_York" assumption. This means a visitor in a different timezone
+// sees correctly-converted LOCAL times automatically, without the
+// dashboard needing to know anything about where they are.
 const WEEKDAY_ABBREV = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 function formatAxisTick(d) {
   const pad = n => String(n).padStart(2, '0');
-  const weekday = WEEKDAY_ABBREV[d.getUTCDay()];
-  return `${weekday} ${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
+  const weekday = WEEKDAY_ABBREV[d.getDay()];
+  return `${weekday} ${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+// Formats a Date as a local "YYYY-MM-DD HH:MM" string for tooltips,
+// replacing the old `.toISOString().slice(0,16).replace('T',' ')`
+// pattern (which was always UTC by definition -- toISOString() cannot
+// return local time). Mirrors the same zero-padding convention as
+// formatAxisTick() above, just without the weekday abbreviation (most
+// tooltip call sites that used the old UTC pattern didn't have one).
+function formatLocalDateTime(d) {
+  const pad = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
 // Per-location display name for the "Observed" series -- ADDED
@@ -1096,7 +1124,7 @@ async function loadForecastChart() {
       .style('cursor', 'default')
       .on('mousemove', (event, d) => {
         tooltip.style('opacity', 1)
-          .html(`<b>${d.color.toUpperCase()} flag</b><br>${d.start.toISOString().slice(0, 16).replace('T', ' ')} UTC onward`)
+          .html(`<b>${d.color.toUpperCase()} flag</b><br>${formatLocalDateTime(d.start)} onward`)
           .style('left', (event.pageX + 12) + 'px')
           .style('top', (event.pageY - 10) + 'px');
       })
@@ -1200,7 +1228,7 @@ async function loadForecastChart() {
         .on('mouseenter', () => setHighlight(m))
         .on('mousemove', (event, d) => {
           tooltip.style('opacity', 1)
-            .html(`<b>${m.toUpperCase()}${memberSuffix(memberVar)}</b><br>${d.valid_time_utc}<br>value: ${d.value}`)
+            .html(`<b>${m.toUpperCase()}${memberSuffix(memberVar)}</b><br>${formatLocalDateTime(d.valid_time_utc_date)}<br>value: ${d.value}`)
             .style('left', (event.pageX + 12) + 'px')
             .style('top', (event.pageY - 10) + 'px');
         })
@@ -1257,7 +1285,7 @@ async function loadForecastChart() {
         .on('mouseenter', () => setHighlight(OBS_KEY))
         .on('mousemove', (event, d) => {
           tooltip.style('opacity', 1)
-            .html(`<b>${observedLabel(state.location)}${memberSuffix(memberVar)}</b><br>${d.ts_utc}<br>value: ${d.value}`)
+            .html(`<b>${observedLabel(state.location)}${memberSuffix(memberVar)}</b><br>${formatLocalDateTime(d.ts_utc_date)}<br>value: ${d.value}`)
             .style('left', (event.pageX + 12) + 'px')
             .style('top', (event.pageY - 10) + 'px');
         })
@@ -1311,7 +1339,7 @@ async function loadForecastChart() {
         .on('mouseenter', () => setHighlight(HB_KEY))
         .on('mousemove', (event, d) => {
           tooltip.style('opacity', 1)
-            .html(`<b>Harvard Bridge${memberSuffix(memberVar)}</b><br>${d.ts_utc}<br>value: ${d.value}`)
+            .html(`<b>Harvard Bridge${memberSuffix(memberVar)}</b><br>${formatLocalDateTime(d.ts_utc_date)}<br>value: ${d.value}`)
             .style('left', (event.pageX + 12) + 'px')
             .style('top', (event.pageY - 10) + 'px');
         })
@@ -1474,7 +1502,7 @@ function renderWindDirectionChart(container, tooltip, models, byModel, obs, flag
       .style('cursor', 'default')
       .on('mousemove', (event, d) => {
         tooltip.style('opacity', 1)
-          .html(`<b>${d.color.toUpperCase()} flag</b><br>${d.start.toISOString().slice(0, 16).replace('T', ' ')} UTC onward`)
+          .html(`<b>${d.color.toUpperCase()} flag</b><br>${formatLocalDateTime(d.start)} onward`)
           .style('left', (event.pageX + 12) + 'px')
           .style('top', (event.pageY - 10) + 'px');
       })
@@ -1710,7 +1738,7 @@ function renderWindDirectionChart(container, tooltip, models, byModel, obs, flag
           : key === AVG_KEY ? (d.col.referenceIsObserved ? `${observedLabel(state.location)} (ground truth)` : 'Cross-model average')
           : key.toUpperCase();
         tooltip.style('opacity', 1)
-          .html(`<b>${label}</b><br>${d.col.date.toISOString().slice(0, 16).replace('T', ' ')} UTC<br>from ${Math.round(d.value)}\u00b0 (blowing toward ${towardDeg}\u00b0)${diffFromRef}`)
+          .html(`<b>${label}</b><br>${formatLocalDateTime(d.col.date)}<br>from ${Math.round(d.value)}\u00b0 (blowing toward ${towardDeg}\u00b0)${diffFromRef}`)
           .style('left', (event.pageX + 12) + 'px')
           .style('top', (event.pageY - 10) + 'px');
       })
@@ -1755,7 +1783,7 @@ function renderWindDirectionChart(container, tooltip, models, byModel, obs, flag
       .on('mousemove', (event, d) => {
         const towardDeg = Math.round((d.value + 180) % 360);
         tooltip.style('opacity', 1)
-          .html(`<b>${observedLabel(state.location)}</b><br>${d.ts_utc}<br>from ${Math.round(d.value)}\u00b0 (blowing toward ${towardDeg}\u00b0)`)
+          .html(`<b>${observedLabel(state.location)}</b><br>${formatLocalDateTime(d.ts_utc_date)}<br>from ${Math.round(d.value)}\u00b0 (blowing toward ${towardDeg}\u00b0)`)
           .style('left', (event.pageX + 12) + 'px')
           .style('top', (event.pageY - 10) + 'px');
       })
@@ -1784,7 +1812,7 @@ function renderWindDirectionChart(container, tooltip, models, byModel, obs, flag
       .on('mousemove', (event, d) => {
         const towardDeg = Math.round((d.value + 180) % 360);
         tooltip.style('opacity', 1)
-          .html(`<b>Harvard Bridge</b><br>${d.ts_utc}<br>from ${Math.round(d.value)}\u00b0 (blowing toward ${towardDeg}\u00b0)`)
+          .html(`<b>Harvard Bridge</b><br>${formatLocalDateTime(d.ts_utc_date)}<br>from ${Math.round(d.value)}\u00b0 (blowing toward ${towardDeg}\u00b0)`)
           .style('left', (event.pageX + 12) + 'px')
           .style('top', (event.pageY - 10) + 'px');
       })
@@ -2024,7 +2052,7 @@ async function loadStabilityChart() {
             ? `<br><span style="color:var(--muted)">(only ${d.n_runs_with_this_hour}/${numRuns} runs reach this far ahead)</span>`
             : '';
           tooltip.style('opacity', 1)
-            .html(`<b>${m.toUpperCase()}${memberSuffix(memberVar)}</b><br>${d.valid_time_utc}<br>` +
+            .html(`<b>${m.toUpperCase()}${memberSuffix(memberVar)}</b><br>${formatLocalDateTime(d.valid_time_utc_date)}<br>` +
                   `avg: ${d.avg_value} ${fmtVarLabel(memberVar)}<br>` +
                   `range across last ${numRuns} runs: ${d.min_value} - ${d.max_value} (spread ${d.spread})<br>` +
                   `stddev: ${d.stddev_value}${runsNote}`)
@@ -2152,7 +2180,7 @@ async function loadFlagPredictionChart() {
       const p = predictions.find(pr => pr.valid_time_utc === d.data.valid_time_utc);
       tooltip.style('opacity', 1)
         .html(`<b>${d.key.toUpperCase()}</b>: ${(p.flag_probabilities[d.key] * 100).toFixed(1)}%<br>` +
-              `${p.valid_time_utc.replace('T', ' ')} UTC<br>` +
+              `${formatLocalDateTime(new Date(p.valid_time_utc + 'Z'))}<br>` +
               `forecast wind: ${p.wind_kt != null ? p.wind_kt.toFixed(1) + ' kt' : 'n/a'}, gust: ${p.gust_kt != null ? p.gust_kt.toFixed(1) + ' kt' : 'n/a'} (effective bucket: ${p.wind_bucket || 'n/a'})<br>` +
               `<i>most likely: ${p.most_likely_flag ? p.most_likely_flag.toUpperCase() : 'n/a'}</i>`)
         .style('left', (event.pageX + 12) + 'px')
@@ -2165,7 +2193,7 @@ async function loadFlagPredictionChart() {
     .attr('class', 'axis')
     .attr('transform', `translate(0,${height - margin.bottom})`)
     .call(d3.axisBottom(x).tickValues(x.domain().filter((d, i) => i % tickEvery === 0))
-      .tickFormat(d => new Date(d + 'Z').toISOString().slice(5, 16).replace('T', ' ')))
+      .tickFormat(d => formatLocalDateTime(d instanceof Date ? d : new Date(d + 'Z')).slice(5)))
     .selectAll('text')
     .attr('transform', 'rotate(-35)')
     .style('text-anchor', 'end');
@@ -2284,7 +2312,7 @@ async function loadWindPredictionChart() {
       const prob = p.actual_wind_probabilities[d.key] || 0;
       tooltip.style('opacity', 1)
         .html(`<b>${d.key}</b>: ${(prob * 100).toFixed(1)}%<br>` +
-              `${p.valid_time_utc.replace('T', ' ')} UTC<br>` +
+              `${formatLocalDateTime(new Date(p.valid_time_utc + 'Z'))}<br>` +
               `model forecast: ${p.forecast_wind_kt != null ? p.forecast_wind_kt.toFixed(1) + ' kt' : 'n/a'} (${p.forecast_wind_bucket || 'n/a'})<br>` +
               `<i>most likely actual: ${p.most_likely_actual_bucket || 'n/a'}</i>`)
         .style('left', (event.pageX + 12) + 'px')
@@ -2297,7 +2325,7 @@ async function loadWindPredictionChart() {
     .attr('class', 'axis')
     .attr('transform', `translate(0,${height - margin.bottom})`)
     .call(d3.axisBottom(x).tickValues(x.domain().filter((d, i) => i % tickEvery === 0))
-      .tickFormat(d => new Date(d + 'Z').toISOString().slice(5, 16).replace('T', ' ')))
+      .tickFormat(d => formatLocalDateTime(d instanceof Date ? d : new Date(d + 'Z')).slice(5)))
     .selectAll('text')
     .attr('transform', 'rotate(-35)')
     .style('text-anchor', 'end');
@@ -2603,7 +2631,7 @@ async function loadGustFactorChart() {
       const factorText = d.gust_factor != null ? `${d.gust_factor}x` : 'n/a (0kt sustained)';
       const label = d.is_forecast ? `<b>+${d.gust_delta_kt}kt (${forecastModel.toUpperCase()} forecast)</b>` : `<b>+${d.gust_delta_kt}kt</b>`;
       tooltip.style('opacity', 1)
-        .html(`${label}<br>${d.ts_utc}<br>sustained: ${d.sustained_kt}kt, gust: ${d.gust_kt}kt<br>ratio: ${factorText}`)
+        .html(`${label}<br>${formatLocalDateTime(d.ts_utc_date)}<br>sustained: ${d.sustained_kt}kt, gust: ${d.gust_kt}kt<br>ratio: ${factorText}`)
         .style('left', (event.pageX + 12) + 'px')
         .style('top', (event.pageY - 10) + 'px');
     })
@@ -2743,7 +2771,7 @@ function loadGustScatterChart(data, forecastModel) {
       const factorText = d.gust_factor != null ? `${d.gust_factor}x` : 'n/a (0kt sustained)';
       const label = d.is_forecast ? `<b>${forecastModel.toUpperCase()} forecast</b><br>` : '';
       tooltip.style('opacity', 1)
-        .html(`${label}sustained: ${d.sustained_kt}kt, gust: ${d.gust_kt}kt<br>+${d.gust_delta_kt}kt, ratio: ${factorText}<br>${d.ts_utc}`)
+        .html(`${label}sustained: ${d.sustained_kt}kt, gust: ${d.gust_kt}kt<br>+${d.gust_delta_kt}kt, ratio: ${factorText}<br>${formatLocalDateTime(d.ts_utc_date)}`)
         .style('left', (event.pageX + 12) + 'px')
         .style('top', (event.pageY - 10) + 'px');
     })
