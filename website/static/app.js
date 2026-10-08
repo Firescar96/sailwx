@@ -1739,13 +1739,7 @@ function renderWindDirectionChart(container, tooltip, models, byModel, obs, flag
     // previously fell straight through to the cross-model average --
     // never actually using Harvard Bridge's real observed direction
     // even on the one chart (this one) where Harvard Bridge direction
-    // data was already being fetched specifically for CBI. Now falls
-    // back to Harvard Bridge (when available, i.e. showHarvardBridgeDir
-    // is true for this location) BEFORE falling back to the
-    // cross-model average -- same "prefer a real observation over a
-    // model-only estimate" priority as the obsDeg branch above, just
-    // with Harvard Bridge as a second-tier real-observation source
-    // when the location's own sensor doesn't exist.
+    // data was already being fetched specifically for CBI.
     let hbDeg = null;
     if (showHarvardBridgeDir && hbSorted.length) {
       const nearestHb = nearestPoint(hbSorted, colDate, d => d.ts_utc_date);
@@ -1753,8 +1747,26 @@ function renderWindDirectionChart(container, tooltip, models, byModel, obs, flag
         hbDeg = nearestHb.value;
       }
     }
-    const referenceDeg = obsDeg != null ? obsDeg : (hbDeg != null ? hbDeg : avgDeg);
-    const referenceIsObserved = obsDeg != null || hbDeg != null;
+    // PRIORITY CHANGED 2026-10-08 (user, immediate follow-up: "the Ref
+    // should be harvard bridge when available, then model average
+    // later"). Previously 3-tier: this location's own obsDeg first,
+    // THEN Harvard Bridge, THEN cross-model average -- but that ranked
+    // a location's own sensor above Harvard Bridge even where this
+    // project has ALREADY established (this same session, and earlier:
+    // "MIT sailing pavilion observed direction is blocked" -> measured
+    // ~25.6 degree average divergence from Harvard Bridge) that the
+    // location's own direction sensor can be unreliable/obstructed.
+    // Explicitly demoted to 2-tier -- Harvard Bridge FIRST when
+    // available, cross-model average as the only fallback -- so this
+    // REF indicator no longer trusts a location's own (potentially
+    // obstructed) sensor over Harvard Bridge's real, unobstructed
+    // reading. The separate OBS_KEY row (this location's own raw
+    // observed data, labeled "Obs") is completely untouched by this --
+    // it still shows the location's own real sensor reading as its own
+    // row; this change ONLY affects which source feeds the synthetic
+    // REF/ground-truth indicator.
+    const referenceDeg = hbDeg != null ? hbDeg : avgDeg;
+    const referenceIsObserved = hbDeg != null;
     return { date: colDate, perModel, avgDeg, obsDeg, referenceDeg, referenceIsObserved };
   });
 
@@ -1771,7 +1783,7 @@ function renderWindDirectionChart(container, tooltip, models, byModel, obs, flag
       .attr('class', 'wind-dir-arrow')
       .attr('d', 'M 0,-7 L 5,5 L 0,2 L -5,5 Z') // simple arrowhead, points "up" (0 deg) before rotation
       .attr('transform', d => `translate(${x(d.col.date)},${rowCenter}) rotate(${(d.value + 180) % 360})`)
-      .attr('fill', d => (key === AVG_KEY && d.col.referenceIsObserved) ? (d.col.obsDeg != null ? '#9aa5ab' : '#d9822b') : colorFn())
+      .attr('fill', d => (key === AVG_KEY && d.col.referenceIsObserved) ? '#d9822b' : colorFn())
       // Opacity encodes agreement with this column's REFERENCE direction
       // (real observation when one exists close enough in time,
       // otherwise the cross-model average -- see the column-building
@@ -1794,20 +1806,18 @@ function renderWindDirectionChart(container, tooltip, models, byModel, obs, flag
       .on('mouseenter', () => setRowHighlight(key))
       .on('mousemove', (event, d) => {
         const towardDeg = Math.round((d.value + 180) % 360);
-        // FIXED 2026-10-08 (same report as the referenceDeg fix above):
-        // the reference label previously always assumed "observed"
-        // meant this location's own sensor -- now correctly names
-        // Harvard Bridge when THAT's actually where the reference
-        // value came from (obsDeg is null but hbDeg wasn't, i.e. a
-        // sensor-less location like CBI falling back to Harvard
-        // Bridge rather than this location's own nonexistent sensor).
-        const refSourceLabel = d.col.obsDeg != null ? observedLabel(state.location) : 'Harvard Bridge';
-        const refLabel = d.col.referenceIsObserved ? refSourceLabel.toLowerCase() : 'cross-model average';
+        // FIXED 2026-10-08 (user, immediate follow-up: "the Ref should
+        // be harvard bridge when available, then model average
+        // later"). referenceDeg now only ever comes from Harvard
+        // Bridge or the cross-model average (never this location's own
+        // obsDeg -- see the referenceDeg priority comment above), so
+        // "observed" here always unambiguously means Harvard Bridge.
+        const refLabel = d.col.referenceIsObserved ? 'harvard bridge' : 'cross-model average';
         const diffFromRef = (key !== AVG_KEY && key !== OBS_KEY && d.col.referenceDeg != null)
           ? `<br>${Math.round(circularDiffDeg(d.value, d.col.referenceDeg))}\u00b0 from ${refLabel}`
           : '';
         const label = key === OBS_KEY ? observedLabel(state.location)
-          : key === AVG_KEY ? (d.col.referenceIsObserved ? `${refSourceLabel} (ground truth)` : 'Cross-model average')
+          : key === AVG_KEY ? (d.col.referenceIsObserved ? 'Harvard Bridge (ground truth)' : 'Cross-model average')
           : key.toUpperCase();
         tooltip.style('opacity', 1)
           .html(`<b>${label}</b><br>${formatLocalDateTime(d.col.date)}<br>from ${Math.round(d.value)}\u00b0 (blowing toward ${towardDeg}\u00b0)${diffFromRef}`)
