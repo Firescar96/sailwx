@@ -450,6 +450,7 @@ async function init() {
       loadFlagPredictionChart();
     } else {
       loadWindPredictionChart();
+      loadGustPredictionChart();
       loadWindRoseChart();
       loadGustFactorChart();
     }
@@ -529,6 +530,23 @@ async function init() {
   d3.select('#wind-prediction-hours-select').on('change', loadWindPredictionChart);
   persistSelectOnChange('wind-prediction-hours-select');
 
+  // Gust Prediction panel -- ADDED 2026-10-16 (user: "i need two graphs
+  // instead of one, one for wind and one for wind gusts"), mirrors Wind
+  // Prediction's init exactly (shares the same api_wind_prediction
+  // backend, just with target=gust -- see loadWindPredictionChart).
+  const gustPredModelSelect = d3.select('#gust-prediction-model-select');
+  gustPredModelSelect.selectAll('option')
+    .data(Object.keys(MODEL_COLORS))
+    .join('option')
+    .attr('value', d => d)
+    .text(d => d.toUpperCase());
+  gustPredModelSelect.property('value', restoreSelectValue('gust-prediction-model-select') || 'gfs');
+  gustPredModelSelect.on('change', loadGustPredictionChart);
+  persistSelectOnChange('gust-prediction-model-select');
+  restoreSelectValue('gust-prediction-hours-select');
+  d3.select('#gust-prediction-hours-select').on('change', loadGustPredictionChart);
+  persistSelectOnChange('gust-prediction-hours-select');
+
   // Wind Rose panel: model select has an extra "Observed only" option
   // (empty value) since the comparison model is optional.
   const roseModelSelect = d3.select('#wind-rose-model-select');
@@ -575,6 +593,7 @@ async function init() {
   } else {
     await Promise.all([
       loadWindPredictionChart(),
+      loadGustPredictionChart(),
       loadWindRoseChart(),
       loadGustFactorChart(),
     ]);
@@ -591,6 +610,7 @@ function updatePredictionPanelVisibility() {
   const isCbi = state.location === 'cbi_dockhouse';
   d3.select('#flag-prediction-panel').attr('hidden', isCbi ? null : true);
   d3.select('#wind-prediction-panel').attr('hidden', isCbi ? true : null);
+  d3.select('#gust-prediction-panel').attr('hidden', isCbi ? true : null);
   d3.select('#wind-rose-panel').attr('hidden', isCbi ? true : null);
   d3.select('#gust-factor-panel').attr('hidden', isCbi ? true : null);
 }
@@ -2466,15 +2486,24 @@ function windBucketColorScale(buckets) {
   return map;
 }
 
-async function loadWindPredictionChart() {
-  const model = d3.select('#wind-prediction-model-select').property('value');
-  const hours = +d3.select('#wind-prediction-hours-select').property('value');
+// GENERICIZED 2026-10-16 (user: "i need two graphs instead of one, one
+// for wind and one for wind gusts, but both charts should use linear
+// regression that incorporates base wind, gusts, and direction").
+// Shared renderer for both Wind Prediction and Gust Prediction -- they
+// use the SAME api_wind_prediction backend (which now takes a `target`
+// param: "wind" or "gust") and the SAME chart layout, just pointed at
+// different DOM element id prefixes and a different probability field
+// label. loadWindPredictionChart() and loadGustPredictionChart() below
+// are thin wrappers that just supply the right idPrefix/target/label.
+async function loadPredictionChart(idPrefix, target, yAxisLabel, noDataNoun) {
+  const model = d3.select(`#${idPrefix}-model-select`).property('value');
+  const hours = +d3.select(`#${idPrefix}-hours-select`).property('value');
   if (!model || !state.location) return;
 
-  const data = await fetchJSON(`/api/wind-prediction?location=${state.location}&model=${model}&hours=${hours}`);
-  const container = d3.select('#wind-prediction-chart');
+  const data = await fetchJSON(`/api/wind-prediction?location=${state.location}&model=${model}&hours=${hours}&target=${target}`);
+  const container = d3.select(`#${idPrefix}-chart`);
   container.selectAll('*').remove();
-  const empty = d3.select('#wind-prediction-empty');
+  const empty = d3.select(`#${idPrefix}-empty`);
 
   if (data.error) {
     empty.attr('hidden', null).text(data.error);
@@ -2533,10 +2562,16 @@ async function loadWindPredictionChart() {
     .on('mousemove', (event, d) => {
       const p = predictions.find(pr => pr.valid_time_utc === d.data.valid_time_utc);
       const prob = p.actual_wind_probabilities[d.key] || 0;
+      // Both forecast wind AND forecast gust are shown regardless of
+      // target, since both are always used as regression inputs (the
+      // cross-feed design) -- the tooltip should make that visible,
+      // not just show whichever one matches this chart's own target.
       tooltip.style('opacity', 1)
         .html(`<b>${d.key}</b>: ${(prob * 100).toFixed(1)}%<br>` +
               `${formatLocalDateTime(new Date(p.valid_time_utc + 'Z'))}<br>` +
-              `model forecast: ${p.forecast_wind_kt != null ? p.forecast_wind_kt.toFixed(1) + ' kt' : 'n/a'} (${p.forecast_wind_bucket || 'n/a'})<br>` +
+              `forecast wind: ${p.forecast_wind_kt != null ? p.forecast_wind_kt.toFixed(1) + ' kt' : 'n/a'}, ` +
+              `forecast gust: ${p.forecast_gust_kt != null ? p.forecast_gust_kt.toFixed(1) + ' kt' : 'n/a'} ` +
+              `(${noDataNoun} bucket: ${p.forecast_wind_bucket || 'n/a'})<br>` +
               `<i>most likely actual: ${p.most_likely_actual_bucket || 'n/a'}</i>`)
         .style('left', (event.pageX + 12) + 'px')
         .style('top', (event.pageY - 10) + 'px');
@@ -2564,7 +2599,7 @@ async function loadWindPredictionChart() {
     .attr('text-anchor', 'middle')
     .attr('fill', 'var(--muted)')
     .attr('font-size', '0.75rem')
-    .text('P(actual wind bucket)');
+    .text(yAxisLabel);
 
   const legend = container.insert('div', 'svg').attr('class', 'legend');
   buckets.forEach(b => {
@@ -2575,6 +2610,14 @@ async function loadWindPredictionChart() {
   legend.append('div').attr('class', 'legend-item')
     .attr('style', 'color:var(--muted); font-size:0.75rem;')
     .text(`(trained on ${data.training_sample_size} historical forecast-vs-observed pairs)`);
+}
+
+async function loadWindPredictionChart() {
+  return loadPredictionChart('wind-prediction', 'wind', 'P(actual wind bucket)', 'forecast wind');
+}
+
+async function loadGustPredictionChart() {
+  return loadPredictionChart('gust-prediction', 'gust', 'P(actual gust bucket)', 'forecast gust');
 }
 
 // ---------------------------------------------------------------------------

@@ -187,8 +187,8 @@
   </section>
 
   <section id="wind-prediction-panel" class="panel" hidden>
-    <h2>Wind Prediction <span class="subtitle">(Bayesian linear regression: P(actual wind bucket | forecast wind, daypart, direction), from one selected model)</span></h2>
-    <p class="subtitle">Not the same as the accuracy chart above -- instead of "how far off is the model on average", this estimates "given this model's forecast wind, time of day, and wind direction, how likely is the REAL wind to fall in each range", by fitting a smooth curve to this location's own historical forecast-vs-observed wind pairing (time of day and direction matter because local sheltering/terrain effects behave differently depending on both), with a Bayesian posterior-predictive distribution around that fitted curve.</p>
+    <h2>Wind Prediction <span class="subtitle">(Bayesian linear regression: P(actual wind bucket | forecast wind, gust, direction, daypart), from one selected model)</span></h2>
+    <p class="subtitle">Not the same as the accuracy chart above -- instead of "how far off is the model on average", this estimates "given this model's forecast wind, gust, time of day, and wind direction, how likely is the REAL wind to fall in each range", by fitting a smooth curve to this location's own historical forecast-vs-observed wind pairing (forecast gust and direction both matter because local sheltering/terrain effects behave differently depending on both), with a Bayesian posterior-predictive distribution around that fitted curve.</p>
     <div class="controls inline">
       <label>
         Model
@@ -208,6 +208,30 @@
     </div>
     <div id="wind-prediction-chart"></div>
     <div id="wind-prediction-empty" class="empty-msg" hidden></div>
+  </section>
+
+  <section id="gust-prediction-panel" class="panel" hidden>
+    <h2>Gust Prediction <span class="subtitle">(Bayesian linear regression: P(actual gust bucket | forecast wind, gust, direction, daypart), from one selected model)</span></h2>
+    <p class="subtitle">Same method as Wind Prediction above, but predicting the REAL GUST speed instead of sustained wind -- "given this model's forecast wind, gust, time of day, and wind direction, how likely is the real GUST to fall in each range". Forecast wind is still used as an input here too (not just forecast gust), since cross-validated testing showed it genuinely improves the gust prediction.</p>
+    <div class="controls inline">
+      <label>
+        Model
+        <select id="gust-prediction-model-select"></select>
+      </label>
+      <label>
+        Look ahead
+        <select id="gust-prediction-hours-select">
+          <option value="24">Next 24h</option>
+          <option value="48">Next 48h</option>
+          <option value="72">Next 72h</option>
+          <option value="120">Next 5 days</option>
+          <option value="168">Next 7 days</option>
+          <option value="336" selected>Next 14 days</option>
+        </select>
+      </label>
+    </div>
+    <div id="gust-prediction-chart"></div>
+    <div id="gust-prediction-empty" class="empty-msg" hidden></div>
   </section>
 
   <section id="wind-rose-panel" class="panel" hidden>

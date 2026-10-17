@@ -971,18 +971,34 @@ def api_flag_prediction(params):
 
 
 def api_wind_prediction(params):
-    """Bayesian wind-speed-bucket prediction for locations with real wind
-    observations (NDBC buoy, MIT Pavilion, KBOS/Logan) -- the wind-only
-    counterpart to api_flag_prediction (CBI has no wind sensor, so it
-    uses flag color instead; these locations DO have real observed wind,
-    so they predict P(actual wind bucket | model's forecast wind bucket)
-    instead of a flag color). Deliberately mirrors that endpoint's shape
+    """Bayesian wind-speed-bucket OR gust-speed-bucket prediction for
+    locations with real wind observations (NDBC buoy, MIT Pavilion,
+    KBOS/Logan) -- the wind-only counterpart to api_flag_prediction (CBI
+    has no wind sensor, so it uses flag color instead; these locations
+    DO have real observed wind, so they predict P(actual bucket |
+    forecast wind, forecast gust, daypart, direction) instead of a flag
+    color). Deliberately mirrors that endpoint's shape
     (stacked-probability-by-hour) per user direction 2026-09-11 ("show a
     very similar graph, but do wind prediction instead").
 
-        P(actual_bucket=b | forecast_bucket=f, daypart=d, dir_sector=s)
-            = P(forecast_bucket=f, daypart=d, dir_sector=s | actual_bucket=b) * P(actual_bucket=b)
-              / P(forecast_bucket=f, daypart=d, dir_sector=s)
+        P(actual_target_bucket=b | forecast wind, forecast gust, daypart=d, dir_sector=s)
+
+    SPLIT INTO TWO CHARTS (Wind, Gust) -- ADDED 2026-10-16 (user: "i
+    need two graphs instead of one, one for wind and one for wind
+    gusts, but both charts should use linear regression that
+    incorporates base wind, gusts, and direction"). This single handler
+    now serves BOTH charts via a `target` query param ("wind" or
+    "gust") -- the frontend calls it twice with different `target`
+    values, and everything else (model selection, hours, location,
+    ground-truth substitution) works identically either way. The
+    regression ALWAYS uses forecast wind + forecast gust + direction +
+    daypart as its 4 input features regardless of which target is being
+    predicted (a genuine cross-feed, e.g. the Gust chart's prediction
+    is conditioned on forecast WIND too, not just forecast gust) --
+    see website/wind_regression_model.py's module docstring for the
+    real cross-validated log-loss numbers justifying this (the
+    cross-feed gives a small but consistently non-negative improvement,
+    never worse, across every location+model combo tested).
 
     ADDED time-of-day (daypart) conditioning 2026-09-24 (user: "how is it
     possible theres a chance of both 20knots and 0 knots, this isn't
@@ -1036,24 +1052,22 @@ def api_wind_prediction(params):
     be, matching how it'll be looked up for future predictions) and each
     future forecast point's own forecast wind_dir_deg the same way.
 
-    Estimated the same way as the flag panel otherwise: build the joint
-    (daypart, dir_sector, forecast_bucket, actual_bucket) count table
-    directly from this location's own historical forecast-vs-observation
-    pairs (same nearest-observation-within-7.5min matching used by
-    v_accuracy_by_lead_time, one row per real observed EVENT rather than
-    one row per forecast run that touched it -- see the dedup rationale
-    below), add Dirichlet(alpha=1) smoothing per (daypart, dir_sector,
-    forecast-bucket) row, then look up each future forecast point's own
-    (daypart, dir_sector, bucket) in that table to get a probability
-    distribution over what the REAL wind is likely to be -- a genuine
-    uncertainty band around the model's raw number, not just the number
-    itself.
+    REPLACED the discrete (daypart, dir_sector, forecast_bucket) ->
+    {actual_bucket: count} Dirichlet-smoothed count table with a
+    Bayesian linear regression (website/wind_regression_model.py) --
+    see that module's docstring for the full rationale and real
+    cross-validated log-loss comparisons justifying the switch.
     """
     location = params.get("location")
     model = params.get("model")
     hours = int(params.get("hours", "48"))
+    target = params.get("target", "wind")  # "wind" or "gust"
+    if target not in ("wind", "gust"):
+        return {"error": "target must be 'wind' or 'gust'"}
     variable = "wind_speed_kt"
+    gust_variable = "wind_gust_kt"
     dir_variable = "wind_dir_deg"
+    target_variable = variable if target == "wind" else gust_variable
     if not location or not model:
         return {"error": "location and model query params are required"}
     # Ground-truth override for mit_pavilion -- see the docstring above
@@ -1065,14 +1079,14 @@ def api_wind_prediction(params):
     ground_truth_location = "harvard_bridge" if location == "mit_pavilion" else location
     con = db()
     try:
-        # 1. Forecast wind for the selected model, forward-looking. Also
-        # pull each point's LOCAL hour (America/New_York, so it tracks
-        # real daylight rather than a fixed UTC offset that would drift
-        # across EDT/EST) to classify its daypart, and this SAME model's
-        # OWN forecast wind direction at the same valid_time_utc (not
-        # observed direction -- for a future point we only have the
-        # model's own forecast to condition on, so training must use the
-        # same signal for consistency).
+        # 1. Forecast wind, gust AND direction for the selected model,
+        # forward-looking. Also pull each point's LOCAL hour
+        # (America/New_York, so it tracks real daylight rather than a
+        # fixed UTC offset that would drift across EDT/EST) to classify
+        # its daypart. Both forecast wind and forecast gust are always
+        # fetched regardless of `target` -- the regression's 4 input
+        # features (wind, gust, direction, daypart) are the same for
+        # both charts; only the observed TARGET column differs below.
         forecast_rows = con.execute(
             """
             WITH latest_run AS (
@@ -1081,29 +1095,34 @@ def api_wind_prediction(params):
                 WHERE location_id = ? AND model = ?
                 QUALIFY row_number() OVER (ORDER BY init_time_utc DESC) = 1
             )
-            SELECT lr.init_time_utc, fv.valid_time_utc, fv.value,
-                   extract(hour FROM (fv.valid_time_utc AT TIME ZONE 'UTC' AT TIME ZONE 'America/New_York')) AS local_hour,
-                   fvdir.value AS forecast_dir_deg
-            FROM forecast_values fv
-            JOIN latest_run lr ON lr.run_id = fv.run_id
-            LEFT JOIN forecast_values fvdir
-                ON fvdir.run_id = fv.run_id
-               AND fvdir.valid_time_utc = fv.valid_time_utc
-               AND fvdir.variable = ?
-            WHERE fv.variable = ?
-              AND fv.valid_time_utc <= now() + (? * INTERVAL '1 hour')
-              AND fv.valid_time_utc >= now()
-            ORDER BY fv.valid_time_utc
+            SELECT lr.init_time_utc, fv_wind.valid_time_utc, fv_wind.value AS forecast_wind,
+                   fv_gust.value AS forecast_gust,
+                   extract(hour FROM (fv_wind.valid_time_utc AT TIME ZONE 'UTC' AT TIME ZONE 'America/New_York')) AS local_hour,
+                   fv_dir.value AS forecast_dir_deg
+            FROM forecast_values fv_wind
+            JOIN latest_run lr ON lr.run_id = fv_wind.run_id
+            LEFT JOIN forecast_values fv_gust
+                ON fv_gust.run_id = fv_wind.run_id
+               AND fv_gust.valid_time_utc = fv_wind.valid_time_utc
+               AND fv_gust.variable = ?
+            LEFT JOIN forecast_values fv_dir
+                ON fv_dir.run_id = fv_wind.run_id
+               AND fv_dir.valid_time_utc = fv_wind.valid_time_utc
+               AND fv_dir.variable = ?
+            WHERE fv_wind.variable = ?
+              AND fv_wind.valid_time_utc <= now() + (? * INTERVAL '1 hour')
+              AND fv_wind.valid_time_utc >= now()
+            ORDER BY fv_wind.valid_time_utc
             """,
-            [location, model, dir_variable, variable, hours],
+            [location, model, gust_variable, dir_variable, variable, hours],
         )
         forecast_points = rows_as_dicts(forecast_rows)
 
         # 2. Historical training pairs: this model's own past forecast
-        # values (wind speed AND direction) at this location, matched to
-        # the nearest real observation within 7.5 minutes (same
-        # tolerance as v_accuracy_by_lead_time), plus the observation's
-        # own local hour for daypart classification.
+        # values (wind speed, gust AND direction) at this location,
+        # matched to the nearest real TARGET observation within 7.5
+        # minutes (same tolerance as v_accuracy_by_lead_time), plus the
+        # observation's own local hour for daypart classification.
         #
         # DEDUPED BY REAL EVENT 2026-09-24 (user: "it should be more
         # conclusive" / "why is 0 knots even showing up at all in
@@ -1126,33 +1145,38 @@ def api_wind_prediction(params):
             """
             WITH nearest_obs AS (
                 SELECT
-                    fv.run_id,
-                    fv.valid_time_utc,
+                    fv_wind.run_id,
+                    fv_wind.valid_time_utc,
                     fr.init_time_utc,
-                    fv.value AS forecast_value,
-                    fvdir.value AS forecast_dir_deg,
-                    o.value AS observed_value,
+                    fv_wind.value AS forecast_wind,
+                    fv_gust.value AS forecast_gust,
+                    fv_dir.value AS forecast_dir_deg,
+                    o.value AS observed_target,
                     extract(hour FROM (o.ts_utc AT TIME ZONE 'UTC' AT TIME ZONE 'America/New_York')) AS local_hour,
                     row_number() OVER (
-                        PARTITION BY fv.run_id, fv.valid_time_utc
-                        ORDER BY abs(epoch(fv.valid_time_utc) - epoch(o.ts_utc))
+                        PARTITION BY fv_wind.run_id, fv_wind.valid_time_utc
+                        ORDER BY abs(epoch(fv_wind.valid_time_utc) - epoch(o.ts_utc))
                     ) AS obs_rn
-                FROM forecast_values fv
-                JOIN forecast_runs fr ON fr.run_id = fv.run_id
-                LEFT JOIN forecast_values fvdir
-                    ON fvdir.run_id = fv.run_id
-                   AND fvdir.valid_time_utc = fv.valid_time_utc
-                   AND fvdir.variable = ?
+                FROM forecast_values fv_wind
+                JOIN forecast_runs fr ON fr.run_id = fv_wind.run_id
+                LEFT JOIN forecast_values fv_gust
+                    ON fv_gust.run_id = fv_wind.run_id
+                   AND fv_gust.valid_time_utc = fv_wind.valid_time_utc
+                   AND fv_gust.variable = ?
+                LEFT JOIN forecast_values fv_dir
+                    ON fv_dir.run_id = fv_wind.run_id
+                   AND fv_dir.valid_time_utc = fv_wind.valid_time_utc
+                   AND fv_dir.variable = ?
                 JOIN observations o
                     ON o.location_id = ?
-                   AND o.variable = fv.variable
-                   AND o.ts_utc BETWEEN fv.valid_time_utc - INTERVAL '7.5 minutes'
-                                     AND fv.valid_time_utc + INTERVAL '7.5 minutes'
-                WHERE fr.location_id = ? AND fr.model = ? AND fv.variable = ?
+                   AND o.variable = ?
+                   AND o.ts_utc BETWEEN fv_wind.valid_time_utc - INTERVAL '7.5 minutes'
+                                     AND fv_wind.valid_time_utc + INTERVAL '7.5 minutes'
+                WHERE fr.location_id = ? AND fr.model = ? AND fv_wind.variable = ?
             ),
             one_per_real_event AS (
                 SELECT
-                    valid_time_utc, forecast_value, forecast_dir_deg, observed_value, local_hour,
+                    valid_time_utc, forecast_wind, forecast_gust, forecast_dir_deg, observed_target, local_hour,
                     row_number() OVER (
                         PARTITION BY valid_time_utc
                         ORDER BY init_time_utc DESC
@@ -1160,15 +1184,15 @@ def api_wind_prediction(params):
                 FROM nearest_obs
                 WHERE obs_rn = 1
             )
-            SELECT forecast_value, forecast_dir_deg, observed_value, local_hour
+            SELECT forecast_wind, forecast_gust, forecast_dir_deg, observed_target, local_hour
             FROM one_per_real_event
             WHERE event_rn = 1
             """,
-            [dir_variable, ground_truth_location, location, model, variable],
+            [gust_variable, dir_variable, ground_truth_location, target_variable, location, model, variable],
         ).fetchall()
         training_rows = [
-            (f, d, o, h) for (f, d, o, h) in training_rows
-            if f is not None and o is not None and h is not None
+            (fw, fg, fd, ot, h) for (fw, fg, fd, ot, h) in training_rows
+            if fw is not None and ot is not None and h is not None
         ]
 
         # 3. Fit the Bayesian linear regression model (replaces the old
@@ -1183,33 +1207,41 @@ def api_wind_prediction(params):
         # at KBOS might) -- the frontend's bucket legend is built from
         # this list.
         all_actual_buckets = sorted(
-            {_wind_bucket(o_val) for (_, _, o_val, _) in training_rows},
+            {_wind_bucket(o_val) for (_, _, _, o_val, _) in training_rows},
             key=lambda b: int(b.split("-")[0]),
         )
         regression_model = wind_regression_model.fit(training_rows)
 
-        def posterior_for(forecast_wind, forecast_dir, local_hour):
+        def posterior_for(forecast_wind, forecast_gust, forecast_dir, local_hour):
             if regression_model is None or not all_actual_buckets:
                 return None
             return wind_regression_model.predict_distribution(
-                regression_model, forecast_wind, forecast_dir, local_hour,
+                regression_model, forecast_wind, forecast_gust, forecast_dir, local_hour,
                 all_actual_buckets, WIND_BUCKET_WIDTH_KT,
             )
 
-        # 4. Attach a probability distribution (over ACTUAL wind buckets)
-        # to every forecast point, using ITS OWN local-hour daypart and
-        # ITS OWN forecast direction sector.
+        # 4. Attach a probability distribution (over ACTUAL buckets for
+        # the selected target) to every forecast point, using ITS OWN
+        # local-hour daypart and ITS OWN forecast wind/gust/direction.
         predictions = []
         for row in forecast_points:
-            forecast_wind = row["value"]
+            forecast_wind = row["forecast_wind"]
+            forecast_gust = row["forecast_gust"]
             forecast_dir = row["forecast_dir_deg"]
-            fb = _wind_bucket(forecast_wind) if forecast_wind is not None else None
+            # fb (forecast bucket label shown in the tooltip) reflects
+            # whichever forecast value corresponds to the selected
+            # target -- forecast wind for the Wind chart, forecast gust
+            # for the Gust chart -- even though BOTH are always used as
+            # regression inputs.
+            forecast_for_bucket = forecast_wind if target == "wind" else forecast_gust
+            fb = _wind_bucket(forecast_for_bucket) if forecast_for_bucket is not None else None
             dp = _daypart(row["local_hour"]) if row["local_hour"] is not None else None
             sector = _compass_sector_label(forecast_dir) if forecast_dir is not None else "unknown"
-            probs = posterior_for(forecast_wind, forecast_dir, row["local_hour"]) if forecast_wind is not None else None
+            probs = posterior_for(forecast_wind, forecast_gust, forecast_dir, row["local_hour"]) if forecast_wind is not None else None
             predictions.append({
                 "valid_time_utc": row["valid_time_utc"],
                 "forecast_wind_kt": forecast_wind,
+                "forecast_gust_kt": forecast_gust,
                 "forecast_wind_bucket": fb,
                 "daypart": dp,
                 "forecast_dir_deg": forecast_dir,
@@ -1221,6 +1253,7 @@ def api_wind_prediction(params):
         return {
             "location": location,
             "model": model,
+            "target": target,
             "training_sample_size": len(training_rows),
             "wind_bucket_width_kt": WIND_BUCKET_WIDTH_KT,
             "wind_prediction_directions": WIND_PREDICTION_DIRECTIONS,
