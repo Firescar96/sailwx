@@ -517,6 +517,15 @@ async function init() {
   d3.select('#flag-prediction-hours-select').on('change', loadFlagPredictionChart);
   persistSelectOnChange('flag-prediction-hours-select');
 
+  // Wind & Gust Prediction -- MERGED INTO ONE CARD 2026-10-16 (user:
+  // "merge the wind prediction and gust prediction blocks into one
+  // card, they can share controls and description"). One shared
+  // model/hours selection now drives BOTH charts (website/static/
+  // index.html only has #wind-prediction-model-select/-hours-select
+  // left -- the gust panel's own duplicate controls were removed from
+  // the HTML entirely, not just hidden), since both charts already use
+  // the exact same api_wind_prediction call with only `target`
+  // differing -- there was never a reason for 2 independent selections.
   const windModelSelect = d3.select('#wind-prediction-model-select');
   windModelSelect.selectAll('option')
     .data(Object.keys(MODEL_COLORS))
@@ -524,28 +533,12 @@ async function init() {
     .attr('value', d => d)
     .text(d => d.toUpperCase());
   windModelSelect.property('value', restoreSelectValue('wind-prediction-model-select') || 'gfs');
-  windModelSelect.on('change', loadWindPredictionChart);
+  windModelSelect.on('change', () => { loadWindPredictionChart(); loadGustPredictionChart(); });
   persistSelectOnChange('wind-prediction-model-select');
   restoreSelectValue('wind-prediction-hours-select');
-  d3.select('#wind-prediction-hours-select').on('change', loadWindPredictionChart);
+  d3.select('#wind-prediction-hours-select').on('change', () => { loadWindPredictionChart(); loadGustPredictionChart(); });
   persistSelectOnChange('wind-prediction-hours-select');
 
-  // Gust Prediction panel -- ADDED 2026-10-16 (user: "i need two graphs
-  // instead of one, one for wind and one for wind gusts"), mirrors Wind
-  // Prediction's init exactly (shares the same api_wind_prediction
-  // backend, just with target=gust -- see loadWindPredictionChart).
-  const gustPredModelSelect = d3.select('#gust-prediction-model-select');
-  gustPredModelSelect.selectAll('option')
-    .data(Object.keys(MODEL_COLORS))
-    .join('option')
-    .attr('value', d => d)
-    .text(d => d.toUpperCase());
-  gustPredModelSelect.property('value', restoreSelectValue('gust-prediction-model-select') || 'gfs');
-  gustPredModelSelect.on('change', loadGustPredictionChart);
-  persistSelectOnChange('gust-prediction-model-select');
-  restoreSelectValue('gust-prediction-hours-select');
-  d3.select('#gust-prediction-hours-select').on('change', loadGustPredictionChart);
-  persistSelectOnChange('gust-prediction-hours-select');
 
   // Wind Rose panel: model select has an extra "Observed only" option
   // (empty value) since the comparison model is optional.
@@ -610,7 +603,6 @@ function updatePredictionPanelVisibility() {
   const isCbi = state.location === 'cbi_dockhouse';
   d3.select('#flag-prediction-panel').attr('hidden', isCbi ? null : true);
   d3.select('#wind-prediction-panel').attr('hidden', isCbi ? true : null);
-  d3.select('#gust-prediction-panel').attr('hidden', isCbi ? true : null);
   d3.select('#wind-rose-panel').attr('hidden', isCbi ? true : null);
   d3.select('#gust-factor-panel').attr('hidden', isCbi ? true : null);
 }
@@ -2495,9 +2487,18 @@ function windBucketColorScale(buckets) {
 // different DOM element id prefixes and a different probability field
 // label. loadWindPredictionChart() and loadGustPredictionChart() below
 // are thin wrappers that just supply the right idPrefix/target/label.
-async function loadPredictionChart(idPrefix, target, yAxisLabel, noDataNoun) {
-  const model = d3.select(`#${idPrefix}-model-select`).property('value');
-  const hours = +d3.select(`#${idPrefix}-hours-select`).property('value');
+//
+// MERGED INTO ONE CARD 2026-10-16 (user: "merge the wind prediction and
+// gust prediction blocks into one card, they can share controls and
+// description"). `controlsPrefix` (where Model/Look-ahead are read
+// from) is now separate from `idPrefix` (where this chart's own
+// chart/empty <div>s live) -- both charts read their shared model/hours
+// selection from the single remaining "wind-prediction" controls, but
+// still render into their own distinct chart containers within the
+// same merged panel.
+async function loadPredictionChart(idPrefix, controlsPrefix, target, yAxisLabel, noDataNoun) {
+  const model = d3.select(`#${controlsPrefix}-model-select`).property('value');
+  const hours = +d3.select(`#${controlsPrefix}-hours-select`).property('value');
   if (!model || !state.location) return;
 
   const data = await fetchJSON(`/api/wind-prediction?location=${state.location}&model=${model}&hours=${hours}&target=${target}`);
@@ -2613,11 +2614,11 @@ async function loadPredictionChart(idPrefix, target, yAxisLabel, noDataNoun) {
 }
 
 async function loadWindPredictionChart() {
-  return loadPredictionChart('wind-prediction', 'wind', 'P(actual wind bucket)', 'forecast wind');
+  return loadPredictionChart('wind-prediction', 'wind-prediction', 'wind', 'P(actual wind bucket)', 'forecast wind');
 }
 
 async function loadGustPredictionChart() {
-  return loadPredictionChart('gust-prediction', 'gust', 'P(actual gust bucket)', 'forecast gust');
+  return loadPredictionChart('gust-prediction', 'wind-prediction', 'gust', 'P(actual gust bucket)', 'forecast gust');
 }
 
 // ---------------------------------------------------------------------------
