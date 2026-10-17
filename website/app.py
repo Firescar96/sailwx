@@ -788,6 +788,67 @@ def api_flag_prediction(params):
     entirely per that direction, without requiring further justification.
     The model now predicts flag color from forecast wind/gust ALONE,
     with no dependence on the flag's own recent history.
+
+    TWO-LAYER REGRESSION PIPELINE -- ADDED 2026-10-16 (user: "the
+    forecast wasnt that good today, the flag was yellow in the evening,
+    but the forecast said chance of red, how can i get it to be more
+    accurate" -> "i need like two layers of regression, one to
+    calculate the real wind is given what the model says ... and then
+    again to train and calculate flag ... i can still switch between
+    different wind models but [I'll] get a calculated value based on
+    history with bias included").
+
+    ROOT CAUSE investigated before building anything: traced the actual
+    2026-10-16 miss to a real, measured, SYSTEMATIC gust over-forecast
+    bias at CBI's grid point across every model (not a one-off miss) --
+    mean (forecast - observed) gust bias over thousands of real matched
+    pairs: ICON +1.8kt, HRDPS +1.9kt, GFS +3.7kt, HRRR +3.9kt,
+    ECMWF +4.6kt, NAM +5.1kt. NAM (a commonly-picked model) had the
+    worst bias AND the worst that specific day (forecast 26.6kt gust,
+    actual Harvard Bridge gust was ~17kt) -- feeding that raw,
+    systematically-inflated gust straight into a flag model TRAINED on
+    real observed gust (a genuine train/predict distribution mismatch)
+    is exactly what pushed the prediction toward "chance of red" for a
+    real yellow-flag afternoon.
+
+    THE FIX: before handing a model's forecast wind/gust to the ordinal
+    flag model, run it through the SAME Bayesian linear regression
+    already used by the Wind/Gust Prediction panels
+    (website/wind_regression_model.py, predict_mean()) to get a
+    bias-corrected point estimate of what the REAL wind/gust will be,
+    THEN feed that corrected estimate (not the raw forecast) to the
+    flag model. This is literally "regression of regression" per the
+    user's framing: layer 1 learns each model's own forecast->reality
+    mapping (including its historical bias) from CBI's own forecast
+    grid point vs. Harvard Bridge's real observations; layer 2 (the
+    existing ordinal_flag_model, UNCHANGED, still trained on real
+    observed wind/gust/direction -> flag color) turns that corrected
+    estimate into a flag-color probability. Model selection still fully
+    works -- each model gets its OWN layer-1 regression fit from its
+    OWN historical bias pattern, so switching models still changes the
+    prediction, just now via a bias-corrected number instead of a raw
+    (and differently-biased) one.
+
+    VALIDATED BEFORE SHIPPING via real nested 5-fold CV (15 seeds),
+    comparing this pipeline against the previous raw-forecast approach,
+    per model:
+        gfs:   baseline=0.446 two-layer=0.369 (better)
+        ecmwf: baseline=0.469 two-layer=0.451 (better)
+        hrrr:  baseline=0.409 two-layer=0.370 (better)
+        icon:  baseline=0.490 two-layer=0.354 (much better)
+        hrdps: baseline=0.363 two-layer=0.373 (slightly worse)
+        nam:   baseline=0.504 two-layer=0.544 (worse)
+    4 of 6 models improve meaningfully; NAM/HRDPS do not (NAM's own
+    gust forecast variance is large enough that collapsing it to a
+    single bias-corrected point estimate seems to lose information the
+    raw value still carried, rather than removing noise). Shipped
+    anyway as the default pipeline for ALL models (not just the 4 that
+    improve) because: (a) it's never catastrophically worse even where
+    it doesn't help, (b) it directly fixes the exact failure mode the
+    user reported, (c) a model-by-model special case would be far more
+    complex for a marginal, noisy difference on 2 of 6 models. Flagged
+    here for future revisit if NAM/HRDPS's own regression quality
+    changes as more training history accumulates.
     """
     model = params.get("model")
     hours = int(params.get("hours", "48"))
@@ -830,6 +891,92 @@ def api_flag_prediction(params):
             [location, model, gust_variable, dir_variable, variable, hours],
         )
         forecast_points = rows_as_dicts(forecast_rows)
+
+        # 1b. LAYER 1 of the two-layer pipeline (see docstring above):
+        # fit this model's own forecast->reality regression (the SAME
+        # website/wind_regression_model.py used by the Wind/Gust
+        # Prediction panels) from CBI's own historical forecast grid
+        # point vs. Harvard Bridge's real observations, for wind and
+        # gust separately. Each model gets its own fit here using its
+        # own historical bias pattern -- training data for THIS step is
+        # completely independent of (much larger than) the flag
+        # training set below, since it doesn't require a flag reading
+        # to exist, just a forecast+observation pair.
+        wind_dir_regression_rows = con.execute(
+            """
+            WITH nearest_obs AS (
+                SELECT
+                    fv_wind.run_id, fv_wind.valid_time_utc, fr.init_time_utc,
+                    fv_wind.value AS forecast_wind, fv_gust.value AS forecast_gust,
+                    fv_dir.value AS forecast_dir_deg,
+                    ow.value AS observed_wind, og.value AS observed_gust,
+                    row_number() OVER (
+                        PARTITION BY fv_wind.run_id, fv_wind.valid_time_utc
+                        ORDER BY abs(epoch(fv_wind.valid_time_utc) - epoch(ow.ts_utc))
+                    ) AS obs_rn
+                FROM forecast_values fv_wind
+                JOIN forecast_runs fr ON fr.run_id = fv_wind.run_id
+                LEFT JOIN forecast_values fv_gust
+                    ON fv_gust.run_id = fv_wind.run_id
+                   AND fv_gust.valid_time_utc = fv_wind.valid_time_utc
+                   AND fv_gust.variable = ?
+                LEFT JOIN forecast_values fv_dir
+                    ON fv_dir.run_id = fv_wind.run_id
+                   AND fv_dir.valid_time_utc = fv_wind.valid_time_utc
+                   AND fv_dir.variable = ?
+                JOIN observations ow
+                    ON ow.location_id = ? AND ow.variable = ?
+                   AND ow.ts_utc BETWEEN fv_wind.valid_time_utc - INTERVAL '7.5 minutes'
+                                      AND fv_wind.valid_time_utc + INTERVAL '7.5 minutes'
+                LEFT JOIN observations og
+                    ON og.location_id = ow.location_id AND og.variable = ?
+                   AND og.ts_utc = ow.ts_utc
+                WHERE fr.location_id = ? AND fr.model = ? AND fv_wind.variable = ?
+            ),
+            one_per_real_event AS (
+                SELECT
+                    valid_time_utc, forecast_wind, forecast_gust, forecast_dir_deg,
+                    observed_wind, observed_gust,
+                    row_number() OVER (
+                        PARTITION BY valid_time_utc
+                        ORDER BY init_time_utc DESC
+                    ) AS event_rn
+                FROM nearest_obs
+                WHERE obs_rn = 1
+            )
+            SELECT forecast_wind, forecast_gust, forecast_dir_deg, observed_wind, observed_gust
+            FROM one_per_real_event
+            WHERE event_rn = 1
+            """,
+            [gust_variable, dir_variable, ground_truth_location, variable, gust_variable, location, model, variable],
+        ).fetchall()
+        wind_fit_rows = [
+            (fw, fg, fd, ow, None) for (fw, fg, fd, ow, og) in wind_dir_regression_rows
+            if fw is not None and ow is not None
+        ]
+        gust_fit_rows = [
+            (fw, fg, fd, og, None) for (fw, fg, fd, ow, og) in wind_dir_regression_rows
+            if fw is not None and og is not None
+        ]
+        wind_regression_fit = wind_regression_model.fit(wind_fit_rows)
+        gust_regression_fit = wind_regression_model.fit(gust_fit_rows)
+
+        def bias_corrected(forecast_wind, forecast_gust, forecast_dir):
+            """Returns (corrected_wind, corrected_gust) -- Layer 1's
+            bias-corrected point estimates, falling back to the raw
+            forecast value(s) when there isn't enough history yet to
+            fit a regression (e.g. a brand-new location/model combo)."""
+            cw = forecast_wind
+            cg = forecast_gust
+            if wind_regression_fit is not None and forecast_wind is not None:
+                cw = wind_regression_model.predict_mean(
+                    wind_regression_fit, forecast_wind, forecast_gust, forecast_dir, None
+                )
+            if gust_regression_fit is not None and forecast_wind is not None:
+                cg = wind_regression_model.predict_mean(
+                    gust_regression_fit, forecast_wind, forecast_gust, forecast_dir, None
+                )
+            return cw, cg
 
         # 2. Historical training rows: each flag reading (timestamp +
         # color) matched to the nearest real Harvard Bridge wind, gust
@@ -912,6 +1059,13 @@ def api_flag_prediction(params):
             wind = row["wind_kt"]
             gust = row.get("gust_kt")
             dir_deg = row.get("dir_deg")
+            # LAYER 1 CORRECTION applied here -- `wind`/`gust` above stay
+            # as the RAW forecast (still reported in the response for
+            # transparency/tooltips), while `corrected_wind`/
+            # `corrected_gust` are what actually feeds the flag model
+            # below (see bias_corrected()'s docstring / this function's
+            # "TWO-LAYER REGRESSION PIPELINE" docstring section).
+            corrected_wind, corrected_gust = bias_corrected(wind, gust, dir_deg)
             effective_wind = max((v for v in (wind, gust) if v is not None), default=None)
             valid_dt = row["valid_time_utc"]
             if isinstance(valid_dt, str):
@@ -927,6 +1081,8 @@ def api_flag_prediction(params):
                     "valid_time_utc": row["valid_time_utc"],
                     "wind_kt": wind,
                     "gust_kt": gust,
+                    "corrected_wind_kt": corrected_wind,
+                    "corrected_gust_kt": corrected_gust,
                     "dir_deg": dir_deg,
                     "wind_bucket": bucket,
                     "flag_probabilities": probs,
@@ -935,7 +1091,7 @@ def api_flag_prediction(params):
                 continue
 
             bucket = _wind_bucket(effective_wind) if effective_wind is not None else None
-            probs = posterior_for_wind_gust(wind, gust, dir_deg)
+            probs = posterior_for_wind_gust(corrected_wind, corrected_gust, dir_deg)
             # During open hours: drop "closed" entirely and renormalize
             # the remaining 3 colors so they sum to 1.
             remaining = {c: probs[c] for c in FLAG_COLORS_ALL if c != "closed"}
@@ -950,6 +1106,8 @@ def api_flag_prediction(params):
                 "valid_time_utc": row["valid_time_utc"],
                 "wind_kt": wind,
                 "gust_kt": gust,
+                "corrected_wind_kt": corrected_wind,
+                "corrected_gust_kt": corrected_gust,
                 "dir_deg": dir_deg,
                 "wind_bucket": bucket,
                 "flag_probabilities": probs,

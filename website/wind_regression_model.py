@@ -177,6 +177,27 @@ def fit(training_rows):
     return {"beta": beta, "sigma": sigma, "n_training": len(rows)}
 
 
+def predict_mean(fitted_model, forecast_wind_kt, forecast_gust_kt, forecast_dir_deg, local_hour):
+    """Returns the fitted model's single point estimate (the regression's
+    predicted mean, bias-corrected for this model's own historical
+    over/under-forecasting pattern) -- no bucket distribution, just the
+    number. ADDED 2026-10-16 for the CBI Flag Prediction two-layer
+    pipeline (see api_flag_prediction's docstring for the full
+    rationale): the flag model needs a single "what do we think the
+    REAL wind/gust will be" estimate to feed in as its own input
+    features, not a probability distribution over buckets -- this is
+    exactly the same underlying regression as predict_distribution(),
+    just stopping one step earlier (before the Gaussian-CDF-over-
+    buckets conversion) since the flag model has its own separate
+    uncertainty model (the ordinal logistic regression's own posterior)
+    rather than needing this layer's uncertainty passed through too."""
+    beta = fitted_model["beta"]
+    dp = _daypart(local_hour)
+    sector = _compass_sector8(forecast_dir_deg)
+    row = np.array(_feature_row(forecast_wind_kt, forecast_gust_kt, dp, sector))
+    return float(row @ beta)
+
+
 def predict_distribution(fitted_model, forecast_wind_kt, forecast_gust_kt, forecast_dir_deg, local_hour, bucket_labels, bucket_width_kt):
     """Returns {bucket_label: probability} over the given bucket labels
     (e.g. "12-16kt"), using the fitted Gaussian predictive distribution

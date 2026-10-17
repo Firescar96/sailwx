@@ -2413,10 +2413,22 @@ async function loadFlagPredictionChart() {
     .attr('height', d => y(d[0]) - y(d[1]))
     .on('mousemove', (event, d) => {
       const p = predictions.find(pr => pr.valid_time_utc === d.data.valid_time_utc);
+      // TWO-LAYER PIPELINE -- ADDED 2026-10-16 (user: "i need like two
+      // layers of regression ... calculate a value based on history
+      // with bias included"). Shows BOTH the raw model forecast AND
+      // the bias-corrected estimate actually fed into the flag model
+      // (see api_flag_prediction's docstring) -- makes the correction
+      // visible rather than silently changing numbers behind the
+      // scenes, especially useful for models with a known large gust
+      // bias (e.g. NAM) where the two numbers can differ a lot.
+      const correctionNote = (p.corrected_wind_kt != null || p.corrected_gust_kt != null)
+        ? `<br>bias-corrected estimate: ${p.corrected_wind_kt != null ? p.corrected_wind_kt.toFixed(1) + ' kt' : 'n/a'} wind, ` +
+          `${p.corrected_gust_kt != null ? p.corrected_gust_kt.toFixed(1) + ' kt' : 'n/a'} gust`
+        : '';
       tooltip.style('opacity', 1)
         .html(`<b>${d.key.toUpperCase()}</b>: ${(p.flag_probabilities[d.key] * 100).toFixed(1)}%<br>` +
               `${formatLocalDateTime(new Date(p.valid_time_utc + 'Z'))}<br>` +
-              `forecast wind: ${p.wind_kt != null ? p.wind_kt.toFixed(1) + ' kt' : 'n/a'}, gust: ${p.gust_kt != null ? p.gust_kt.toFixed(1) + ' kt' : 'n/a'} (effective bucket: ${p.wind_bucket || 'n/a'})<br>` +
+              `forecast wind: ${p.wind_kt != null ? p.wind_kt.toFixed(1) + ' kt' : 'n/a'}, gust: ${p.gust_kt != null ? p.gust_kt.toFixed(1) + ' kt' : 'n/a'} (effective bucket: ${p.wind_bucket || 'n/a'})${correctionNote}<br>` +
               `<i>most likely: ${p.most_likely_flag ? p.most_likely_flag.toUpperCase() : 'n/a'}</i>`)
         .style('left', (event.pageX + 12) + 'px')
         .style('top', (event.pageY - 10) + 'px');
