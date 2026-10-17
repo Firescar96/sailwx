@@ -169,6 +169,25 @@ function fmtVarLabel(v) {
   return VARIABLE_LABELS[v] || v;
 }
 
+// PROMOTED to top-level 2026-10-08 (was a local function inside
+// renderWindDirectionChart only) -- now also used by
+// renderStabilityDirectionChart(), see that function for the
+// "forecast stability math for wind_dir_deg must be circular, not
+// plain numeric MIN/MAX/AVG" rationale.
+function circularMeanDeg(degs) {
+  if (!degs.length) return null;
+  const sx = degs.reduce((s, d) => s + Math.sin(d * Math.PI / 180), 0);
+  const cx = degs.reduce((s, d) => s + Math.cos(d * Math.PI / 180), 0);
+  if (sx === 0 && cx === 0) return null; // perfectly opposed directions cancel out -- no meaningful average
+  return ((Math.atan2(sx, cx) * 180 / Math.PI) + 360) % 360;
+}
+
+function circularDiffDeg(a, b) {
+  // smallest angle between two bearings, in [0, 180]
+  let diff = Math.abs(a - b) % 360;
+  return diff > 180 ? 360 - diff : diff;
+}
+
 // Shared x-axis tick formatter for the Forecast Time Series charts
 // (both the normal line chart and the Wind Direction row/arrow chart
 // use this identically -- was previously duplicated in each). SIMPLIFIED
@@ -1658,20 +1677,6 @@ function renderWindDirectionChart(container, tooltip, models, byModel, obs, flag
     );
   }
 
-  function circularMeanDeg(degs) {
-    if (!degs.length) return null;
-    const sx = degs.reduce((s, d) => s + Math.sin(d * Math.PI / 180), 0);
-    const cx = degs.reduce((s, d) => s + Math.cos(d * Math.PI / 180), 0);
-    if (sx === 0 && cx === 0) return null; // perfectly opposed directions cancel out -- no meaningful average
-    return ((Math.atan2(sx, cx) * 180 / Math.PI) + 360) % 360;
-  }
-
-  function circularDiffDeg(a, b) {
-    // smallest angle between two bearings, in [0, 180]
-    let diff = Math.abs(a - b) % 360;
-    return diff > 180 ? 360 - diff : diff;
-  }
-
   const modelSeriesSorted = new Map(models.map(m => [
     m,
     (byModel.get(m) || []).filter(d => d.value != null).slice().sort((a, b) => a.valid_time_utc_date - b.valid_time_utc_date),
@@ -1944,6 +1949,130 @@ function renderWindDirectionChart(container, tooltip, models, byModel, obs, flag
 // before an older one may have resolved.
 let stabilityRequestToken = 0;
 
+// FORECAST STABILITY -- WIND DIRECTION ARROWS -- ADDED 2026-10-08
+// (user: "i like the shading for differences, but the wind direction
+// forecast stability chart should have arrows"). Mirrors
+// renderWindDirectionChart's row-per-model arrow layout (same arrow
+// glyph, same "blowing toward" rotation convention, same color =
+// model), but answers Forecast Stability's own question instead of
+// Forecast Time Series' -- "how much has THIS model's own prediction
+// for this hour changed across its last N runs" rather than "what did
+// each model predict / what was observed". Each arrow here is the
+// CIRCULAR mean direction across a model's last N runs for that valid
+// hour (see api_forecast_stability's "WIND DIRECTION IS CIRCULAR" fix
+// -- the backend now returns raw per-run values for wind_dir_deg
+// specifically so this circular math can happen here, matching how
+// circularMeanDeg/circularDiffDeg are already used for the Wind
+// Direction chart's REF row).
+//
+// SPREAD -> OPACITY: there's no equivalent of a shaded min/max band
+// for a single arrow per cell, so run-to-run disagreement is encoded
+// as arrow opacity instead -- solid arrow = the model's last N runs
+// all agreed closely on this hour's direction (low circular spread),
+// faded arrow = its own runs disagreed (unstable/low-confidence),
+// exactly mirroring what the shaded band communicates for every other
+// variable, just via a different visual channel suited to a directional
+// glyph. Spread is measured as the max circularDiffDeg from the
+// circular mean across that cell's raw values (0 degrees = full
+// opacity, capped at 90+ degrees = the fixed minimum floor opacity).
+function renderStabilityDirectionChart(container, rows, models, numRuns) {
+  const rowHeight = 34;
+  const rowsTop = 10;
+  const width = Math.min(900, container.node().clientWidth || 900);
+
+  rows.forEach(d => { d.valid_time_utc_date = new Date(d.valid_time_utc + 'Z'); });
+  const columnDates = Array.from(new Set(rows.map(d => +d.valid_time_utc_date))).sort((a, b) => a - b).map(t => new Date(t));
+
+  const margin = { top: rowsTop, right: 20, bottom: 70, left: 60 };
+  const plotHeight = Math.max(200, models.length * rowHeight);
+  const svg = container.append('svg').attr('width', width).attr('height', rowsTop + plotHeight + margin.bottom);
+
+  const x = d3.scaleTime()
+    .domain(d3.extent(columnDates))
+    .range([margin.left, width - margin.right]);
+
+  const rowY = d3.scaleBand()
+    .domain(models)
+    .range([rowsTop, rowsTop + plotHeight])
+    .paddingInner(0.3);
+
+  svg.append('g')
+    .attr('class', 'axis')
+    .attr('transform', `translate(0,${rowsTop + plotHeight})`)
+    .call(d3.axisBottom(x).ticks(Math.min(10, columnDates.length))
+      .tickFormat(d => formatLocalDateTime(d).slice(5)))
+    .selectAll('text')
+    .attr('transform', 'rotate(-35)')
+    .style('text-anchor', 'end');
+
+  svg.append('text')
+    .attr('x', width / 2).attr('y', rowsTop + plotHeight + margin.bottom - 6)
+    .attr('text-anchor', 'middle')
+    .attr('fill', 'var(--muted)').attr('font-size', '0.72rem')
+    .text(`Upcoming forecast hours -- arrow opacity = agreement across each model's last ${numRuns} runs (solid = consistent, faded = still disagreeing)`);
+
+  const tooltip = getOrCreateTooltip('point-tooltip');
+
+  function setHighlight(hoveredModel) {
+    svg.selectAll('[data-row-key]')
+      .attr('opacity', function () {
+        const key = d3.select(this).attr('data-row-key');
+        return !hoveredModel || key === hoveredModel ? 1 : 0.25;
+      });
+  }
+
+  // Per-model row label (reuses MODEL_COLORS, same convention as every
+  // other chart on this dashboard).
+  models.forEach(m => {
+    svg.append('text')
+      .attr('x', margin.left - 8).attr('y', rowY(m) + rowY.bandwidth() / 2 + 4)
+      .attr('text-anchor', 'end')
+      .attr('fill', MODEL_COLORS[m] || '#888')
+      .attr('font-size', '0.72rem')
+      .attr('font-weight', 'bold')
+      .text(m.toUpperCase());
+  });
+
+  const byModel = d3.group(rows, d => d.model);
+
+  models.forEach(m => {
+    const series = (byModel.get(m) || []).slice().sort((a, b) => a.valid_time_utc_date - b.valid_time_utc_date);
+    const points = series.map(d => {
+      const meanDeg = circularMeanDeg(d.values);
+      if (meanDeg == null) return null;
+      const maxDiff = d3.max(d.values, v => circularDiffDeg(v, meanDeg));
+      return { date: d.valid_time_utc_date, value: meanDeg, maxDiff, n: d.n_runs_with_this_hour };
+    }).filter(d => d != null);
+
+    const rowCenter = rowY(m) + rowY.bandwidth() / 2;
+    svg.append('g')
+      .attr('data-row-key', m)
+      .selectAll('path.stability-dir-arrow')
+      .data(points)
+      .join('path')
+      .attr('class', 'stability-dir-arrow')
+      .attr('d', 'M 0,-7 L 5,5 L 0,2 L -5,5 Z') // same arrowhead glyph as the Wind Direction chart
+      .attr('transform', d => `translate(${x(d.date)},${rowCenter}) rotate(${(d.value + 180) % 360})`)
+      .attr('fill', MODEL_COLORS[m] || '#888')
+      .attr('opacity', d => Math.max(0.2, 1 - Math.min(d.maxDiff, 90) / 90 * 0.8))
+      .style('cursor', 'pointer')
+      .on('mouseenter', () => setHighlight(m))
+      .on('mousemove', (event, d) => {
+        const towardDeg = Math.round((d.value + 180) % 360);
+        const runsNote = d.n < +numRuns
+          ? `<br><span style="color:var(--muted)">(only ${d.n}/${numRuns} runs reach this far ahead)</span>`
+          : '';
+        tooltip.style('opacity', 1)
+          .html(`<b>${m.toUpperCase()}</b><br>${formatLocalDateTime(d.date)}<br>` +
+                `avg direction across last ${numRuns} runs: from ${Math.round(d.value)}\u00b0 (blowing toward ${towardDeg}\u00b0)<br>` +
+                `max run-to-run disagreement: ${Math.round(d.maxDiff)}\u00b0${runsNote}`)
+          .style('left', (event.pageX + 12) + 'px')
+          .style('top', (event.pageY - 10) + 'px');
+      })
+      .on('mouseleave', () => { tooltip.style('opacity', 0); setHighlight(null); });
+  });
+}
+
 async function loadStabilityChart() {
   const myToken = ++stabilityRequestToken;
   const numRuns = d3.select('#stability-num-runs-select').property('value');
@@ -1988,6 +2117,18 @@ async function loadStabilityChart() {
 
   rows.forEach(d => { d.valid_time_utc_date = new Date(d.valid_time_utc + 'Z'); });
   const models = Array.from(new Set(rows.map(d => d.model))).sort();
+
+  // WIND DIRECTION -- ARROWS, NOT A SHADED BAND -- ADDED 2026-10-08
+  // (user: "i like the shading for differences, but the wind direction
+  // forecast stability chart should have arrows"). wind_dir_deg is
+  // never part of a combo group (see VARIABLE_GROUPS), so checking
+  // state.variable directly here is safe and matches the same pattern
+  // used in loadForecastChart for the identical reason.
+  if (state.variable === 'wind_dir_deg') {
+    renderStabilityDirectionChart(container, rows, models, numRuns);
+    return;
+  }
+
   // Grouped by (model, member) -- mirrors the Forecast Time Series
   // chart's byModelMember, see that comment for the full rationale.
   const byModelMember = d3.group(rows, d => d.model, d => d.__member);

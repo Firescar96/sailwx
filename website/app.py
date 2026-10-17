@@ -490,42 +490,102 @@ def api_forecast_stability(params):
         # of the selected runs actually reach that far, rather than
         # being capped by whichever selected run happens to be shortest.
         MIN_RUNS_FOR_SPREAD = 2
-        cur = con.execute(
-            """
-            WITH recent_runs AS (
-                SELECT run_id, model, init_time_utc,
-                       row_number() OVER (PARTITION BY model ORDER BY init_time_utc DESC) AS run_rank
-                FROM forecast_runs
-                WHERE location_id = ?
-            ),
-            chosen_runs AS (
-                SELECT run_id, model, init_time_utc
-                FROM recent_runs
-                WHERE run_rank <= ?
-            ),
-            values_across_runs AS (
-                SELECT cr.model, fv.valid_time_utc, fv.value, cr.init_time_utc
-                FROM forecast_values fv
-                JOIN chosen_runs cr ON cr.run_id = fv.run_id
-                WHERE fv.variable = ?
-                  AND fv.valid_time_utc >= now()
-                  AND fv.valid_time_utc <= now() + (? * INTERVAL '1 hour')
+
+        # WIND DIRECTION IS CIRCULAR -- FIXED 2026-10-08 (user: "i like
+        # the shading for differences, but the wind direction forecast
+        # stability chart should have arrows"). Investigating the
+        # "messy shading" complaint found a real correctness bug, not
+        # just a styling one: plain SQL MIN/MAX/AVG/STDDEV on
+        # wind_dir_deg treats compass degrees as an ordinary number --
+        # e.g. forecasts of 350 degrees and 10 degrees (both nearly due
+        # north, 20 degrees apart in reality) average to 180 (due
+        # south, the OPPOSITE direction), and their "spread" of 340
+        # looks like wild disagreement when the models actually nearly
+        # agreed. This is almost certainly why the wind-direction
+        # stability bands looked so noisy/wide. Every other variable
+        # (wind_speed_kt, wind_gust_kt, pressure_hpa, temps, etc) has no
+        # such wraparound issue, so this ONLY branches for
+        # wind_dir_deg -- the ordinary aggregation path below is
+        # completely unchanged for every other variable, preserving the
+        # existing shaded-band look the user explicitly said they like.
+        #
+        # For wind_dir_deg, skip SQL aggregation entirely and return the
+        # raw per-run degree values per (model, valid_time_utc) instead
+        # -- the frontend already has circularMeanDeg()/circularDiffDeg()
+        # helpers (built for the Wind Direction chart) and computes the
+        # real circular mean + an arrow-opacity-encoded spread from
+        # these raw values, mirroring that chart's rendering approach.
+        if variable == "wind_dir_deg":
+            cur = con.execute(
+                """
+                WITH recent_runs AS (
+                    SELECT run_id, model, init_time_utc,
+                           row_number() OVER (PARTITION BY model ORDER BY init_time_utc DESC) AS run_rank
+                    FROM forecast_runs
+                    WHERE location_id = ?
+                ),
+                chosen_runs AS (
+                    SELECT run_id, model, init_time_utc
+                    FROM recent_runs
+                    WHERE run_rank <= ?
+                ),
+                values_across_runs AS (
+                    SELECT cr.model, fv.valid_time_utc, fv.value
+                    FROM forecast_values fv
+                    JOIN chosen_runs cr ON cr.run_id = fv.run_id
+                    WHERE fv.variable = ?
+                      AND fv.valid_time_utc >= now()
+                      AND fv.valid_time_utc <= now() + (? * INTERVAL '1 hour')
+                )
+                SELECT model, valid_time_utc,
+                       count(*) AS n_runs_with_this_hour,
+                       list(value) AS values
+                FROM values_across_runs
+                GROUP BY model, valid_time_utc
+                HAVING count(*) >= ?
+                ORDER BY model, valid_time_utc
+                """,
+                [location, num_runs, variable, hours, MIN_RUNS_FOR_SPREAD],
             )
-            SELECT model, valid_time_utc,
-                   count(*) AS n_runs_with_this_hour,
-                   min(value) AS min_value,
-                   max(value) AS max_value,
-                   round(max(value) - min(value), 3) AS spread,
-                   round(stddev(value), 3) AS stddev_value,
-                   round(avg(value), 3) AS avg_value
-            FROM values_across_runs
-            GROUP BY model, valid_time_utc
-            HAVING count(*) >= ?
-            ORDER BY model, valid_time_utc
-            """,
-            [location, num_runs, variable, hours, MIN_RUNS_FOR_SPREAD],
-        )
-        rows = rows_as_dicts(cur)
+            rows = rows_as_dicts(cur)
+        else:
+            cur = con.execute(
+                """
+                WITH recent_runs AS (
+                    SELECT run_id, model, init_time_utc,
+                           row_number() OVER (PARTITION BY model ORDER BY init_time_utc DESC) AS run_rank
+                    FROM forecast_runs
+                    WHERE location_id = ?
+                ),
+                chosen_runs AS (
+                    SELECT run_id, model, init_time_utc
+                    FROM recent_runs
+                    WHERE run_rank <= ?
+                ),
+                values_across_runs AS (
+                    SELECT cr.model, fv.valid_time_utc, fv.value, cr.init_time_utc
+                    FROM forecast_values fv
+                    JOIN chosen_runs cr ON cr.run_id = fv.run_id
+                    WHERE fv.variable = ?
+                      AND fv.valid_time_utc >= now()
+                      AND fv.valid_time_utc <= now() + (? * INTERVAL '1 hour')
+                )
+                SELECT model, valid_time_utc,
+                       count(*) AS n_runs_with_this_hour,
+                       min(value) AS min_value,
+                       max(value) AS max_value,
+                       round(max(value) - min(value), 3) AS spread,
+                       round(stddev(value), 3) AS stddev_value,
+                       round(avg(value), 3) AS avg_value
+                FROM values_across_runs
+                GROUP BY model, valid_time_utc
+                HAVING count(*) >= ?
+                ORDER BY model, valid_time_utc
+                """,
+                [location, num_runs, variable, hours, MIN_RUNS_FOR_SPREAD],
+            )
+            rows = rows_as_dicts(cur)
+
 
         # Also report which init_time_utc runs were actually used per
         # model, so the frontend/tooltip can say "based on the last 3
