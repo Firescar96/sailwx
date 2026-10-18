@@ -7,6 +7,17 @@ const MODEL_COLORS = {
   icon: getCssVar('--icon'),
   nam: getCssVar('--nam'),
   hrdps: getCssVar('--hrdps'),
+  // NDA -- ADDED 2026-10-17 (user: "for every metric for every
+  // location for every graph, i need a new model, the Nchinda model
+  // that does linear regression across predictions for all models to
+  // give its own answer, weighted voting" -> named "NDA"). A real
+  // synthetic model (scripts/ingest_nda.py writes genuine
+  // forecast_runs/forecast_values rows with model='nda') -- it shows
+  // up automatically in every chart below exactly like any real NWP
+  // model, with no special-casing needed per chart. Distinct gold
+  // color (not reused from the 6 real models) so it visually stands
+  // out as "the ensemble", not just another raw model.
+  nda: getCssVar('--nda'),
 };
 
 const FLAG_COLORS = {
