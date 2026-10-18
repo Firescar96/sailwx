@@ -44,6 +44,14 @@ const VARIABLE_LABELS = {
   dew_point_f: 'Dew Point (°F)',
   rain_in: 'Rain (in/hr)',
   lightning_strikes: 'Lightning Strikes',
+  // ADDED 2026-10-18 (user: "do any of these data sources include CAPE
+  // or Lifted Index? i need to add that to all the locations where
+  // available" -> confirmed CAPE is real on Open-Meteo, Lifted Index
+  // isn't offered at all). FORECAST-ONLY -- no ground-truth sensor
+  // anywhere in this project measures CAPE, so this variable will
+  // never have an "Observed" line or a Model Accuracy bar, the same
+  // situation wind_dir_deg is in at a sensor-less location.
+  cape_jkg: 'CAPE (J/kg)',
 };
 
 // COMBINED-VARIABLE GROUPS -- ADDED 2026-10-06 (user: "most of the
@@ -306,6 +314,14 @@ const state = {
   variable: 'wind_speed_kt',
   accuracyVarsByLocation: {}, // location_id -> Set(variable)
   observedVarsByLocation: {}, // location_id -> Set(variable), ANY observed data regardless of forecast coverage (see allVariablesUnion)
+  // ADDED 2026-10-18 (user: "do any of these data sources include CAPE
+  // or Lifted Index? i need to add that to all the locations where
+  // available"). CAPE is forecast-only everywhere -- no sensor in this
+  // project measures it -- so it can't be discovered via either of the
+  // 2 existing maps above (both ultimately require a real observation
+  // to exist). See api_forecast_only_variables's docstring for the
+  // full rationale.
+  forecastOnlyVarsByLocation: {}, // location_id -> Set(variable), real forecast coverage but NO possible ground truth anywhere
   hours: 336, // matches the <select> default in index.html (Next 14 days) -- 14d is roughly GFS/ECMWF's own forecast horizon (the longest of the 6 models)
   pastHours: 168, // matches the <select> default in index.html (Last 7 days)
   hiddenModels: new Set(), // model keys (or 'observed') toggled off via legend click, Forecast Time Series chart
@@ -420,10 +436,11 @@ async function fetchJSON(url) {
 // ---------------------------------------------------------------------------
 
 async function init() {
-  const [locations, accuracyVars, observedVars] = await Promise.all([
+  const [locations, accuracyVars, observedVars, forecastOnlyVars] = await Promise.all([
     fetchJSON('/api/locations'),
     fetchJSON('/api/accuracy-variables'),
     fetchJSON('/api/variables-for-location'),
+    fetchJSON('/api/forecast-only-variables'),
   ]);
 
   state.locations = locations;
@@ -447,6 +464,16 @@ async function init() {
       state.observedVarsByLocation[row.location_id] = new Set();
     }
     state.observedVarsByLocation[row.location_id].add(row.variable);
+  });
+  // ADDED 2026-10-18 -- see state.forecastOnlyVarsByLocation's own
+  // comment and api_forecast_only_variables' docstring for the full
+  // rationale (CAPE: real forecast coverage, zero possible ground
+  // truth anywhere).
+  forecastOnlyVars.forEach(row => {
+    if (!state.forecastOnlyVarsByLocation[row.location_id]) {
+      state.forecastOnlyVarsByLocation[row.location_id] = new Set();
+    }
+    state.forecastOnlyVarsByLocation[row.location_id].add(row.variable);
   });
 
   const locSelect = d3.select('#location-select');
@@ -648,6 +675,12 @@ function allVariablesUnion() {
   // humidity, dew point -- none of which any model predicts) would be
   // scraped/stored correctly but never selectable anywhere in the UI.
   Object.values(state.observedVarsByLocation).forEach(set => set.forEach(v => s.add(v)));
+  // ADDED 2026-10-18 -- see state.forecastOnlyVarsByLocation's own
+  // comment. Without this, CAPE (real forecast coverage, zero possible
+  // ground truth anywhere) would never be selectable at all -- neither
+  // of the 2 unions above can ever include a variable that has no
+  // observation anywhere to match against.
+  Object.values(state.forecastOnlyVarsByLocation).forEach(set => set.forEach(v => s.add(v)));
   // Always ensure the two required variables are present as options even
   // if a given location has no accuracy rows yet for them.
   s.add('wind_speed_kt');

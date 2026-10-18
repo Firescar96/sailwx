@@ -55,7 +55,7 @@ LOCATIONS = {
     "courageous_sailing": (42.3715, -71.0509),
 }
 
-HOURLY_VARS = "wind_speed_10m,wind_gusts_10m,wind_direction_10m,pressure_msl,temperature_2m"
+HOURLY_VARS = "wind_speed_10m,wind_gusts_10m,wind_direction_10m,pressure_msl,temperature_2m,cape"
 
 # model key -> (forecast API models= slug, metadata API id, extra forecast params)
 # past_days=2 added 2026-09-10: Open-Meteo's default is to return data only
@@ -114,6 +114,27 @@ VARIABLE_MAP = {
     "wind_direction_10m": "wind_dir_deg",
     "pressure_msl": "pressure_hpa",
     "temperature_2m": "air_temp_f",
+    # ADDED 2026-10-18 (user: "do any of these data sources include CAPE
+    # or Lifted Index? i need to add that to all the locations where
+    # available"). Confirmed live: Open-Meteo's documented hourly
+    # variable list has `cape` (J/kg, Convective Available Potential
+    # Energy) but NOT Lifted Index at all -- CAPE is the only
+    # convective-instability metric they expose, and it returns real
+    # (non-stub) values for every one of our 6 models, confirmed via a
+    # direct API call at MIT's coordinates. No unit conversion needed
+    # (J/kg is already the canonical unit) -- see WIND_SPEED_VARS/
+    # TEMP_VARS below, cape_jkg is deliberately absent from both.
+    #
+    # FORECAST-ONLY, per explicit user confirmation during design: no
+    # ground-truth sensor at ANY of this project's locations measures
+    # CAPE (not Harvard Bridge, not MIT's own station, not KBOS/METAR,
+    # not NDBC) -- it will show up in Forecast Time Series/Stability/
+    # Model Accuracy's dropdown exactly like every other variable, but
+    # with no "Observed" line possible and no real accuracy/MAE
+    # computable (there's nothing real to compare the forecast
+    # against), the same situation wind_dir_deg is in at any location
+    # without a direction sensor.
+    "cape": "cape_jkg",
 }
 KMH_TO_KT = 0.539957
 # Which of our variable names need the km/h -> knots conversion applied.
@@ -172,25 +193,48 @@ def ingest_model_location(con, model_key, models_slug, init_time, extra_params,
         "SELECT run_id FROM forecast_runs WHERE model = ? AND location_id = ? AND init_time_utc = ?",
         [model_key, location_id, init_time],
     ).fetchone()
+    existing_variables = set()
     if existing:
         run_id = existing[0]
-        print(f"  {model_key}/{location_id}: run for init_time {init_time} already ingested (run_id={run_id}), skipping values")
-        return 0
-
-    run_id = con.execute(
-        """
-        INSERT INTO forecast_runs (model, location_id, init_time_utc, retrieved_at)
-        VALUES (?, ?, ?, ?)
-        RETURNING run_id
-        """,
-        [model_key, location_id, init_time, retrieved_at],
-    ).fetchone()[0]
+        # FIXED 2026-10-18 (user: "do any of these data sources include
+        # CAPE or Lifted Index? i need to add that to all the locations
+        # where available" -> cape added to HOURLY_VARS/VARIABLE_MAP).
+        # This used to unconditionally skip the ENTIRE run whenever
+        # forecast_runs already had a row for this (model, location,
+        # init_time) -- correct for avoiding duplicate re-polls of data
+        # already ingested, but it also meant that adding a brand-new
+        # variable to HOURLY_VARS could never backfill onto any run
+        # that existed before the variable was added (confirmed live:
+        # right after adding cape, ICON's current run -- already
+        # ingested moments earlier for the OLD variable set -- got
+        # silently skipped and never received its cape_jkg rows, while
+        # every other model's run happened to still be fresh enough
+        # this cycle to insert normally). Fixed by checking which
+        # variables this existing run ALREADY has and only inserting
+        # whatever's still missing, instead of skipping the whole run.
+        existing_variables = {
+            row[0] for row in con.execute(
+                "SELECT DISTINCT variable FROM forecast_values WHERE run_id = ?",
+                [run_id],
+            ).fetchall()
+        }
+    else:
+        run_id = con.execute(
+            """
+            INSERT INTO forecast_runs (model, location_id, init_time_utc, retrieved_at)
+            VALUES (?, ?, ?, ?)
+            RETURNING run_id
+            """,
+            [model_key, location_id, init_time, retrieved_at],
+        ).fetchone()[0]
 
     rows = []
     for om_var, values in hourly.items():
         if om_var == "time":
             continue
         our_var = VARIABLE_MAP.get(om_var, om_var)
+        if our_var in existing_variables:
+            continue  # this run already has this variable -- only backfilling genuinely missing ones
         for t_str, v in zip(times, values):
             if v is None:
                 continue
@@ -202,8 +246,14 @@ def ingest_model_location(con, model_key, models_slug, init_time, extra_params,
                 value = value * 9 / 5 + 32
             rows.append((run_id, valid_time, our_var, round(value, 2)))
 
+    if not rows:
+        if existing_variables:
+            print(f"  {model_key}/{location_id}: run for init_time {init_time} already has every current variable (run_id={run_id}), nothing to backfill")
+        return 0
+
     bulk_insert(con, "forecast_values", ["run_id", "valid_time_utc", "variable", "value"], rows)
-    print(f"  {model_key}/{location_id}: new run_id={run_id}, init_time={init_time}, inserted {len(rows)} forecast_values rows")
+    verb = "backfilled missing variables onto existing" if existing_variables else "new"
+    print(f"  {model_key}/{location_id}: {verb} run_id={run_id}, init_time={init_time}, inserted {len(rows)} forecast_values rows")
     return len(rows)
 
 

@@ -676,6 +676,48 @@ def api_variables_for_location(params):
         con.close()
 
 
+def api_forecast_only_variables(params):
+    """Which (location, variable) pairs have real forecast data with NO
+    ground-truth observation anywhere to compare against -- e.g. CAPE
+    (added 2026-10-18, user: "do any of these data sources include CAPE
+    or Lifted Index? i need to add that to all the locations where
+    available"), which no sensor in this project measures at all.
+
+    Without this, a forecast-only variable could never appear in the
+    frontend's Variable dropdown: api_accuracy_variables only returns
+    combos with a matched observation (by definition -- it answers
+    "does accuracy data exist"), and api_variables_for_location only
+    covers the observations table directly. This is the genuine third
+    case -- real forecast coverage, zero possible ground truth -- and
+    needs its own explicit query rather than being inferred from either
+    existing endpoint.
+
+    Deliberately does NOT use the mit_pavilion->harvard_bridge (or any
+    other) ground-truth substitution CASE the other 2 endpoints use --
+    there is no substitute sensor for CAPE anywhere, substituted or
+    not, so the EXISTS check is intentionally against the UNSUBSTITUTED
+    location_id: a variable only belongs in this "forecast-only, no
+    ground truth at all" bucket if it's missing from every possible
+    real/substitute location's observations, not just its own.
+    """
+    con = db()
+    try:
+        cur = con.execute(
+            """
+            SELECT DISTINCT fr.location_id, fv.variable
+            FROM forecast_values fv
+            JOIN forecast_runs fr ON fr.run_id = fv.run_id
+            WHERE NOT EXISTS (
+                SELECT 1 FROM observations o WHERE o.variable = fv.variable
+            )
+            ORDER BY location_id, variable
+            """
+        )
+        return rows_as_dicts(cur)
+    finally:
+        con.close()
+
+
 FLAG_COLORS_ALL = ["red", "yellow", "green", "closed"]
 WIND_BUCKET_WIDTH_KT = 4.0  # historical training data is sparse (~40 flag
                             # readings total), so buckets need to be wide
@@ -1684,6 +1726,7 @@ ROUTES = {
     "/api/accuracy": api_accuracy,
     "/api/accuracy-variables": api_accuracy_variables,
     "/api/forecast": api_forecast,
+    "/api/forecast-only-variables": api_forecast_only_variables,
     "/api/forecast-stability": api_forecast_stability,
     "/api/observations": api_observations,
     "/api/variables-for-location": api_variables_for_location,
