@@ -2053,7 +2053,7 @@ function renderStabilityDirectionChart(container, rows, models, numRuns) {
     .attr('x', width / 2).attr('y', rowsTop + plotHeight + margin.bottom - 6)
     .attr('text-anchor', 'middle')
     .attr('fill', 'var(--muted)').attr('font-size', '0.72rem')
-    .text(`Upcoming forecast hours -- arrow opacity = agreement across each model's last ${numRuns} runs (solid = consistent, faded = still disagreeing)`);
+    .text(`Upcoming forecast hours -- one arrow layer per recent run (up to ${numRuns}), additively blended -- agreeing runs glow brighter, disagreeing runs stay dim/separate`);
 
   const tooltip = getOrCreateTooltip('point-tooltip');
 
@@ -2085,20 +2085,67 @@ function renderStabilityDirectionChart(container, rows, models, numRuns) {
       const meanDeg = circularMeanDeg(d.values);
       if (meanDeg == null) return null;
       const maxDiff = d3.max(d.values, v => circularDiffDeg(v, meanDeg));
-      return { date: d.valid_time_utc_date, value: meanDeg, maxDiff, n: d.n_runs_with_this_hour };
+      return {
+        date: d.valid_time_utc_date, value: meanDeg, maxDiff,
+        n: d.n_runs_with_this_hour, runValues: d.values,
+      };
     }).filter(d => d != null);
 
     const rowCenter = rowY(m) + rowY.bandwidth() / 2;
-    svg.append('g')
+    const modelColor = MODEL_COLORS[m] || '#888';
+
+    // OVERLAID PER-RUN ARROWS WITH ADDITIVE BLENDING -- ADDED 2026-10-18
+    // (user: "instead of just darkened arrow for instability, show
+    // multiple arrow overlayed one for each run of the model that
+    // differed, the colors will need to be made additive ... so that
+    // overlaying shapes of the same color increases saturation and
+    // brightness to the max 100% ... with number of layers needed to
+    // be max set by the number of runs dropdown"). Replaces the
+    // previous single opacity-faded "mean" arrow with ONE ARROW PER
+    // RAW RUN VALUE (d.values, already returned by api_forecast_
+    // stability's wind_dir_deg branch -- see that endpoint's "WIND
+    // DIRECTION IS CIRCULAR" docstring section). Each layer is drawn
+    // at 1/numRuns of the model's full color (so e.g. 3 runs all
+    // agreeing on the same rotation stack via CSS mix-blend-mode:
+    // plus-lighter -- see style.css's .stability-dir-arrow-layer --
+    // back up to the model's TRUE full-brightness color; runs that
+    // disagree land at different rotations and so never fully
+    // reconstruct the base color, staying visibly dim/fragmented
+    // instead). `isolation: isolate` on this cell-group's wrapper
+    // scopes the additive blending to just this (model, hour) cell's
+    // own stacked layers -- without it, plus-lighter would also blend
+    // against the grid lines/axis/everything else painted earlier in
+    // the same SVG.
+    const cellGroup = svg.append('g')
       .attr('data-row-key', m)
-      .selectAll('path.stability-dir-arrow')
+      .style('isolation', 'isolate');
+
+    points.forEach(d => {
+      const perRunOpacity = 1 / Math.max(1, +numRuns);
+      cellGroup.append('g')
+        .attr('class', 'stability-dir-arrow-layer')
+        .selectAll('path.stability-dir-arrow')
+        .data(d.runValues)
+        .join('path')
+        .attr('class', 'stability-dir-arrow')
+        .attr('d', 'M 0,-7 L 5,5 L 0,2 L -5,5 Z') // same arrowhead glyph as the Wind Direction chart
+        .attr('transform', v => `translate(${x(d.date)},${rowCenter}) rotate(${(v + 180) % 360})`)
+        .attr('fill', modelColor)
+        .attr('fill-opacity', perRunOpacity)
+        .style('pointer-events', 'none'); // the invisible hit-target below handles hover/tooltip for the whole stack
+    });
+
+    // Invisible hit-target per column (one per averaged point, same as
+    // before) -- keeps hover/tooltip behavior working without every
+    // individual run-layer needing its own listener (which would also
+    // fight with mix-blend-mode's render-order sensitivity).
+    cellGroup.selectAll('circle.stability-dir-hit')
       .data(points)
-      .join('path')
-      .attr('class', 'stability-dir-arrow')
-      .attr('d', 'M 0,-7 L 5,5 L 0,2 L -5,5 Z') // same arrowhead glyph as the Wind Direction chart
-      .attr('transform', d => `translate(${x(d.date)},${rowCenter}) rotate(${(d.value + 180) % 360})`)
-      .attr('fill', MODEL_COLORS[m] || '#888')
-      .attr('opacity', d => Math.max(0.2, 1 - Math.min(d.maxDiff, 90) / 90 * 0.8))
+      .join('circle')
+      .attr('class', 'stability-dir-hit')
+      .attr('cx', d => x(d.date)).attr('cy', rowCenter)
+      .attr('r', 9)
+      .attr('fill', 'transparent')
       .style('cursor', 'pointer')
       .on('mouseenter', () => setHighlight(m))
       .on('mousemove', (event, d) => {
@@ -2106,9 +2153,11 @@ function renderStabilityDirectionChart(container, rows, models, numRuns) {
         const runsNote = d.n < +numRuns
           ? `<br><span style="color:var(--muted)">(only ${d.n}/${numRuns} runs reach this far ahead)</span>`
           : '';
+        const runsList = d.runValues.map(v => `${Math.round(v)}\u00b0`).join(', ');
         tooltip.style('opacity', 1)
           .html(`<b>${m.toUpperCase()}</b><br>${formatLocalDateTime(d.date)}<br>` +
                 `avg direction across last ${numRuns} runs: from ${Math.round(d.value)}\u00b0 (blowing toward ${towardDeg}\u00b0)<br>` +
+                `individual runs: ${runsList}<br>` +
                 `max run-to-run disagreement: ${Math.round(d.maxDiff)}\u00b0${runsNote}`)
           .style('left', (event.pageX + 12) + 'px')
           .style('top', (event.pageY - 10) + 'px');

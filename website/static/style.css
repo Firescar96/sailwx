@@ -256,6 +256,29 @@ main {
   z-index: 20;
 }
 
+/* ADDED 2026-10-18 (user: "instead of just darkened arrow for
+   instability, show multiple arrow overlayed one for each run of the
+   model that differed, the colors will need to be made additive ...
+   overlaying shapes of the same color increases saturation and
+   brightness to the max 100%"). Forecast Stability's wind-direction
+   chart now draws one arrow PER historical run (not one averaged/
+   opacity-faded arrow) -- mix-blend-mode: plus-lighter does true
+   additive RGB blending (clamped at white, not just "screen"'s softer
+   approach), so N overlapping same-color arrows at a model's own color
+   sum toward that color's max brightness when the model's runs agree
+   on direction (same rotation = same pixels = colors add up), while
+   disagreeing runs land in different rotations and stay visibly
+   separate/dim individual arrows instead of blending together.
+   `isolation: isolate` on the wrapping <g> (set inline per cell in
+   app.js, see renderStabilityDirectionChart) scopes the blending to
+   just that one cell's stacked arrows -- without it, plus-lighter
+   would blend with the grid lines / axis / everything else painted
+   earlier in the SVG, not just the other arrow layers in the same
+   cell. */
+.stability-dir-arrow-layer {
+  mix-blend-mode: plus-lighter;
+}
+
 footer {
   text-align: center;
   color: var(--muted);
