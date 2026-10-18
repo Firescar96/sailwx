@@ -21,3 +21,4 @@ data/*.csv
 .vscode/
 *.swp
 *.deb
+check_cbi.py

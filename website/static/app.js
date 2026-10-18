@@ -224,6 +224,27 @@ function formatAxisTick(d) {
   return `${weekday} ${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
+// FIXED 2026-10-17 (user: "Forecast Time Series on last 12 hours i
+// need more dates printed on the charte"). The previous tick-count
+// formula, Math.min(8, (hours + pastHours) / 12), was tuned for the
+// LONG end of the window selector (e.g. "Next 14 days" + "Last 7
+// days" = 504h / 12 = 42, correctly capped at 8) but produced far too
+// FEW ticks at the short end -- e.g. a 36h total window (hours=24 +
+// pastHours=12) computed to just 3, and a 12h-only window computed to
+// just 1, which is why a short-window view looked nearly unlabeled.
+// D3's .ticks(n) is already just a hint (it snaps to "nice" round
+// intervals and may return somewhat more/fewer than asked), so asking
+// for too low a number on a short window starves it outright.
+// Replaced with a formula that scales by total-hours/6 (so a tick
+// roughly every 6 hours of chart width) with a floor of 6 and the
+// existing cap of 8 for long windows -- a 12h window now gets 6 ticks
+// (roughly every 2h) instead of 1, while very long windows are
+// unchanged from before.
+function xAxisTickCount(hours, pastHours) {
+  const totalHours = hours + pastHours;
+  return Math.max(6, Math.min(8, Math.round(totalHours / 6)));
+}
+
 // Formats a Date as a local "YYYY-MM-DD HH:MM" string for tooltips,
 // replacing the old `.toISOString().slice(0,16).replace('T',' ')`
 // pattern (which was always UTC by definition -- toISOString() cannot
@@ -1242,7 +1263,7 @@ async function loadForecastChart() {
   svg.append('g')
     .attr('class', 'axis')
     .attr('transform', `translate(0,${height - margin.bottom})`)
-    .call(d3.axisBottom(x).ticks(Math.min(8, (hours + pastHours) / 12)).tickFormat(formatAxisTick))
+    .call(d3.axisBottom(x).ticks(xAxisTickCount(hours, pastHours)).tickFormat(formatAxisTick))
     .selectAll('text')
     .attr('transform', 'rotate(-45)')
     .style('text-anchor', 'end');
@@ -1624,7 +1645,7 @@ function renderWindDirectionChart(container, tooltip, models, byModel, obs, flag
   svg.append('g')
     .attr('class', 'axis')
     .attr('transform', `translate(0,${rowsTop + rowKeys.length * rowHeight + flagStripSpace})`)
-    .call(d3.axisBottom(x).ticks(Math.min(8, (hours + pastHours) / 12)).tickFormat(formatAxisTick))
+    .call(d3.axisBottom(x).ticks(xAxisTickCount(hours, pastHours)).tickFormat(formatAxisTick))
     .selectAll('text')
     .attr('transform', 'rotate(-45)')
     .style('text-anchor', 'end');
