@@ -5,13 +5,24 @@
   --text: #dce8ef;
   --muted: #7fa1b3;
   --accent: #3fb6e0;
-  --gfs: #4fc3f7;
-  --ecmwf: #ffb74d;
-  --hrrr: #81c784;
-  --icon: #ba68c8;
-  --nam: #e57373;
-  --hrdps: #4db6ac;
-  --nda: #f5d547;
+  /* Model colors -- REWORKED 2026-10-17 (user: "any way to get a
+     bigger variety of colors for the legends?"). Previously ad-hoc
+     picks that, when measured in HSL, clustered badly: ECMWF (hue 36)
+     and NDA (hue 49) were only 13 degrees apart (both orange/gold,
+     easy to confuse at a glance in a legend), and HRRR/ICON/HRDPS all
+     had saturation under 50%, making them look washed-out/muddy
+     against the dark navy background rather than vivid. Replaced with
+     7 colors evenly spaced around the hue wheel (360/7 ~= 51 degrees
+     apart) at a consistent high saturation (75%) and lightness (62%)
+     tuned for contrast against --bg -- maximizes the perceptual
+     distance between every pair, not just avoids exact duplicates. */
+  --gfs: #e65555;
+  --ecmwf: #e6d255;
+  --hrrr: #7ee655;
+  --icon: #55e6a8;
+  --nam: #55a8e6;
+  --hrdps: #7e55e6;
+  --nda: #e655d2;
   --grid: #22384a;
   --flag-green: #2e7d32;
   --flag-yellow: #f9a825;
