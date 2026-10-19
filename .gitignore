@@ -22,3 +22,7 @@ data/*.csv
 *.swp
 *.deb
 check_cbi.py
+
+# Scraped runtime cache (regenerated monthly by scripts/scrape_cbi_hours.py
+# via cron) -- derived data, not source, same category as db/weather.duckdb.
+db/cbi_hours_cache.json
