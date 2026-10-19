@@ -526,14 +526,14 @@ async function init() {
 
   d3.select('#hours-select').on('change', function () {
     state.hours = +this.value;
-    loadForecastChart();
+    refreshForecastChart();
   });
   if (restoreSelectValue('hours-select')) state.hours = +document.getElementById('hours-select').value;
   persistSelectOnChange('hours-select');
 
   d3.select('#past-hours-select').on('change', function () {
     state.pastHours = +this.value;
-    loadForecastChart();
+    refreshForecastChart();
   });
   if (restoreSelectValue('past-hours-select')) state.pastHours = +document.getElementById('past-hours-select').value;
   persistSelectOnChange('past-hours-select');
@@ -549,8 +549,8 @@ async function init() {
   // api_forecast_stability in app.py.
   restoreSelectValue('stability-num-runs-select');
   restoreSelectValue('stability-hours-select');
-  d3.select('#stability-num-runs-select').on('change', loadStabilityChart);
-  d3.select('#stability-hours-select').on('change', loadStabilityChart);
+  d3.select('#stability-num-runs-select').on('change', refreshStabilityChart);
+  d3.select('#stability-hours-select').on('change', refreshStabilityChart);
   persistSelectOnChange('stability-num-runs-select');
   persistSelectOnChange('stability-hours-select');
 
@@ -740,8 +740,8 @@ async function refreshAll() {
   await Promise.all([
     loadCurrentConditions(),
     loadAccuracyChart(),
-    loadForecastChart(),
-    loadStabilityChart(),
+    refreshForecastChart(),
+    refreshStabilityChart(),
   ]);
 }
 
@@ -952,7 +952,53 @@ async function loadAccuracyChart() {
 
 let forecastXScale = null;
 
-async function loadForecastChart() {
+// SPLIT WIND/GUST CHARTS -- ADDED 2026-10-18 (user: "the forecast time
+// series for wind is too cluttered, split wind a gusts into two
+// charts, but keep them within the same card, sharing the same
+// description"). Dispatcher: every existing call site that used to
+// call loadForecastChart() directly now calls this instead -- it
+// decides, based on state.variable, whether to render the single
+// #forecast-chart (unchanged behavior for every variable except
+// wind_combo) or 2 independent single-member charts into
+// #forecast-chart-wind/#forecast-chart-gust (only for wind_combo).
+// Both split calls reuse the EXACT SAME loadForecastChart() renderer
+// (via its new `opts.forcedVariable`) rather than a separate code
+// path, so every existing behavior (Harvard Bridge overlay, flag
+// strip, display-side smoothing, hover-to-highlight, legend toggle,
+// tooltip) is automatically inherited by both halves with zero
+// duplication.
+async function refreshForecastChart() {
+  const isSplitWind = state.variable === 'wind_combo';
+  d3.select('#forecast-chart').attr('hidden', isSplitWind ? true : null);
+  d3.select('#forecast-chart-split').attr('hidden', isSplitWind ? null : true);
+  if (!isSplitWind) {
+    await loadForecastChart();
+    return;
+  }
+  const group = VARIABLE_GROUPS.wind_combo;
+  const [windHasData, gustHasData] = await Promise.all([
+    loadForecastChart({ containerId: 'forecast-chart-wind', emptyId: 'forecast-empty-wind-unused', forcedVariable: group.members[0] }),
+    loadForecastChart({ containerId: 'forecast-chart-gust', emptyId: 'forecast-empty-gust-unused', forcedVariable: group.members[1] }),
+  ]);
+  // The shared #forecast-empty message only needs to show if BOTH
+  // halves came back empty -- if either has real data, the split view
+  // itself is already showing something useful.
+  d3.select('#forecast-empty').attr('hidden', (windHasData || gustHasData) ? true : null);
+}
+
+async function loadForecastChart(opts = {}) {
+  // SPLIT WIND/GUST CHARTS -- ADDED 2026-10-18 (user: "the forecast
+  // time series for wind is too cluttered, split wind a gusts into two
+  // charts, but keep them within the same card, sharing the same
+  // description"). `opts` lets the dispatcher below (refreshForecast
+  // Chart) call this SAME renderer twice with a single forced member
+  // variable each (wind_speed_kt / wind_gust_kt) instead of the normal
+  // combo behavior -- every other code path (normal single variable,
+  // temp_combo, wind_dir_deg) is completely unaffected since opts is
+  // only ever passed when state.variable === 'wind_combo'.
+  const containerId = opts.containerId || 'forecast-chart';
+  const emptyId = opts.emptyId || 'forecast-empty';
+  const forcedVariable = opts.forcedVariable || null;
   const hours = state.hours;
   const pastHours = state.pastHours;
   // Observation overlay window: strictly follows "Also show past". If
@@ -989,9 +1035,11 @@ async function loadForecastChart() {
   // variable names when a combo is selected. Defined early (before
   // showHarvardBridge below) since that check now needs to consider
   // every member, not just state.variable itself.
-  const memberVars = isComboVariable(state.variable) ? VARIABLE_GROUPS[state.variable].members : [state.variable];
+  const memberVars = forcedVariable ? [forcedVariable]
+    : isComboVariable(state.variable) ? VARIABLE_GROUPS[state.variable].members : [state.variable];
   const showHarvardBridge = (state.location === 'mit_pavilion' || state.location === 'cbi_dockhouse')
     && memberVars.some(v => HARVARD_BRIDGE_VARS.has(v));
+
   // Wind-direction overlay -- ADDED 2026-09-27 (user: "build in that
   // wind direction scraping ... show that data overlayed mit wind
   // data"). Handled as its own flag (not folded into HARVARD_BRIDGE_VARS
@@ -1074,7 +1122,7 @@ async function loadForecastChart() {
   let harvardBridge = [].concat(...memberResults.map(r => r[2]));
   let flagHistory = flagHistoryFetched;
 
-  const container = d3.select('#forecast-chart');
+  const container = d3.select(`#${containerId}`);
   container.selectAll('*').remove();
   // BUG FIXED 2026-10-08 (user: "Forecast Time Series is blank for
   // most variables including wind for harvard location"). Root cause:
@@ -1089,8 +1137,9 @@ async function loadForecastChart() {
   // forecast model coverage still gets a genuinely useful chart (just
   // the Observed line, no model lines), instead of nothing at all.
   const hasAnyData = forecast.length > 0 || obs.length > 0;
-  d3.select('#forecast-empty').attr('hidden', hasAnyData ? true : null);
-  if (!hasAnyData) { forecastXScale = null; return; }
+  d3.select(`#${emptyId}`).attr('hidden', hasAnyData ? true : null);
+  if (!hasAnyData) { if (!forcedVariable) forecastXScale = null; return hasAnyData; }
+
 
   forecast.forEach(d => { d.valid_time_utc_date = new Date(d.valid_time_utc + 'Z'); });
   obs.forEach(d => { d.ts_utc_date = new Date(d.ts_utc + 'Z'); });
@@ -1173,7 +1222,7 @@ async function loadForecastChart() {
   const x = d3.scaleTime()
     .domain([minDate, maxDate])
     .range([margin.left, width - margin.right]);
-  forecastXScale = x;
+  if (!forcedVariable) forecastXScale = x;
 
   // Single shared tooltip div for this whole chart render, reused by
   // the flag-color strip, every model's line/dots, and the observed
@@ -1201,7 +1250,7 @@ async function loadForecastChart() {
   // combo-variable changes above.)
   if (state.variable === 'wind_dir_deg') {
     renderWindDirectionChart(container, tooltip, models, d3.group(forecast, d => d.model), obs, flagHistory, x, width, height, margin, minDate, maxDate, hours, pastHours, showFlagBands, harvardBridge, showHarvardBridgeDir);
-    return;
+    return true;
   }
 
   // Y-axis domain only considers currently-VISIBLE series (respecting
@@ -1495,7 +1544,7 @@ async function loadForecastChart() {
     } else {
       state.hiddenModels.add(key);
     }
-    loadForecastChart(); // re-render with the updated visibility set
+    refreshForecastChart(); // re-render with the updated visibility set (handles split wind_combo mode too)
   }
 
   const legend = container.insert('div', 'svg').attr('class', 'legend');
@@ -1557,6 +1606,7 @@ async function loadForecastChart() {
       item.append('span').text(fmtVarLabel(memberVar));
     });
   }
+  return true;
 }
 
 // Wind-direction rendering path for the Forecast Time Series chart --
@@ -2024,7 +2074,20 @@ function renderWindDirectionChart(container, tooltip, models, byModel, obs, flag
 // dashboard (see the convergence-button race-condition fix history) --
 // changing "Compare last N runs" or "Forecast window" fires a new fetch
 // before an older one may have resolved.
-let stabilityRequestToken = 0;
+//
+// KEYED PER CONTAINER -- CHANGED 2026-10-18 (user: "split wind a gusts
+// into two charts"). Was a single shared counter, which worked fine
+// when only one Forecast Stability chart could ever be loading at
+// once -- but refreshStabilityChart() now calls loadStabilityChart()
+// TWICE IN PARALLEL for wind_combo (once per containerId). A single
+// shared counter would have made each call's token stale by the time
+// the OTHER call finished incrementing it moments later, so the first
+// of the two to resolve would always wrongly bail out thinking a
+// "newer" request had superseded it -- even though they're for 2
+// completely different charts, not competing requests for the same
+// one. Keyed by containerId so each chart's own in-flight-request
+// tracking is independent.
+let stabilityRequestTokens = {};
 
 // FORECAST STABILITY -- WIND DIRECTION ARROWS -- ADDED 2026-10-08
 // (user: "i like the shading for differences, but the wind direction
@@ -2199,18 +2262,43 @@ function renderStabilityDirectionChart(container, rows, models, numRuns) {
   });
 }
 
-async function loadStabilityChart() {
-  const myToken = ++stabilityRequestToken;
+async function refreshStabilityChart() {
+  const isSplitWind = state.variable === 'wind_combo';
+  d3.select('#stability-chart').attr('hidden', isSplitWind ? true : null);
+  d3.select('#stability-chart-split').attr('hidden', isSplitWind ? null : true);
+  if (!isSplitWind) {
+    await loadStabilityChart();
+    return;
+  }
+  const group = VARIABLE_GROUPS.wind_combo;
+  const [windHasData, gustHasData] = await Promise.all([
+    loadStabilityChart({ containerId: 'stability-chart-wind', forcedVariable: group.members[0] }),
+    loadStabilityChart({ containerId: 'stability-chart-gust', forcedVariable: group.members[1] }),
+  ]);
+  d3.select('#stability-empty').attr('hidden', (windHasData || gustHasData) ? true : null);
+}
+
+async function loadStabilityChart(opts = {}) {
+  const containerId = opts.containerId || 'stability-chart';
+  const forcedVariable = opts.forcedVariable || null;
+  stabilityRequestTokens[containerId] = (stabilityRequestTokens[containerId] || 0) + 1;
+  const myToken = stabilityRequestTokens[containerId];
   const numRuns = d3.select('#stability-num-runs-select').property('value');
   const hours = d3.select('#stability-hours-select').property('value');
-  if (!state.location || !state.variable) return;
+  if (!state.location || !state.variable) return false;
 
   // COMBINED VARIABLES -- ADDED 2026-10-06, see VARIABLE_GROUPS'
   // definition for the full rationale. Same approach as the Forecast
   // Time Series chart: fetch each member variable's own stability data
   // in parallel and tag every row with which member it came from, so
   // this single chart can render both on one shared Y-axis.
-  const memberVars = isComboVariable(state.variable) ? VARIABLE_GROUPS[state.variable].members : [state.variable];
+  //
+  // SPLIT WIND/GUST -- ADDED 2026-10-18, see refreshStabilityChart()'s
+  // own comment for the full rationale. forcedVariable overrides the
+  // normal combo-member resolution with a single forced member, same
+  // mechanism as loadForecastChart's forcedVariable.
+  const memberVars = forcedVariable ? [forcedVariable]
+    : isComboVariable(state.variable) ? VARIABLE_GROUPS[state.variable].members : [state.variable];
   const memberDash = memberVar => MEMBER_DASH_PATTERNS[memberVars.indexOf(memberVar)] || null;
   const memberSuffix = memberVar => memberVars.length > 1 ? ` (${fmtVarLabel(memberVar)})` : '';
 
@@ -2221,25 +2309,30 @@ async function loadStabilityChart() {
     if (d.rows) d.rows.forEach(r => { r.__member = memberVar; });
     return d;
   }));
-  if (myToken !== stabilityRequestToken) return; // a newer request has since started/finished
+  if (myToken !== stabilityRequestTokens[containerId]) return false; // a newer request for THIS container has since started/finished
 
-  const container = d3.select('#stability-chart');
+  const container = d3.select(`#${containerId}`);
   container.selectAll('*').remove();
+  // Split-mode sub-charts (opts.containerId set) have no per-side
+  // empty-msg element of their own -- the shared #stability-empty is
+  // only toggled by refreshStabilityChart() once BOTH halves resolve.
   const empty = d3.select('#stability-empty');
 
   const firstError = memberResults.find(d => d.error);
   if (firstError) {
-    empty.attr('hidden', null).text(firstError.error);
-    return;
+    if (!opts.containerId) empty.attr('hidden', null).text(firstError.error);
+    return false;
   }
   const rows = [].concat(...memberResults.map(d => d.rows || []));
   if (!rows.length) {
-    empty.attr('hidden', null).text(
-      `Not enough forecast run history yet to compare the last ${numRuns} runs for this location/variable.`
-    );
-    return;
+    if (!opts.containerId) {
+      empty.attr('hidden', null).text(
+        `Not enough forecast run history yet to compare the last ${numRuns} runs for this location/variable.`
+      );
+    }
+    return false;
   }
-  empty.attr('hidden', true);
+  if (!opts.containerId) empty.attr('hidden', true);
 
   rows.forEach(d => { d.valid_time_utc_date = new Date(d.valid_time_utc + 'Z'); });
   const models = Array.from(new Set(rows.map(d => d.model))).sort();
@@ -2252,7 +2345,7 @@ async function loadStabilityChart() {
   // used in loadForecastChart for the identical reason.
   if (state.variable === 'wind_dir_deg') {
     renderStabilityDirectionChart(container, rows, models, numRuns);
-    return;
+    return true;
   }
 
   // Grouped by (model, member) -- mirrors the Forecast Time Series
@@ -2314,7 +2407,7 @@ async function loadStabilityChart() {
     .attr('text-anchor', 'middle')
     .attr('fill', 'var(--muted)')
     .attr('font-size', '0.75rem')
-    .text(fmtVarLabel(state.variable));
+    .text(forcedVariable ? fmtVarLabel(forcedVariable) : fmtVarLabel(state.variable));
 
   svg.append('text')
     .attr('x', width / 2).attr('y', height - 6)
@@ -2422,7 +2515,7 @@ async function loadStabilityChart() {
     } else {
       state.hiddenStabilityModels.add(key);
     }
-    loadStabilityChart(); // re-render with the updated visibility set
+    loadStabilityChart(opts); // re-render with the updated visibility set (preserves split-mode containerId/forcedVariable)
   }
 
   const legend = container.insert('div', 'svg').attr('class', 'legend');
@@ -2452,6 +2545,7 @@ async function loadStabilityChart() {
       item.append('span').text(fmtVarLabel(memberVar));
     });
   }
+  return true;
 }
 
 // ---------------------------------------------------------------------------

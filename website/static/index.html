@@ -130,6 +130,21 @@
       </label>
     </div>
     <div id="forecast-chart"></div>
+    <!-- SPLIT WIND/GUST CHARTS -- ADDED 2026-10-18 (user: "the forecast
+         time series for wind is too cluttered, split wind a gusts into
+         two charts, but keep them within the same card, sharing the
+         same description"). Only used when state.variable ===
+         'wind_combo' (see app.js's loadForecastChart) -- every other
+         variable, including temp_combo, keeps rendering into the
+         single #forecast-chart above untouched. Reuses the
+         .subsection-title convention already established by the Wind
+         & Gust Prediction card for its own 2 labeled subsections. -->
+    <div id="forecast-chart-split" hidden>
+      <h3 class="subsection-title">Wind</h3>
+      <div id="forecast-chart-wind"></div>
+      <h3 class="subsection-title">Gusts</h3>
+      <div id="forecast-chart-gust"></div>
+    </div>
     <div id="forecast-empty" class="empty-msg" hidden>No forecast data available yet for this location/variable.</div>
   </section>
 
@@ -159,6 +174,16 @@
       </label>
     </div>
     <div id="stability-chart"></div>
+    <!-- SPLIT WIND/GUST CHARTS -- see forecast-chart-split's own
+         comment above (Forecast Time Series) for the full rationale;
+         same scope decision applies here (user: "Also apply the same
+         split to Forecast Stability's Wind Speed + Gust chart"). -->
+    <div id="stability-chart-split" hidden>
+      <h3 class="subsection-title">Wind</h3>
+      <div id="stability-chart-wind"></div>
+      <h3 class="subsection-title">Gusts</h3>
+      <div id="stability-chart-gust"></div>
+    </div>
     <div id="stability-empty" class="empty-msg" hidden></div>
   </section>
 
