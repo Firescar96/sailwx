@@ -2509,13 +2509,27 @@ async function loadStabilityChart(opts = {}) {
   // visibility, mirroring the Forecast Time Series chart's legend
   // (user 2026-09-21: "hover to brighten works well, but only one
   // chart has the click to temporarily hide").
+  //
+  // BUG FIXED 2026-10-19 (user: "the buttons on wind/gust to enable/
+  // disable models should enable and disable on both simultaneously
+  // right now it only changes the charts on one"). This previously
+  // called loadStabilityChart(opts), which only re-renders the ONE
+  // sub-chart whose legend was actually clicked (opts.containerId is
+  // specific to that chart) -- state.hiddenStabilityModels (the shared
+  // Set both sub-charts read from) was updated correctly, but only one
+  // of the two charts was ever told to re-render and pick up the new
+  // value, so the sibling chart kept showing the stale visibility set
+  // until something else happened to trigger a refresh. Calling
+  // refreshStabilityChart() instead re-dispatches through the same
+  // single/split logic used everywhere else -- for a split wind_combo
+  // chart, that re-renders BOTH halves from the one shared state.
   function toggleStabilityModel(key) {
     if (state.hiddenStabilityModels.has(key)) {
       state.hiddenStabilityModels.delete(key);
     } else {
       state.hiddenStabilityModels.add(key);
     }
-    loadStabilityChart(opts); // re-render with the updated visibility set (preserves split-mode containerId/forcedVariable)
+    refreshStabilityChart();
   }
 
   const legend = container.insert('div', 'svg').attr('class', 'legend');
