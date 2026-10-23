@@ -55,7 +55,7 @@ from ingest_nda import (
     LOCATIONS,
     VARIABLES,
     ground_truth_location,
-    predict_linear,
+    predict_ensemble,
     predict_direction,
 )
 
@@ -148,11 +148,37 @@ def fetch_full_direction_training_rows(con, location_id, gt_location):
     return rows
 
 
-def fit_linear_from_rows(rows):
+WIND_SPEED_VARS = {"wind_speed_kt", "wind_gust_kt"}  # mirrors ingest_nda.py's WIND_SPEED_VARS -- see that module's fit_ensemble() docstring for the full rationale
+
+
+def fit_linear_from_rows(rows, variable):
+    """UPDATED 2026-10-22 (user: "is there an edit better than straight
+    linear regression that would fit this better maybe 3rd degree so i
+    can still go through 0" -> "quadratic forced through zero", after
+    real cross-validation showed it beats both the old linear+intercept
+    design and a cubic alternative -- see ingest_nda.py's fit_ensemble()
+    for the full investigation/rationale). Mirrors that function's
+    choice: wind_speed_kt/wind_gust_kt get a quadratic regression with
+    NO intercept term (forces the "all models say zero -> predict
+    zero" property); every other variable keeps the original linear
+    design with an intercept, since zero has no comparable physical
+    meaning for pressure/temperature. This backfill script duplicates
+    ingest_nda.py's fitting logic (rather than importing it directly)
+    because it needs the WALK-FORWARD data shape (only rows strictly
+    before a given historical init_time) that the live script's single
+    "fit once on everything available right now" functions don't
+    support -- see this module's own docstring for that rationale --
+    but the actual regression DESIGN must stay identical between the 2
+    scripts' outputs, hence mirroring the variable-based branch here
+    rather than letting them drift apart."""
     if len(rows) < MIN_TRAINING_ROWS:
         return None
     X = np.array([r[1:7] for r in rows], dtype=float)
     y = np.array([r[7] for r in rows], dtype=float)
+    if variable in WIND_SPEED_VARS:
+        feats = np.hstack([X, X**2])
+        beta, _, _, _ = np.linalg.lstsq(feats, y, rcond=None)
+        return beta
     X1 = np.hstack([np.ones((len(X), 1)), X])
     beta, _, _, _ = np.linalg.lstsq(X1, y, rcond=None)
     return beta
@@ -282,7 +308,7 @@ def main():
                     else:
                         full_rows, gt_loc = cached_rows[variable]
                         train_rows = [r for r in full_rows if r[0] < init_time_utc]
-                        beta = fit_linear_from_rows(train_rows)
+                        beta = fit_linear_from_rows(train_rows, variable)
                         if beta is None:
                             continue
 
@@ -311,7 +337,7 @@ def main():
                         if variable == "wind_dir_deg":
                             pred = predict_direction(beta_sin, beta_cos, model_values)
                         else:
-                            pred = predict_linear(beta, model_values)
+                            pred = predict_ensemble(beta, model_values, variable)
                         if pred is None:
                             continue
                         pending_run_values.append((run_id, vt, variable, pred))

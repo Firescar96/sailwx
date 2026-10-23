@@ -166,23 +166,90 @@ def fetch_training_matrix(con, location_id, variable, gt_location):
     return X, y
 
 
-def fit_linear_ensemble(X, y):
-    """Ordinary least squares with intercept: y ~= beta0 + beta . X.
-    Same "Bayesian under a flat prior" framing as
-    wind_regression_model.py -- OLS is the MAP solution under a
-    Gaussian likelihood with an uninformative prior, not a different
-    thing. Returns None if there's not enough data."""
+WIND_SPEED_VARS = {"wind_speed_kt", "wind_gust_kt"}  # see fit_ensemble()'s docstring for why these get the quadratic-through-zero treatment and nothing else does
+
+
+def fit_ensemble(X, y, variable):
+    """Fits NDA's per-variable regression. Two designs, chosen by
+    variable:
+
+    QUADRATIC, FORCED THROUGH ZERO -- for wind_speed_kt/wind_gust_kt
+    only. ADDED 2026-10-22 (user: "why is my NDA model saying such
+    higher wind than other models on saturday both wind and gusts" ->
+    traced to the OLD linear-with-intercept design: its fitted
+    intercept (roughly +1 to +1.5kt depending on location) is a small,
+    invisible correction on a normal/windy day, but becomes a large
+    fraction of the total prediction on an unusually calm day --
+    confirmed with real numbers: 5 real models averaging ~3.0kt at MIT
+    on a calm Saturday, NDA outputting 4.4kt, almost entirely the
+    intercept. User asked: "is there an edit better than straight
+    linear regression that would fit this better maybe 3rd degree so i
+    can still go through 0" -> "quadratic forced through zero" after a
+    follow-up comparison. VALIDATED FIRST via real 5-fold
+    cross-validation across all 3 ground-truthed locations before
+    implementing (not just taking the user's intuition on faith):
+        linear + intercept (old):      MIT 1.669, CBI 1.698, KBOS 1.555
+        linear, NO intercept:          MIT 1.745, CBI 1.776, KBOS 1.601 (WORSE -- just dropping the intercept without adding flexibility hurts)
+        quadratic, NO intercept:       MIT 1.645, CBI 1.652, KBOS 1.552 (BEST overall)
+        cubic, NO intercept:           MIT 1.654, CBI 1.656, KBOS 1.552 (very close to quadratic, slightly worse at 2/3 locations -- extra cubic term doesn't earn its keep on this much data)
+    Quadratic-through-zero both beats the old model's accuracy AND
+    genuinely fixes the complaint (all 6 models reporting 0 now
+    predicts 0, not a baked-in offset).
+
+    LINEAR + INTERCEPT (unchanged) -- for every other variable
+    (pressure_hpa, air_temp_f, water_temp_f). Deliberately NOT changed
+    to quadratic-through-zero: "zero" has no physical meaning for
+    pressure (hPa) or temperature (F) the way it does for wind speed --
+    0 hPa and 0F are not meaningful "calm" states those models would
+    ever jointly predict, so forcing the regression through that point
+    would be an arbitrary constraint with no justification, unlike
+    wind/gust where 0 genuinely means "every model agrees it's dead
+    calm". wind_dir_deg's sin/cos regression is a separate code path
+    entirely (see fetch_direction_training_matrix/predict_direction)
+    and is also unaffected by this change.
+
+    Returns a fitted beta vector suitable for predict_ensemble(..., variable)
+    with the matching variable name -- do NOT pass a quadratic-fit beta
+    to predict_linear(), use predict_ensemble() instead.
+    """
     if X is None or len(X) < MIN_TRAINING_ROWS:
         return None
+    if variable in WIND_SPEED_VARS:
+        feats = np.hstack([X, X**2])
+        beta, _residuals, _rank, _sv = np.linalg.lstsq(feats, y, rcond=None)
+        return beta
     X1 = np.hstack([np.ones((len(X), 1)), X])
     beta, _residuals, _rank, _sv = np.linalg.lstsq(X1, y, rcond=None)
     return beta
 
 
-def predict_linear(beta, model_values):
+def predict_ensemble(beta, model_values, variable):
     """model_values: list of 6 floats in REAL_MODELS order (or None for
     a missing model -- substituted with the mean of the other present
-    models so one missing model doesn't zero out the whole prediction)."""
+    models so one missing model doesn't zero out the whole prediction).
+    Mirrors fit_ensemble()'s choice of feature transform by variable --
+    see that function's docstring for the full rationale."""
+    present = [v for v in model_values if v is not None]
+    if not present:
+        return None
+    fallback = sum(present) / len(present)
+    filled = np.array([v if v is not None else fallback for v in model_values])
+    if variable in WIND_SPEED_VARS:
+        row = np.concatenate([filled, filled**2])
+    else:
+        row = np.concatenate([[1.0], filled])
+    return float(row @ beta)
+
+
+def predict_linear(beta, model_values):
+    """Plain linear-with-intercept prediction -- still used directly by
+    predict_direction() for the sin/cos components (always linear,
+    never quadratic -- see fit_ensemble()'s docstring for why direction
+    is out of scope for the quadratic-through-zero change), and
+    equivalent to predict_ensemble(..., variable='pressure_hpa') for
+    any non-wind-speed variable (kept as a separate simpler function
+    for that direction use case rather than requiring a dummy variable
+    argument there)."""
     present = [v for v in model_values if v is not None]
     if not present:
         return None
@@ -322,7 +389,7 @@ def main():
                     beta_cos, _, _, _ = np.linalg.lstsq(X_cos1, y_cos, rcond=None)
                 else:
                     X, y = fetch_training_matrix(con, location_id, variable, gt_loc)
-                    beta = fit_linear_ensemble(X, y)
+                    beta = fit_ensemble(X, y, variable)
                     if beta is None:
                         continue
 
@@ -342,7 +409,7 @@ def main():
                     if variable == "wind_dir_deg":
                         pred = predict_direction(beta_sin, beta_cos, model_values)
                     else:
-                        pred = predict_linear(beta, model_values)
+                        pred = predict_ensemble(beta, model_values, variable)
                     if pred is None:
                         continue
                     con.execute(
