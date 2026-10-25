@@ -6,19 +6,97 @@ graph, i need a new model, the Nchinda model that does linear
 regression across predictions for all models to give its own answer,
 weighted voting" -> named "NDA" per follow-up). For every (location,
 variable) combo that has enough real history, fits a genuine linear
-regression -- NDA = beta0 + beta1*gfs + beta2*ecmwf + beta3*hrrr +
-beta4*icon + beta5*nam + beta6*hrdps -- against real ground-truth
-observations, then writes its own OWN forecast_runs/forecast_values
-rows (model='nda') for the CURRENT run of each of the 6 real models,
-exactly like any other model would. This is a deliberate architectural
-choice: by writing real rows into the same tables every other model
-uses, NDA automatically shows up in EVERY existing chart (Forecast
-Time Series, Forecast Stability, Model Accuracy, Wind Rose, Gustiness,
-Wind/Gust Prediction, Flag Prediction) with zero special-casing needed
-in any of those 6+ separate chart-rendering code paths -- the
-alternative (hand-wiring a synthetic "6th model" into every endpoint)
-would have been far more invasive and error-prone for a user request
-explicitly scoped to "every metric, every location, every graph".
+regression against real ground-truth observations, then writes its own
+OWN forecast_runs/forecast_values rows (model='nda') for the CURRENT
+run of each of the 6 real models, exactly like any other model would.
+This is a deliberate architectural choice: by writing real rows into
+the same tables every other model uses, NDA automatically shows up in
+EVERY existing chart (Forecast Time Series, Forecast Stability, Model
+Accuracy, Wind Rose, Gustiness, Wind/Gust Prediction, Flag Prediction)
+with zero special-casing needed in any of those 6+ separate
+chart-rendering code paths.
+
+REWRITTEN 2026-10-22 (user, in direct response to the quadratic-through
+-zero instability bug -- see git history for that incident):
+    "1. go back to linear model
+     2. make sure database for every model is storing the updates,
+        both the time the model was check AND the time the model was
+        predicted for
+     3. calculate NDA and store it as you store models, but dont just
+        store a single number, store the history of predictions for
+        the times in the future
+     4. the linear regression should have time as an input because the
+        regression might be different for now vs 72 hours in the future
+     5. dont include models like HRRR in the future calculation if
+        they don't have data, dont take an average"
+
+Addressed as follows:
+
+(1) LINEAR, NOT QUADRATIC -- reverted entirely. The quadratic-through-
+zero design (shipped for the Saturday-overshoot complaint) turned out
+to be numerically unstable with small training samples: a documented
+real case predicted 199kt of wind when the actual observation was
+16.7kt, traced to the walk-forward backfill refitting on as few as 199
+historical rows early in this project's history (a 12-parameter
+quadratic is far more prone to runaway extrapolation on thin data than
+a 7-parameter linear fit). Reverting removes that risk entirely; the
+Saturday-style small-intercept overshoot this was meant to fix is a
+much smaller, more bounded problem than an occasional 199kt prediction.
+
+(2) STORAGE OF BOTH TIMESTAMPS -- already true, confirmed by re-reading
+db/schema.sql rather than assuming: forecast_runs.init_time_utc is
+"the time the model was checked" (when this run's data was pulled/
+generated) and forecast_values.valid_time_utc is "the time the model
+was predicted for" (one row per future hour). This was NOT a gap that
+needed fixing -- every real model (GFS/ECMWF/etc) and NDA have always
+stored both. Documented explicitly here since the user's instruction
+implied it might be missing.
+
+(3) FULL PREDICTION HISTORY, NOT A SINGLE NUMBER -- also already true:
+NDA writes one forecast_values row per valid_time_utc for every hour
+each of the 6 real models currently forecasts (same as any other
+model), and every run of this script creates a NEW forecast_runs row
+(not an update to a prior one), so historical NDA runs are preserved
+exactly like real models' run history -- this is what already lets
+Forecast Stability compare NDA's last-N-runs the same way it compares
+any real model. Also not a gap; documented for the same reason as (2).
+
+(4) TIME AS A REGRESSION INPUT -- genuinely new. Confirmed empirically
+first (not just taking the user's intuition on faith): a regression
+trained ONLY on 0-12h lead-time data and then applied unchanged out to
+48-72h showed real, measurable degradation (clean CV MAE 1.64kt at
+0-12h vs 1.99kt at 24-48h when using the SAME fixed line) -- the
+relationship between the 6 models' forecasts and the real outcome
+genuinely does shift with lead time, confirming the user's suspicion.
+Addressed by adding lead_hours (hours between "now" and the valid_time
+being predicted) as an explicit regression feature: NDA = beta0 +
+beta_lead*lead_hours + sum(beta_m * model_m for m in whichever models
+have real data for that hour). This lets the fitted relationship
+genuinely vary continuously with distance into the future, rather than
+either (a) one fixed line for every horizon (the old design) or (b)
+hard lead-time buckets with arbitrary boundaries and less training
+data per bucket.
+
+(5) NO AVERAGING-IN FOR MISSING MODELS, EVER -- genuinely new, and
+replaces the single biggest source of the OLD design's error at long
+lead times. Previously, when a short-horizon model (HRRR ~48h, NAM
+~60h, HRDPS ~42h real coverage -- see ingest_forecasts.py's MODELS
+comment) had no data for an hour, predict_ensemble() substituted the
+MEAN of whichever models WERE present in that missing model's slot --
+this fed the regression a fabricated value in place of real data,
+every single time, for every hour past each short-horizon model's own
+limit (confirmed live: HRDPS/HRRR/NAM essentially have zero real
+coverage past 48h, meaning almost every "72h+" NDA prediction was
+quietly substituting 2-3 fabricated inputs). Now: for every distinct
+VALID_TIME, the actual set of models with real data at that hour is
+computed directly (no hardcoded horizon assumptions -- this adapts
+automatically if a model's real coverage ever changes), and a
+SEPARATE regression is fit (or reused from cache) for that EXACT set
+of available models, trained only on historical rows where that same
+set of models was genuinely present. A missing model is never
+backfilled with a substitute value of any kind -- it's simply excluded
+from both the regression's inputs and its training data for that
+specific active-model combination.
 
 GROUND TRUTH, per explicit user direction (both the general
 ground-truth-substitution pattern already used everywhere else in this
@@ -34,57 +112,34 @@ truth data"):
       real ground truth available for those variables at CBI).
     - air_temp_f, water_temp_f (Harvard Bridge has no temperature
       sensor at all): falls back to that location's OWN observations.
-      This is a deliberate, narrower exception confirmed with the user
-      during design -- temps were never part of the "use Harvard
-      Bridge" instruction (which was about wind/gust/direction/
-      pressure specifically), and Harvard Bridge genuinely has no
-      temperature data to substitute even if the instruction were
-      read that broadly.
     - kbos, ndbc_44013, courageous_sailing, coops_8443970: use their
-      own real sensors directly (no substitution available/needed --
-      Harvard Bridge ground-truth substitution has ALWAYS been
-      specific to mit_pavilion/cbi_dockhouse in this project, since
-      those are the two locations on the Charles River basin close
-      enough to Harvard Bridge to be a meaningful stand-in; KBOS/NDBC/
-      Courageous/CO-OPS are real independent sensors already).
+      own real sensors directly.
 
 NEVER INCLUDES ITSELF: per explicit user instruction ("as long as NDA
-isn't computed to include itself"), the regression is fit ONLY from
+isn't computed to include itself"), every regression is fit ONLY from
 the 6 real NWP models' (gfs, ecmwf, hrrr, icon, nam, hrdps) historical
 forecast values -- this script never reads back its own prior 'nda'
-rows as a regression input, and the SQL below explicitly filters
-fr.model IN (...) to the 6 real models, excluding 'nda' by construction
-even if a prior run's rows are still in the table.
+rows as a regression input.
 
 DIRECTION (wind_dir_deg) IS CIRCULAR -- per explicit user direction
 ("regress the sin/cos components separately ... then reconstruct the
 angle -- keeps it genuinely 'linear regression', handles wraparound
-correctly"): two SEPARATE linear regressions are fit, one predicting
-sin(observed_direction) from each model's sin(forecast_direction), one
-predicting cos(...) the same way, then NDA's own direction is
-reconstructed via atan2(predicted_sin, predicted_cos). This correctly
-handles wraparound (e.g. models disagreeing between 350 degrees and 10
-degrees, which are actually only 20 degrees apart) the same way
-circularMeanDeg() does on the frontend, but as a genuine fitted
-regression rather than an unweighted average.
+correctly"): two SEPARATE linear regressions are fit (now also
+per-active-model-set + lead_hours, same as every other variable), one
+predicting sin(observed_direction), one predicting cos(...), then
+NDA's own direction is reconstructed via atan2(predicted_sin,
+predicted_cos).
 
-MINIMUM DATA BAR: reuses the same MIN_TRAINING_ROWS=20 threshold
-already established in wind_regression_model.py (per user: "same
-minimum-row threshold already used elsewhere in this project") --
-skips writing NDA rows for any (location, variable) that doesn't have
-at least 20 real matched (all 6 models + ground truth) historical rows
-to fit from. This naturally means a brand-new location like Courageous
-Sailing may not get NDA coverage for a while after being added, and a
-variable with sparse ground truth (e.g. KBOS's wind_gust_kt, which has
-real METAR reporting gaps -- see the "Logan Airport gust-reporting
-convention" investigation elsewhere in this project) may also fall
-below the bar even at an otherwise well-covered location.
+MINIMUM DATA BAR: MIN_TRAINING_ROWS=20 (mirrors
+website/wind_regression_model.py's threshold), applied PER
+ACTIVE-MODEL-SET -- a lead-time range/model-combination with too few
+historical examples is skipped entirely (no prediction written for
+those hours) rather than falling back to a less-specific fit, which
+would reintroduce exactly the kind of implicit substitution point (5)
+was meant to eliminate.
 
 CADENCE: run on the SAME cron cadence as the main Forecast Ingester
-(see sw_ingest_nda.sh), right after it -- NDA needs each of the 6 real
-models' CURRENT run to already be in the database before it can
-produce its own forecast for "right now", so it must run after (not
-concurrently with) the main forecast ingester.
+(see sw_ingest_nda.sh), right after it.
 """
 import sys
 from datetime import datetime, timezone
@@ -97,6 +152,7 @@ from common import get_connection
 REAL_MODELS = ["gfs", "ecmwf", "hrrr", "icon", "nam", "hrdps"]
 NDA_MODEL_NAME = "nda"
 MIN_TRAINING_ROWS = 20  # mirrors website/wind_regression_model.py's threshold
+WIND_SPEED_VARS = {"wind_speed_kt", "wind_gust_kt"}  # which variables get the WIND_SANITY_RANGE_KT output clamp -- see predict_linear()'s docstring
 
 # (location_id, variable) -> ground_truth_location_id. Variables/locations
 # not listed here use their own location_id as ground truth (the "use own
@@ -114,18 +170,42 @@ def ground_truth_location(location_id, variable):
     return GROUND_TRUTH_OVERRIDE.get((location_id, variable), location_id)
 
 
-def fetch_training_matrix(con, location_id, variable, gt_location):
-    """Returns (X, y) where X is an (n, 6) array of each real model's
-    forecast value (columns in REAL_MODELS order) and y is the matched
-    ground-truth observed value, for every historical valid_time_utc
-    where ALL 6 models AND a ground-truth observation are available.
-    Uses the nearest-observation-within-7.5min matching convention
-    already established by v_accuracy_by_lead_time/the dedup-by-real-
-    event pattern elsewhere in this project."""
-    rows = con.execute(
-        """
+def fetch_bucket_training_rows(con, location_id, variable, gt_location, active_models):
+    """Training data for a SPECIFIC set of active models (point 5: a
+    regression is only ever fit/applied using models that genuinely
+    have data for the hours in question -- never a fabricated
+    substitute for a missing one).
+
+    Returns a list of (lead_hours, [value for m in active_models],
+    observed_value) tuples. A historical valid_time is included as
+    long as EVERY model in active_models has a real value there --
+    other real models not in active_models are ignored entirely for
+    this fit (their presence/absence doesn't matter), which is exactly
+    why this naturally reuses near-term rows (where all 6 models are
+    present) as training data for every active-set, not just the
+    smaller active-sets that only ever occur at long lead times.
+
+    lead_hours is computed PER ROW as the average, across the active
+    models, of (valid_time - that model's own init_time) -- i.e. "how
+    far ahead was this forecast made", consistent with how lead_hours
+    is computed for a live prediction (see predict-time call sites
+    below, which use "now" as the reference init_time since NDA's own
+    run represents the current moment)."""
+    model_list_sql = ", ".join("?" for _ in active_models)
+    value_cols = ", ".join(
+        f"max(CASE WHEN model = ? THEN value END) AS m{i}" for i in range(len(active_models))
+    )
+    lead_cols = ", ".join(
+        f"max(CASE WHEN model = ? THEN lead_hours END) AS l{i}" for i in range(len(active_models))
+    )
+    not_null_clause = " AND ".join(f"p.m{i} IS NOT NULL" for i in range(len(active_models)))
+    avg_lead_expr = "(" + " + ".join(f"p.l{i}" for i in range(len(active_models))) + f") / {len(active_models)}.0"
+    value_select = ", ".join(f"p.m{i}" for i in range(len(active_models)))
+
+    query = f"""
         WITH per_model AS (
             SELECT fv.valid_time_utc, fr.model, fv.value,
+                   epoch(fv.valid_time_utc - fr.init_time_utc) / 3600.0 AS lead_hours,
                    row_number() OVER (
                        PARTITION BY fr.model, fv.valid_time_utc
                        ORDER BY epoch(fv.valid_time_utc - fr.init_time_utc)
@@ -133,213 +213,199 @@ def fetch_training_matrix(con, location_id, variable, gt_location):
             FROM forecast_values fv
             JOIN forecast_runs fr ON fr.run_id = fv.run_id
             WHERE fr.location_id = ? AND fv.variable = ?
-              AND fr.model IN ('gfs', 'ecmwf', 'hrrr', 'icon', 'nam', 'hrdps')
-              AND epoch(fv.valid_time_utc - fr.init_time_utc) / 3600.0 BETWEEN 0 AND 12
+              AND fr.model IN ({model_list_sql})
+              AND fv.valid_time_utc >= fr.init_time_utc
         ),
         pivoted AS (
-            SELECT valid_time_utc,
-                   max(CASE WHEN model = 'gfs' THEN value END) AS gfs,
-                   max(CASE WHEN model = 'ecmwf' THEN value END) AS ecmwf,
-                   max(CASE WHEN model = 'hrrr' THEN value END) AS hrrr,
-                   max(CASE WHEN model = 'icon' THEN value END) AS icon,
-                   max(CASE WHEN model = 'nam' THEN value END) AS nam,
-                   max(CASE WHEN model = 'hrdps' THEN value END) AS hrdps
+            SELECT valid_time_utc, {value_cols}, {lead_cols}
             FROM per_model
             WHERE rn = 1
             GROUP BY valid_time_utc
         )
-        SELECT p.gfs, p.ecmwf, p.hrrr, p.icon, p.nam, p.hrdps, o.value
+        SELECT {avg_lead_expr} AS lead_hours, {value_select}, o.value AS observed_value
         FROM pivoted p
         JOIN observations o
             ON o.location_id = ? AND o.variable = ?
            AND o.ts_utc BETWEEN p.valid_time_utc - INTERVAL '7.5 minutes'
                              AND p.valid_time_utc + INTERVAL '7.5 minutes'
-        WHERE p.gfs IS NOT NULL AND p.ecmwf IS NOT NULL AND p.hrrr IS NOT NULL
-          AND p.icon IS NOT NULL AND p.nam IS NOT NULL AND p.hrdps IS NOT NULL
-        """,
-        [location_id, variable, gt_location, variable],
-    ).fetchall()
-    if not rows:
-        return None, None
-    X = np.array([r[:6] for r in rows], dtype=float)
-    y = np.array([r[6] for r in rows], dtype=float)
-    return X, y
-
-
-WIND_SPEED_VARS = {"wind_speed_kt", "wind_gust_kt"}  # see fit_ensemble()'s docstring for why these get the quadratic-through-zero treatment and nothing else does
-
-
-def fit_ensemble(X, y, variable):
-    """Fits NDA's per-variable regression. Two designs, chosen by
-    variable:
-
-    QUADRATIC, FORCED THROUGH ZERO -- for wind_speed_kt/wind_gust_kt
-    only. ADDED 2026-10-22 (user: "why is my NDA model saying such
-    higher wind than other models on saturday both wind and gusts" ->
-    traced to the OLD linear-with-intercept design: its fitted
-    intercept (roughly +1 to +1.5kt depending on location) is a small,
-    invisible correction on a normal/windy day, but becomes a large
-    fraction of the total prediction on an unusually calm day --
-    confirmed with real numbers: 5 real models averaging ~3.0kt at MIT
-    on a calm Saturday, NDA outputting 4.4kt, almost entirely the
-    intercept. User asked: "is there an edit better than straight
-    linear regression that would fit this better maybe 3rd degree so i
-    can still go through 0" -> "quadratic forced through zero" after a
-    follow-up comparison. VALIDATED FIRST via real 5-fold
-    cross-validation across all 3 ground-truthed locations before
-    implementing (not just taking the user's intuition on faith):
-        linear + intercept (old):      MIT 1.669, CBI 1.698, KBOS 1.555
-        linear, NO intercept:          MIT 1.745, CBI 1.776, KBOS 1.601 (WORSE -- just dropping the intercept without adding flexibility hurts)
-        quadratic, NO intercept:       MIT 1.645, CBI 1.652, KBOS 1.552 (BEST overall)
-        cubic, NO intercept:           MIT 1.654, CBI 1.656, KBOS 1.552 (very close to quadratic, slightly worse at 2/3 locations -- extra cubic term doesn't earn its keep on this much data)
-    Quadratic-through-zero both beats the old model's accuracy AND
-    genuinely fixes the complaint (all 6 models reporting 0 now
-    predicts 0, not a baked-in offset).
-
-    LINEAR + INTERCEPT (unchanged) -- for every other variable
-    (pressure_hpa, air_temp_f, water_temp_f). Deliberately NOT changed
-    to quadratic-through-zero: "zero" has no physical meaning for
-    pressure (hPa) or temperature (F) the way it does for wind speed --
-    0 hPa and 0F are not meaningful "calm" states those models would
-    ever jointly predict, so forcing the regression through that point
-    would be an arbitrary constraint with no justification, unlike
-    wind/gust where 0 genuinely means "every model agrees it's dead
-    calm". wind_dir_deg's sin/cos regression is a separate code path
-    entirely (see fetch_direction_training_matrix/predict_direction)
-    and is also unaffected by this change.
-
-    Returns a fitted beta vector suitable for predict_ensemble(..., variable)
-    with the matching variable name -- do NOT pass a quadratic-fit beta
-    to predict_linear(), use predict_ensemble() instead.
+        WHERE {not_null_clause}
     """
-    if X is None or len(X) < MIN_TRAINING_ROWS:
+    params = (
+        [location_id, variable]
+        + list(active_models)
+        + list(active_models)
+        + list(active_models)
+        + [gt_location, variable]
+    )
+    rows = con.execute(query, params).fetchall()
+    return rows
+
+
+def fit_linear(rows, n_active_models):
+    """Plain OLS with intercept: y ~= beta0 + beta_lead*lead_hours +
+    sum(beta_m * model_m). `rows` is (lead_hours, model_val_1, ...,
+    model_val_k, observed_value) tuples -- the lead_hours column comes
+    FIRST so it's always feature index 0 regardless of how many models
+    are active, keeping this one fit function usable for every
+    active-model-set size (1 through 6). Returns None if there's not
+    enough data (point 5's "don't fall back to a less-specific fit"
+    principle applies here too -- too little data for one specific
+    active-set means no prediction for those hours, not a guess).
+
+    MINIMUM ROWS SCALES WITH PARAMETER COUNT -- ADDED 2026-10-24 after
+    finding a real problem during backfill testing: a flat
+    MIN_TRAINING_ROWS=20 for every active-set size let 1-model fits
+    (2 parameters: intercept + lead_hours + 1 model = effectively a
+    plane in 3D) run with barely more rows than parameters, which is
+    exactly the small-sample-instability regime that caused the
+    quadratic model's 199kt explosion earlier in this project's
+    history. Confirmed live: courageous_sailing's backfill produced
+    ~7% of its wind_speed_kt predictions as physically impossible
+    (negative or 100+kt), ALL traced to n_models=1 fits with minimal
+    walk-forward training data early in that location's history.
+    Scaling the floor by (2 + n_active_models) -- the real parameter
+    count (intercept + lead_hours + one coefficient per active model)
+    -- means a 1-model fit now needs more real support before being
+    trusted, while a full 6-model fit (8 parameters) isn't penalized
+    beyond the original threshold in proportion."""
+    min_rows = max(MIN_TRAINING_ROWS, (2 + n_active_models) * 10)
+    if len(rows) < min_rows:
         return None
-    if variable in WIND_SPEED_VARS:
-        feats = np.hstack([X, X**2])
-        beta, _residuals, _rank, _sv = np.linalg.lstsq(feats, y, rcond=None)
-        return beta
+    arr = np.array(rows, dtype=float)
+    X = arr[:, :-1]  # lead_hours + all active model values
+    y = arr[:, -1]
     X1 = np.hstack([np.ones((len(X), 1)), X])
     beta, _residuals, _rank, _sv = np.linalg.lstsq(X1, y, rcond=None)
-    return beta
+    # ADDED 2026-10-24 (user: "shouldn't be 80 knot predictions...unless
+    # which models said the same?") -- found that even after fixing the
+    # negative-lead_hours query bug (see fetch_bucket_training_rows's
+    # new "fv.valid_time_utc >= fr.init_time_utc" filter), a fit trained
+    # ONLY on short lead times (e.g. a 1-model active-set that's rarely
+    # the sole survivor except at very long lead times, so its training
+    # rows end up clustered at 0-5h) was still being asked to predict at
+    # 300+ hours -- wild extrapolation FAR outside the fit's actual
+    # training range, producing nonsense (verified: -9kt for a case
+    # whose only real input, GFS, said an ordinary 10.5kt). The WIDE
+    # sanity clamp from the same date was hiding this by capping the
+    # output number, but never addressed why the regression was wrong
+    # in the first place. Real fix (per user's explicit choice): track
+    # the training data's own lead_hours range here and have
+    # predict_linear() refuse to extrapolate meaningfully beyond it.
+    max_train_lead = float(X[:, 0].max())
+    return beta, max_train_lead
 
 
-def predict_ensemble(beta, model_values, variable):
-    """model_values: list of 6 floats in REAL_MODELS order (or None for
-    a missing model -- substituted with the mean of the other present
-    models so one missing model doesn't zero out the whole prediction).
-    Mirrors fit_ensemble()'s choice of feature transform by variable --
-    see that function's docstring for the full rationale."""
-    present = [v for v in model_values if v is not None]
-    if not present:
+# Physically-sane output range for wind variables -- kept as a LAST-
+# LINE-OF-DEFENSE only (narrowed 2026-10-24 now that the real fix is
+# predict_linear()'s lead_hours-range check below; this should rarely
+# if ever fire now, unlike before when it was silently absorbing
+# routine extrapolation failures). Real gusts at this project's
+# locations have been observed up to the high 30s kt (see the
+# NE-direction gust analysis elsewhere in this project).
+WIND_SANITY_RANGE_KT = (0.0, 60.0)
+
+# How far beyond a fit's own training lead_hours range it's allowed to
+# extrapolate before predict_linear() refuses outright (returns None)
+# instead of guessing -- ADDED 2026-10-24, see fit_linear()'s docstring
+# for the investigation that motivated this (a 1-model fit trained on
+# 0-5h data was extrapolating to 300+h and producing nonsense). A
+# fixed multiplier rather than a fixed hour count so a fit with a wider
+# natural training range (e.g. a 2-model set that's commonly active out
+# to 72h) isn't penalized the same as a 1-model set that's only ever
+# seen 0-5h.
+MAX_EXTRAPOLATION_FACTOR = 2.0
+
+
+def predict_linear(beta_and_range, lead_hours, model_values, clamp_range=None):
+    """model_values: list of floats, same order/length as the
+    active_models the beta was fit against. No None-filling/averaging
+    here at all (point 5) -- by construction, the caller only ever
+    passes the models that genuinely have real data for this hour.
+    clamp_range, if given, clips the output to (lo, hi) -- used for
+    wind_speed_kt/wind_gust_kt only, see WIND_SANITY_RANGE_KT (now a
+    last-resort safety net, not the primary defense -- see
+    MAX_EXTRAPOLATION_FACTOR for the real fix).
+
+    beta_and_range is fit_linear()'s (beta, max_train_lead) return
+    value -- refuses to predict (returns None) when lead_hours is more
+    than MAX_EXTRAPOLATION_FACTOR x beyond what this specific fit was
+    ever trained on, rather than silently extrapolating into nonsense
+    and relying on the output clamp to hide it."""
+    if beta_and_range is None:
         return None
-    fallback = sum(present) / len(present)
-    filled = np.array([v if v is not None else fallback for v in model_values])
-    if variable in WIND_SPEED_VARS:
-        row = np.concatenate([filled, filled**2])
-    else:
-        row = np.concatenate([[1.0], filled])
-    return float(row @ beta)
-
-
-def predict_linear(beta, model_values):
-    """Plain linear-with-intercept prediction -- still used directly by
-    predict_direction() for the sin/cos components (always linear,
-    never quadratic -- see fit_ensemble()'s docstring for why direction
-    is out of scope for the quadratic-through-zero change), and
-    equivalent to predict_ensemble(..., variable='pressure_hpa') for
-    any non-wind-speed variable (kept as a separate simpler function
-    for that direction use case rather than requiring a dummy variable
-    argument there)."""
-    present = [v for v in model_values if v is not None]
-    if not present:
+    beta, max_train_lead = beta_and_range
+    if lead_hours > max_train_lead * MAX_EXTRAPOLATION_FACTOR and lead_hours > max_train_lead + 24:
         return None
-    fallback = sum(present) / len(present)
-    row = np.array([1.0] + [v if v is not None else fallback for v in model_values])
-    return float(row @ beta)
+    row = np.array([1.0, lead_hours] + list(model_values))
+    pred = float(row @ beta)
+    if clamp_range is not None:
+        pred = max(clamp_range[0], min(clamp_range[1], pred))
+    return pred
 
 
-def fetch_direction_training_matrix(con, location_id, gt_location):
-    """Same shape as fetch_training_matrix but returns sin/cos pairs
-    for circular regression -- see module docstring's "DIRECTION IS
-    CIRCULAR" section."""
-    rows = con.execute(
-        """
-        WITH per_model AS (
-            SELECT fv.valid_time_utc, fr.model, fv.value,
-                   row_number() OVER (
-                       PARTITION BY fr.model, fv.valid_time_utc
-                       ORDER BY epoch(fv.valid_time_utc - fr.init_time_utc)
-                   ) AS rn
-            FROM forecast_values fv
-            JOIN forecast_runs fr ON fr.run_id = fv.run_id
-            WHERE fr.location_id = ? AND fv.variable = 'wind_dir_deg'
-              AND fr.model IN ('gfs', 'ecmwf', 'hrrr', 'icon', 'nam', 'hrdps')
-              AND epoch(fv.valid_time_utc - fr.init_time_utc) / 3600.0 BETWEEN 0 AND 12
-        ),
-        pivoted AS (
-            SELECT valid_time_utc,
-                   max(CASE WHEN model = 'gfs' THEN value END) AS gfs,
-                   max(CASE WHEN model = 'ecmwf' THEN value END) AS ecmwf,
-                   max(CASE WHEN model = 'hrrr' THEN value END) AS hrrr,
-                   max(CASE WHEN model = 'icon' THEN value END) AS icon,
-                   max(CASE WHEN model = 'nam' THEN value END) AS nam,
-                   max(CASE WHEN model = 'hrdps' THEN value END) AS hrdps
-            FROM per_model
-            WHERE rn = 1
-            GROUP BY valid_time_utc
-        )
-        SELECT p.gfs, p.ecmwf, p.hrrr, p.icon, p.nam, p.hrdps, o.value
-        FROM pivoted p
-        JOIN observations o
-            ON o.location_id = ? AND o.variable = 'wind_dir_deg'
-           AND o.ts_utc BETWEEN p.valid_time_utc - INTERVAL '7.5 minutes'
-                             AND p.valid_time_utc + INTERVAL '7.5 minutes'
-        WHERE p.gfs IS NOT NULL AND p.ecmwf IS NOT NULL AND p.hrrr IS NOT NULL
-          AND p.icon IS NOT NULL AND p.nam IS NOT NULL AND p.hrdps IS NOT NULL
-        """,
-        [location_id, gt_location],
-    ).fetchall()
-    if not rows:
-        return None, None, None
-    raw_models = np.array([r[:6] for r in rows], dtype=float)
-    obs = np.array([r[6] for r in rows], dtype=float)
-    X_sin = np.sin(np.radians(raw_models))
-    X_cos = np.cos(np.radians(raw_models))
-    y_sin = np.sin(np.radians(obs))
-    y_cos = np.cos(np.radians(obs))
-    return X_sin, X_cos, (y_sin, y_cos)
+def fetch_bucket_direction_rows(con, location_id, gt_location, active_models):
+    """Same shape as fetch_bucket_training_rows but for wind_dir_deg --
+    returns raw (not yet sin/cos-transformed) rows so the caller can
+    build the sin and cos training sets separately. See module
+    docstring's "DIRECTION IS CIRCULAR" section."""
+    return fetch_bucket_training_rows(con, location_id, "wind_dir_deg", gt_location, active_models)
 
 
-def predict_direction(beta_sin, beta_cos, model_degrees):
-    """model_degrees: list of 6 raw direction forecasts (degrees, or
-    None). Predicts sin/cos separately via the 2 fitted regressions,
-    then reconstructs the angle via atan2 -- correctly handles
-    wraparound (e.g. models split between 350 and 10 degrees)."""
-    present = [d for d in model_degrees if d is not None]
-    if not present:
+def fit_direction(rows):
+    """Fits 2 separate linear regressions (sin and cos components) from
+    the same raw-degree rows fetch_bucket_direction_rows returns.
+    Returns (beta_sin, beta_cos), either/both None if too little data."""
+    if len(rows) < MIN_TRAINING_ROWS:
+        return None, None
+    arr = np.array(rows, dtype=float)
+    lead_hours = arr[:, 0:1]
+    model_degrees = arr[:, 1:-1]
+    obs_degrees = arr[:, -1]
+    X_sin = np.hstack([lead_hours, np.sin(np.radians(model_degrees))])
+    X_cos = np.hstack([lead_hours, np.cos(np.radians(model_degrees))])
+    y_sin = np.sin(np.radians(obs_degrees))
+    y_cos = np.cos(np.radians(obs_degrees))
+    X_sin1 = np.hstack([np.ones((len(X_sin), 1)), X_sin])
+    X_cos1 = np.hstack([np.ones((len(X_cos), 1)), X_cos])
+    beta_sin, *_ = np.linalg.lstsq(X_sin1, y_sin, rcond=None)
+    beta_cos, *_ = np.linalg.lstsq(X_cos1, y_cos, rcond=None)
+    return beta_sin, beta_cos
+
+
+def predict_direction(beta_sin, beta_cos, lead_hours, model_degrees):
+    """model_degrees: list of raw direction forecasts (degrees), same
+    order/length as the active_models the betas were fit against --
+    no None-filling, mirrors predict_linear()."""
+    if beta_sin is None or beta_cos is None:
         return None
-    sins = [np.sin(np.radians(d)) if d is not None else None for d in model_degrees]
-    coss = [np.cos(np.radians(d)) if d is not None else None for d in model_degrees]
-    pred_sin = predict_linear(beta_sin, sins)
-    pred_cos = predict_linear(beta_cos, coss)
-    if pred_sin is None or pred_cos is None:
-        return None
+    sins = [np.sin(np.radians(d)) for d in model_degrees]
+    coss = [np.cos(np.radians(d)) for d in model_degrees]
+    pred_sin = float(np.array([1.0, lead_hours] + sins) @ beta_sin)
+    pred_cos = float(np.array([1.0, lead_hours] + coss) @ beta_cos)
     return float(np.degrees(np.arctan2(pred_sin, pred_cos)) % 360)
 
 
 def get_latest_run_forecast(con, location_id, model, variable):
     """Returns {valid_time_utc: value} for the latest run of (location,
-    model, variable)."""
+    model, variable).
+
+    FIXED 2026-10-24 (same bug as backfill_nda.py's prefetch_all_runs
+    and fetch_full_rows_any_lead -- user: "shouldn't be 80 knot
+    predictions...unless which models said the same?"): without the
+    valid_time_utc >= init_time_utc filter, a model's bundled pre-init
+    analysis hours were being included as if they were real forward-
+    looking forecast values, corrupting which active-model-set a given
+    hour was grouped into live."""
     rows = con.execute(
         """
         WITH latest_run AS (
-            SELECT run_id FROM forecast_runs
+            SELECT run_id, init_time_utc FROM forecast_runs
             WHERE location_id = ? AND model = ?
             ORDER BY init_time_utc DESC LIMIT 1
         )
         SELECT fv.valid_time_utc, fv.value
         FROM forecast_values fv JOIN latest_run lr ON lr.run_id = fv.run_id
-        WHERE fv.variable = ?
+        WHERE fv.variable = ? AND fv.valid_time_utc >= lr.init_time_utc
         """,
         [location_id, model, variable],
     ).fetchall()
@@ -352,50 +418,34 @@ def main():
     total_rows_written = 0
     try:
         for location_id in LOCATIONS:
-            # ONE run per location per script execution, shared across
-            # every variable for that location -- mirrors how a real
-            # model's run works (one init_time_utc covers all its
-            # variables). FIXED 2026-10-17: an earlier version created a
-            # separate run per (location, variable), which collided on
-            # forecast_runs' (model, location_id, init_time_utc) UNIQUE
-            # constraint since every variable in the same script
-            # execution shares the same `now` timestamp -- the second
-            # variable's INSERT ON CONFLICT DO UPDATE tried to reuse/
-            # recreate the first variable's run_id, which DuckDB
-            # rejected with a foreign-key violation (the first run_id
-            # was already referenced by that first variable's
-            # forecast_values rows).
-            run_id = con.execute(
-                """
-                INSERT INTO forecast_runs (model, location_id, init_time_utc, retrieved_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT (model, location_id, init_time_utc) DO UPDATE SET retrieved_at = excluded.retrieved_at
-                RETURNING run_id
-                """,
-                [NDA_MODEL_NAME, location_id, now, now],
-            ).fetchone()[0]
+            # Query-then-branch rather than ON CONFLICT ... DO UPDATE --
+            # see backfill_nda.py's identical fix for the full
+            # rationale (a real DuckDB 1.5.5 limitation: UPSERT-ing a
+            # row that already has forecast_values children raises a
+            # spurious ConstraintException). `now` differs every run
+            # down to the microsecond so this conflict essentially
+            # never fires live in practice, but the fix is applied here
+            # too for consistency/future-proofing with backfill_nda.py.
+            existing_run = con.execute(
+                "SELECT run_id FROM forecast_runs WHERE model = ? AND location_id = ? AND init_time_utc = ?",
+                [NDA_MODEL_NAME, location_id, now],
+            ).fetchone()
+            if existing_run:
+                run_id = existing_run[0]
+                con.execute("UPDATE forecast_runs SET retrieved_at = ? WHERE run_id = ?", [now, run_id])
+            else:
+                run_id = con.execute(
+                    """
+                    INSERT INTO forecast_runs (model, location_id, init_time_utc, retrieved_at)
+                    VALUES (?, ?, ?, ?)
+                    RETURNING run_id
+                    """,
+                    [NDA_MODEL_NAME, location_id, now, now],
+                ).fetchone()[0]
 
             for variable in VARIABLES:
                 gt_loc = ground_truth_location(location_id, variable)
 
-                if variable == "wind_dir_deg":
-                    X_sin, X_cos, y_pair = fetch_direction_training_matrix(con, location_id, gt_loc)
-                    if X_sin is None or len(X_sin) < MIN_TRAINING_ROWS:
-                        continue
-                    y_sin, y_cos = y_pair
-                    X_sin1 = np.hstack([np.ones((len(X_sin), 1)), X_sin])
-                    X_cos1 = np.hstack([np.ones((len(X_cos), 1)), X_cos])
-                    beta_sin, _, _, _ = np.linalg.lstsq(X_sin1, y_sin, rcond=None)
-                    beta_cos, _, _, _ = np.linalg.lstsq(X_cos1, y_cos, rcond=None)
-                else:
-                    X, y = fetch_training_matrix(con, location_id, variable, gt_loc)
-                    beta = fit_ensemble(X, y, variable)
-                    if beta is None:
-                        continue
-
-                # Gather each real model's CURRENT latest-run forecast,
-                # keyed by valid_time_utc, so NDA produces one point per
-                # valid_time (matching whichever models actually cover it).
                 per_model_forecasts = {
                     m: get_latest_run_forecast(con, location_id, m, variable) for m in REAL_MODELS
                 }
@@ -403,26 +453,69 @@ def main():
                 if not all_valid_times:
                     continue
 
-                rows_written = 0
+                # Group valid_times by their EXACT active-model-set
+                # (point 5) -- a given hour's active set is whichever
+                # real models genuinely have a value there, nothing
+                # more. Most hours within a model's real coverage share
+                # the same active set (all 6), so this naturally
+                # collapses to very few distinct fits per location/
+                # variable (one per "how many/which models have
+                # dropped out by this point"), not one fit per hour.
+                groups = {}
                 for vt in all_valid_times:
-                    model_values = [per_model_forecasts[m].get(vt) for m in REAL_MODELS]
-                    if variable == "wind_dir_deg":
-                        pred = predict_direction(beta_sin, beta_cos, model_values)
-                    else:
-                        pred = predict_ensemble(beta, model_values, variable)
-                    if pred is None:
+                    active = tuple(m for m in REAL_MODELS if per_model_forecasts[m].get(vt) is not None)
+                    if not active:
                         continue
-                    con.execute(
-                        """
-                        INSERT INTO forecast_values (run_id, valid_time_utc, variable, value)
-                        VALUES (?, ?, ?, ?)
-                        ON CONFLICT (run_id, valid_time_utc, variable) DO UPDATE SET value = excluded.value
-                        """,
-                        [run_id, vt, variable, pred],
-                    )
-                    rows_written += 1
+                    groups.setdefault(active, []).append(vt)
+
+                rows_written = 0
+                skipped_insufficient_data = 0
+                fit_cache = {}  # active_models tuple -> beta (or (beta_sin, beta_cos) for direction)
+                for active_models, vts in groups.items():
+                    if active_models not in fit_cache:
+                        if variable == "wind_dir_deg":
+                            train_rows = fetch_bucket_direction_rows(con, location_id, gt_loc, active_models)
+                            fit_cache[active_models] = fit_direction(train_rows)
+                        else:
+                            train_rows = fetch_bucket_training_rows(con, location_id, variable, gt_loc, active_models)
+                            fit_cache[active_models] = fit_linear(train_rows, len(active_models))
+
+                    fitted = fit_cache[active_models]
+                    is_missing = (fitted is None) if variable != "wind_dir_deg" else (fitted[0] is None)
+                    if is_missing:
+                        skipped_insufficient_data += len(vts)
+                        continue
+
+                    for vt in vts:
+                        # DuckDB TIMESTAMP columns come back as naive
+                        # datetimes (no tz info) -- now is tz-aware, so
+                        # strip its tzinfo for a consistent subtraction
+                        # (every timestamp in this DB is already
+                        # implicitly UTC, matching the project's
+                        # existing convention elsewhere).
+                        lead_hours = (vt - now.replace(tzinfo=None)).total_seconds() / 3600.0
+                        model_values = [per_model_forecasts[m][vt] for m in active_models]
+                        if variable == "wind_dir_deg":
+                            beta_sin, beta_cos = fitted
+                            pred = predict_direction(beta_sin, beta_cos, lead_hours, model_values)
+                        else:
+                            clamp = WIND_SANITY_RANGE_KT if variable in WIND_SPEED_VARS else None
+                            pred = predict_linear(fitted, lead_hours, model_values, clamp_range=clamp)
+                        if pred is None:
+                            continue
+                        con.execute(
+                            """
+                            INSERT INTO forecast_values (run_id, valid_time_utc, variable, value)
+                            VALUES (?, ?, ?, ?)
+                            ON CONFLICT (run_id, valid_time_utc, variable) DO UPDATE SET value = excluded.value
+                            """,
+                            [run_id, vt, variable, pred],
+                        )
+                        rows_written += 1
+
                 total_rows_written += rows_written
-                print(f"NDA {location_id}/{variable}: fit on ground truth {gt_loc}, wrote {rows_written} points")
+                note = f" ({skipped_insufficient_data} hours skipped, insufficient training data for their active-model-set)" if skipped_insufficient_data else ""
+                print(f"NDA {location_id}/{variable}: fit on ground truth {gt_loc}, wrote {rows_written} points across {len(fit_cache)} active-model-set(s){note}")
     finally:
         con.close()
     print(f"NDA ensemble: {total_rows_written} total forecast points written across all location/variable combos")

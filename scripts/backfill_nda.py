@@ -2,42 +2,36 @@
 """One-time (re-runnable) BACKFILL for the NDA ensemble model.
 
 ADDED 2026-10-17 (user: "you need to backfill calculate the NDA models
-for the past" -- after noticing NDA only had its first ~2 live runs
-from scripts/ingest_nda.py's initial manual run + first cron tick, vs.
-the 6 real models' 140-160 historical runs going back to September).
-Without this, NDA would have looked like a brand-new location for
-weeks in Forecast Time Series/Model Accuracy/Stability, even though it
-could be computed retroactively from data that already exists.
+for the past"). REWRITTEN 2026-10-22 alongside ingest_nda.py's own
+rewrite (see that module's docstring for the full "1-5" rationale) --
+this script must mirror ingest_nda.py's CURRENT design (linear, time-
+as-a-feature, per-active-model-set fitting, no missing-model averaging)
+or the backfilled history and the live cron job would represent two
+different, inconsistent models.
 
-WALK-FORWARD, NOT HINDSIGHT -- this is the one thing that makes a
-backfill like this legitimate rather than cheating: for each historical
-moment being backfilled, the regression weights are refit using ONLY
-ground-truth data whose valid_time_utc is STRICTLY BEFORE that day's
-start. If this script instead fit one set of weights on ALL available
-history (including data from after the backfilled date) and applied it
-retroactively, NDA's own historical "accuracy" would be artificially
-inflated by effectively knowing the future relative to the date being
-backfilled -- a classic look-ahead bias that would make Model Accuracy
-and any other NDA-vs-real-model comparison meaningless. Refit cadence
-is DAILY (not per-run) as a reasonable compute/rigor tradeoff -- ~40
-real historical days per location, refitting at finer granularity than
-that wouldn't meaningfully change the weights day-to-day anyway given
-how much data each day already represents, but refitting once per real
-model run (150+ times per location) would be needlessly slow for no
-real accuracy benefit.
+WALK-FORWARD, NOT HINDSIGHT -- the one thing that makes a backfill like
+this legitimate rather than cheating: for each historical init_time
+being backfilled, every regression is refit using ONLY ground-truth
+data whose valid_time_utc is STRICTLY BEFORE that init_time. Refitting
+once on ALL available history and applying it retroactively would give
+NDA artificially inflated historical "accuracy" via look-ahead bias.
 
-MIRRORS ingest_nda.py's exact production logic (ground-truth overrides,
-MIN_TRAINING_ROWS threshold, direction sin/cos regression, "never
-includes itself" via the same REAL_MODELS-only training query) -- this
-is NOT a separate, divergent implementation; it imports and reuses
-ingest_nda.py's fitting/prediction functions directly so the backfilled
-history and the ongoing live cron job stay consistent with each other.
+PER-ACTIVE-MODEL-SET, PER-INIT-TIME -- mirrors ingest_nda.py's "point
+5" design exactly: at a given historical init_time, whichever of the 6
+real models actually had data for a given valid_time_utc determines
+that hour's active set; a SEPARATE regression (with lead_hours as a
+feature -- "point 4") is fit per active set, trained only on rows
+STRICTLY BEFORE this init_time where that same active set held. No
+missing model is ever backfilled with a substitute/average value.
 
-SAFE TO RE-RUN: every INSERT uses the same ON CONFLICT DO UPDATE
-pattern as the live script, keyed on (model, location_id,
-init_time_utc) for runs and (run_id, valid_time_utc, variable) for
-values -- re-running this script recomputes/overwrites rather than
-duplicating.
+PERFORMANCE: fitting is now per (init_time, active-model-set) rather
+than per (init_time, variable) -- more total fits than the old design,
+but each fit's training-row lookup is a fast in-memory list
+comprehension over a pre-fetched array (same pattern as before), not a
+new DB query, so this stays tractable. See prefetch/caching comments
+below for the specifics.
+
+SAFE TO RE-RUN: same ON CONFLICT DO UPDATE pattern as the live script.
 """
 import sys
 from datetime import timezone
@@ -55,181 +49,163 @@ from ingest_nda import (
     LOCATIONS,
     VARIABLES,
     ground_truth_location,
-    predict_ensemble,
-    predict_direction,
 )
 
 
-def fetch_full_training_rows(con, location_id, variable, gt_location):
-    """Like ingest_nda.fetch_training_matrix but ALSO returns each row's
-    own valid_time_utc, needed here to filter to 'data available before
-    day X' for the walk-forward refit. Returns a list of
-    (valid_time_utc, [6 model values], observed_value)."""
+def fetch_full_rows_any_lead(con, location_id, variable, gt_location):
+    """Returns EVERY historical (valid_time_utc, lead_hours, model,
+    value, observed_value) row for this location/variable, regardless
+    of which models are present for a given valid_time -- unlike
+    ingest_nda.py's live fetch_bucket_training_rows (which is called
+    once per active-model-set with a fixed SQL shape for that set),
+    this backfill needs one flexible in-memory structure it can filter
+    BOTH by "active set" AND by "strictly before this init_time"
+    without re-querying the DB for every (init_time, active-set)
+    combination -- there could be dozens of init_times x several
+    active-sets per location, and a DB round trip for each would be
+    the real bottleneck (same lesson as the old backfill's
+    prefetch_all_runs fix).
+
+    Returns a dict: valid_time_utc -> {"obs": observed_value,
+    "models": {model: (value, lead_hours)}}."""
     rows = con.execute(
         """
-        WITH per_model AS (
-            SELECT fv.valid_time_utc, fr.model, fv.value,
-                   row_number() OVER (
-                       PARTITION BY fr.model, fv.valid_time_utc
-                       ORDER BY epoch(fv.valid_time_utc - fr.init_time_utc)
-                   ) AS rn
-            FROM forecast_values fv
-            JOIN forecast_runs fr ON fr.run_id = fv.run_id
-            WHERE fr.location_id = ? AND fv.variable = ?
-              AND fr.model IN ('gfs', 'ecmwf', 'hrrr', 'icon', 'nam', 'hrdps')
-              AND epoch(fv.valid_time_utc - fr.init_time_utc) / 3600.0 BETWEEN 0 AND 12
-        ),
-        pivoted AS (
-            SELECT valid_time_utc,
-                   max(CASE WHEN model = 'gfs' THEN value END) AS gfs,
-                   max(CASE WHEN model = 'ecmwf' THEN value END) AS ecmwf,
-                   max(CASE WHEN model = 'hrrr' THEN value END) AS hrrr,
-                   max(CASE WHEN model = 'icon' THEN value END) AS icon,
-                   max(CASE WHEN model = 'nam' THEN value END) AS nam,
-                   max(CASE WHEN model = 'hrdps' THEN value END) AS hrdps
-            FROM per_model
-            WHERE rn = 1
-            GROUP BY valid_time_utc
-        )
-        SELECT p.valid_time_utc, p.gfs, p.ecmwf, p.hrrr, p.icon, p.nam, p.hrdps, o.value
-        FROM pivoted p
+        SELECT fv.valid_time_utc, fr.model, fv.value,
+               epoch(fv.valid_time_utc - fr.init_time_utc) / 3600.0 AS lead_hours,
+               o.value AS observed_value,
+               row_number() OVER (
+                   PARTITION BY fr.model, fv.valid_time_utc
+                   ORDER BY epoch(fv.valid_time_utc - fr.init_time_utc)
+               ) AS rn
+        FROM forecast_values fv
+        JOIN forecast_runs fr ON fr.run_id = fv.run_id
         JOIN observations o
             ON o.location_id = ? AND o.variable = ?
-           AND o.ts_utc BETWEEN p.valid_time_utc - INTERVAL '7.5 minutes'
-                             AND p.valid_time_utc + INTERVAL '7.5 minutes'
-        WHERE p.gfs IS NOT NULL AND p.ecmwf IS NOT NULL AND p.hrrr IS NOT NULL
-          AND p.icon IS NOT NULL AND p.nam IS NOT NULL AND p.hrdps IS NOT NULL
-        ORDER BY p.valid_time_utc
+           AND o.ts_utc BETWEEN fv.valid_time_utc - INTERVAL '7.5 minutes'
+                             AND fv.valid_time_utc + INTERVAL '7.5 minutes'
+        WHERE fr.location_id = ? AND fv.variable = ?
+          AND fr.model IN ('gfs', 'ecmwf', 'hrrr', 'icon', 'nam', 'hrdps')
+          AND fv.valid_time_utc >= fr.init_time_utc
         """,
-        [location_id, variable, gt_location, variable],
+        [gt_location, variable, location_id, variable],
     ).fetchall()
-    return rows  # each: (valid_time_utc, gfs, ecmwf, hrrr, icon, nam, hrdps, observed)
+    by_valid_time = {}
+    for vt, model, value, lead_hours, obs, rn in rows:
+        if rn != 1:
+            continue  # keep only the freshest (shortest-lead) run's value for this (model, valid_time), mirrors ingest_nda.py's live "latest run" semantics
+        entry = by_valid_time.setdefault(vt, {"obs": obs, "models": {}})
+        entry["models"][model] = (value, lead_hours)
+    return by_valid_time
 
 
-def fetch_full_direction_training_rows(con, location_id, gt_location):
-    rows = con.execute(
-        """
-        WITH per_model AS (
-            SELECT fv.valid_time_utc, fr.model, fv.value,
-                   row_number() OVER (
-                       PARTITION BY fr.model, fv.valid_time_utc
-                       ORDER BY epoch(fv.valid_time_utc - fr.init_time_utc)
-                   ) AS rn
-            FROM forecast_values fv
-            JOIN forecast_runs fr ON fr.run_id = fv.run_id
-            WHERE fr.location_id = ? AND fv.variable = 'wind_dir_deg'
-              AND fr.model IN ('gfs', 'ecmwf', 'hrrr', 'icon', 'nam', 'hrdps')
-              AND epoch(fv.valid_time_utc - fr.init_time_utc) / 3600.0 BETWEEN 0 AND 12
-        ),
-        pivoted AS (
-            SELECT valid_time_utc,
-                   max(CASE WHEN model = 'gfs' THEN value END) AS gfs,
-                   max(CASE WHEN model = 'ecmwf' THEN value END) AS ecmwf,
-                   max(CASE WHEN model = 'hrrr' THEN value END) AS hrrr,
-                   max(CASE WHEN model = 'icon' THEN value END) AS icon,
-                   max(CASE WHEN model = 'nam' THEN value END) AS nam,
-                   max(CASE WHEN model = 'hrdps' THEN value END) AS hrdps
-            FROM per_model
-            WHERE rn = 1
-            GROUP BY valid_time_utc
-        )
-        SELECT p.valid_time_utc, p.gfs, p.ecmwf, p.hrrr, p.icon, p.nam, p.hrdps, o.value
-        FROM pivoted p
-        JOIN observations o
-            ON o.location_id = ? AND o.variable = 'wind_dir_deg'
-           AND o.ts_utc BETWEEN p.valid_time_utc - INTERVAL '7.5 minutes'
-                             AND p.valid_time_utc + INTERVAL '7.5 minutes'
-        WHERE p.gfs IS NOT NULL AND p.ecmwf IS NOT NULL AND p.hrrr IS NOT NULL
-          AND p.icon IS NOT NULL AND p.nam IS NOT NULL AND p.hrdps IS NOT NULL
-        ORDER BY p.valid_time_utc
-        """,
-        [location_id, gt_location],
-    ).fetchall()
-    return rows
+def fetch_full_direction_rows(con, location_id, gt_location):
+    return fetch_full_rows_any_lead(con, location_id, "wind_dir_deg", gt_location)
 
 
-WIND_SPEED_VARS = {"wind_speed_kt", "wind_gust_kt"}  # mirrors ingest_nda.py's WIND_SPEED_VARS -- see that module's fit_ensemble() docstring for the full rationale
+WIND_SPEED_VARS = {"wind_speed_kt", "wind_gust_kt"}  # mirrors ingest_nda.py's WIND_SPEED_VARS -- which variables get the WIND_SANITY_RANGE_KT output clamp
+WIND_SANITY_RANGE_KT = (0.0, 60.0)  # narrowed 2026-10-24, mirrors ingest_nda.py's WIND_SANITY_RANGE_KT -- see that module's predict_linear() docstring for the full rationale
 
 
-def fit_linear_from_rows(rows, variable):
-    """UPDATED 2026-10-22 (user: "is there an edit better than straight
-    linear regression that would fit this better maybe 3rd degree so i
-    can still go through 0" -> "quadratic forced through zero", after
-    real cross-validation showed it beats both the old linear+intercept
-    design and a cubic alternative -- see ingest_nda.py's fit_ensemble()
-    for the full investigation/rationale). Mirrors that function's
-    choice: wind_speed_kt/wind_gust_kt get a quadratic regression with
-    NO intercept term (forces the "all models say zero -> predict
-    zero" property); every other variable keeps the original linear
-    design with an intercept, since zero has no comparable physical
-    meaning for pressure/temperature. This backfill script duplicates
-    ingest_nda.py's fitting logic (rather than importing it directly)
-    because it needs the WALK-FORWARD data shape (only rows strictly
-    before a given historical init_time) that the live script's single
-    "fit once on everything available right now" functions don't
-    support -- see this module's own docstring for that rationale --
-    but the actual regression DESIGN must stay identical between the 2
-    scripts' outputs, hence mirroring the variable-based branch here
-    rather than letting them drift apart."""
-    if len(rows) < MIN_TRAINING_ROWS:
+def fit_linear(rows, n_active_models):
+    """rows: list of (lead_hours, model_val_1, ..., model_val_k,
+    observed_value). Mirrors ingest_nda.py's fit_linear() exactly --
+    see that function's docstring, including the 2026-10-24 fixes:
+    (1) scaling the minimum-rows floor by parameter count (found via
+    direct testing on this exact script: courageous_sailing's backfill
+    produced ~7% physically-impossible wind_speed_kt predictions,
+    traced to 1-model fits with too little walk-forward training
+    data), and (2) returning (beta, max_train_lead) so predict_linear()
+    can refuse to extrapolate far beyond what a fit actually saw
+    (user: "shouldn't be 80 knot predictions...unless which models said
+    the same?" -- traced to 1-model fits trained on 0-5h data being
+    asked to predict at 300+h)."""
+    min_rows = max(MIN_TRAINING_ROWS, (2 + n_active_models) * 10)
+    if len(rows) < min_rows:
         return None
-    X = np.array([r[1:7] for r in rows], dtype=float)
-    y = np.array([r[7] for r in rows], dtype=float)
-    if variable in WIND_SPEED_VARS:
-        feats = np.hstack([X, X**2])
-        beta, _, _, _ = np.linalg.lstsq(feats, y, rcond=None)
-        return beta
+    arr = np.array(rows, dtype=float)
+    X = arr[:, :-1]
+    y = arr[:, -1]
     X1 = np.hstack([np.ones((len(X), 1)), X])
-    beta, _, _, _ = np.linalg.lstsq(X1, y, rcond=None)
-    return beta
+    beta, _residuals, _rank, _sv = np.linalg.lstsq(X1, y, rcond=None)
+    max_train_lead = float(X[:, 0].max())
+    return beta, max_train_lead
 
 
-def fit_direction_from_rows(rows):
+MAX_EXTRAPOLATION_FACTOR = 2.0  # mirrors ingest_nda.py's MAX_EXTRAPOLATION_FACTOR -- see that module's predict_linear() docstring
+
+
+def predict_linear(beta_and_range, lead_hours, model_values, clamp_range=None):
+    """Mirrors ingest_nda.py's predict_linear() -- clamp_range, if
+    given, clips the output to (lo, hi), used for wind_speed_kt/
+    wind_gust_kt only. beta_and_range is fit_linear()'s (beta,
+    max_train_lead) -- refuses to predict (returns None) when
+    extrapolating too far beyond the fit's own training range."""
+    if beta_and_range is None:
+        return None
+    beta, max_train_lead = beta_and_range
+    if lead_hours > max_train_lead * MAX_EXTRAPOLATION_FACTOR and lead_hours > max_train_lead + 24:
+        return None
+    row = np.array([1.0, lead_hours] + list(model_values))
+    pred = float(row @ beta)
+    if clamp_range is not None:
+        pred = max(clamp_range[0], min(clamp_range[1], pred))
+    return pred
+
+
+def fit_direction(rows):
+    """rows: list of (lead_hours, model_deg_1, ..., model_deg_k,
+    observed_deg). Mirrors ingest_nda.py's fit_direction() exactly."""
     if len(rows) < MIN_TRAINING_ROWS:
         return None, None
-    raw_models = np.array([r[1:7] for r in rows], dtype=float)
-    obs = np.array([r[7] for r in rows], dtype=float)
-    X_sin = np.sin(np.radians(raw_models))
-    X_cos = np.cos(np.radians(raw_models))
-    y_sin = np.sin(np.radians(obs))
-    y_cos = np.cos(np.radians(obs))
+    arr = np.array(rows, dtype=float)
+    lead_hours = arr[:, 0:1]
+    model_degrees = arr[:, 1:-1]
+    obs_degrees = arr[:, -1]
+    X_sin = np.hstack([lead_hours, np.sin(np.radians(model_degrees))])
+    X_cos = np.hstack([lead_hours, np.cos(np.radians(model_degrees))])
+    y_sin = np.sin(np.radians(obs_degrees))
+    y_cos = np.cos(np.radians(obs_degrees))
     X_sin1 = np.hstack([np.ones((len(X_sin), 1)), X_sin])
     X_cos1 = np.hstack([np.ones((len(X_cos), 1)), X_cos])
-    beta_sin, _, _, _ = np.linalg.lstsq(X_sin1, y_sin, rcond=None)
-    beta_cos, _, _, _ = np.linalg.lstsq(X_cos1, y_cos, rcond=None)
+    beta_sin, *_ = np.linalg.lstsq(X_sin1, y_sin, rcond=None)
+    beta_cos, *_ = np.linalg.lstsq(X_cos1, y_cos, rcond=None)
     return beta_sin, beta_cos
 
 
-def get_run_forecast(con, location_id, model, variable, init_time_utc):
-    """Returns {valid_time_utc: value} for the SPECIFIC historical run
-    at init_time_utc (not necessarily the latest) -- this is what makes
-    the backfill reconstruct "what NDA would have said back then"
-    rather than always using today's current run."""
-    rows = con.execute(
-        """
-        SELECT fv.valid_time_utc, fv.value
-        FROM forecast_values fv
-        JOIN forecast_runs fr ON fr.run_id = fv.run_id
-        WHERE fr.location_id = ? AND fr.model = ? AND fr.init_time_utc = ? AND fv.variable = ?
-        """,
-        [location_id, model, init_time_utc, variable],
-    ).fetchall()
-    return {vt: val for vt, val in rows}
+def predict_direction(beta_sin, beta_cos, lead_hours, model_degrees):
+    if beta_sin is None or beta_cos is None:
+        return None
+    sins = [np.sin(np.radians(d)) for d in model_degrees]
+    coss = [np.cos(np.radians(d)) for d in model_degrees]
+    pred_sin = float(np.array([1.0, lead_hours] + sins) @ beta_sin)
+    pred_cos = float(np.array([1.0, lead_hours] + coss) @ beta_cos)
+    return float(np.degrees(np.arctan2(pred_sin, pred_cos)) % 360)
 
 
 def prefetch_all_runs(con, location_id):
-    """One query per location instead of 6 models x 6 vars x ~150 init
-    times (~5,400 queries down to 1) -- the original per-(variable,
-    init_time, model) query pattern was the real bottleneck (each
-    location took minutes; a full 6-location backfill would have taken
-    well over an hour). Returns {(model, variable, init_time_utc):
-    {valid_time_utc: value}}."""
+    """Same as the old backfill's version -- {(model, variable,
+    init_time_utc): {valid_time_utc: value}}, used to reconstruct what
+    each model's forecast looked like AT a specific historical
+    init_time (not necessarily its latest run).
+
+    FIXED 2026-10-24 (same bug/investigation as
+    fetch_full_rows_any_lead's identical fix -- user: "shouldn't be 80
+    knot predictions...unless which models said the same?"): without
+    the valid_time_utc >= init_time_utc filter, a model's bundled
+    PRE-init analysis hours (negative lead_hours -- data for times
+    before the run even started) were being treated as real forecast
+    points for that init_time, which is nonsensical for "what did this
+    model predict going forward from here" and corrupted the
+    active-model-set grouping/lead_hours used when actually making a
+    prediction (as opposed to fetch_full_rows_any_lead's training-data
+    bug, this is the SAME flaw on the prediction side)."""
     rows = con.execute(
         """
         SELECT fr.model, fv.variable, fr.init_time_utc, fv.valid_time_utc, fv.value
         FROM forecast_values fv
         JOIN forecast_runs fr ON fr.run_id = fv.run_id
         WHERE fr.location_id = ? AND fr.model IN ('gfs','ecmwf','hrrr','icon','nam','hrdps')
+          AND fv.valid_time_utc >= fr.init_time_utc
         """,
         [location_id],
     ).fetchall()
@@ -239,14 +215,12 @@ def prefetch_all_runs(con, location_id):
     return out
 
 
-def main():
+def main(locations=None):
     con = get_connection()
     total_runs_written = 0
     total_points_written = 0
     try:
-        for location_id in LOCATIONS:
-            # Every distinct init_time_utc across the 6 real models for
-            # this location -- one NDA "run" will be backfilled at each.
+        for location_id in (locations or LOCATIONS):
             all_init_times = [
                 r[0]
                 for r in con.execute(
@@ -262,55 +236,55 @@ def main():
                 continue
             print(f"=== {location_id}: {len(all_init_times)} historical init times to backfill ===")
 
-            # PERFORMANCE FIX: commit every COMMIT_EVERY_N_RUNS init
-            # times instead of one giant transaction per location.
-            # Confirmed directly: a single transaction spanning MIT's
-            # full 349 init times ran DuckDB out of memory (3.1GB used,
-            # OutOfMemoryException on executemany) -- DuckDB keeps an
-            # uncommitted transaction's changes in memory, and this
-            # project's write-ahead buffer isn't sized for ~350 runs x
-            # up to 6 variables x many forecast_values rows all held
-            # open at once. Periodic commits bound memory to roughly
-            # one batch's worth of pending changes while still avoiding
-            # the original per-statement-autocommit slowness.
             COMMIT_EVERY_N_RUNS = 20
             con.execute("BEGIN TRANSACTION")
 
-            # Pre-fetch each variable's full training history ONCE per
-            # location (not once per init_time) -- the walk-forward
-            # filter below just slices this in-memory list by date,
-            # which is cheap; re-querying the DB per init_time would be
-            # the slow part otherwise.
+            # Pre-fetch ONCE per location/variable -- walk-forward
+            # filtering and active-model-set grouping below are all
+            # cheap in-memory operations over this, not new DB queries.
+            #
+            # PERFORMANCE FIX (found via direct profiling -- a 149-
+            # init-time test on courageous_sailing didn't finish in
+            # 120s): the original version re-scanned the ENTIRE
+            # full_by_vt dict (every historical valid_time this
+            # location/variable has ever had, easily thousands of
+            # entries) for EVERY (init_time, active-model-set)
+            # combination -- with ~149 init_times x 6 variables x
+            # several active-sets each, that's a full-dataset scan
+            # repeated many hundreds of times per location. Fixed by
+            # sorting each variable's rows once into a (valid_time,
+            # entry) list, so the walk-forward "strictly before
+            # init_time_utc" cutoff can be found with a single
+            # bisect_left call (O(log n)) instead of an O(n) scan, and
+            # only that prefix is ever iterated.
+            import bisect
             cached_rows = {}
             cached_dir_rows = None
             for variable in VARIABLES:
                 gt_loc = ground_truth_location(location_id, variable)
                 if variable == "wind_dir_deg":
-                    cached_dir_rows = (fetch_full_direction_training_rows(con, location_id, gt_loc), gt_loc)
+                    full_by_vt = fetch_full_direction_rows(con, location_id, gt_loc)
                 else:
-                    cached_rows[variable] = (fetch_full_training_rows(con, location_id, variable, gt_loc), gt_loc)
+                    full_by_vt = fetch_full_rows_any_lead(con, location_id, variable, gt_loc)
+                sorted_vts = sorted(full_by_vt.keys())
+                sorted_entries = [full_by_vt[vt] for vt in sorted_vts]
+                if variable == "wind_dir_deg":
+                    cached_dir_rows = (sorted_vts, sorted_entries, gt_loc)
+                else:
+                    cached_rows[variable] = (sorted_vts, sorted_entries, gt_loc)
 
-            # PERFORMANCE FIX -- see prefetch_all_runs()'s docstring:
-            # replaces what was 6 models x 6 variables x ~150 init-time
-            # DB round trips (per location) with a single query.
             all_runs = prefetch_all_runs(con, location_id)
 
-            pending_run_values = []  # batched (run_id, valid_time, variable, value) rows -- executemany at the end of each init_time
+            pending_run_values = []
             for i, init_time_utc in enumerate(all_init_times):
-                run_id = None  # created lazily, only if at least one variable produces data
+                run_id = None
                 for variable in VARIABLES:
-                    if variable == "wind_dir_deg":
-                        full_rows, gt_loc = cached_dir_rows
-                        train_rows = [r for r in full_rows if r[0] < init_time_utc]
-                        beta_sin, beta_cos = fit_direction_from_rows(train_rows)
-                        if beta_sin is None:
-                            continue
-                    else:
-                        full_rows, gt_loc = cached_rows[variable]
-                        train_rows = [r for r in full_rows if r[0] < init_time_utc]
-                        beta = fit_linear_from_rows(train_rows, variable)
-                        if beta is None:
-                            continue
+                    sorted_vts, sorted_entries, gt_loc = cached_dir_rows if variable == "wind_dir_deg" else cached_rows[variable]
+                    # Everything at index < cutoff has valid_time_utc
+                    # STRICTLY BEFORE init_time_utc (walk-forward) --
+                    # replaces the old full-dict scan with one bisect.
+                    cutoff = bisect.bisect_left(sorted_vts, init_time_utc)
+                    training_entries = sorted_entries[:cutoff]
 
                     per_model_forecasts = {
                         m: all_runs.get((m, variable, init_time_utc), {}) for m in REAL_MODELS
@@ -319,34 +293,101 @@ def main():
                     if not all_valid_times:
                         continue
 
-                    if run_id is None:
-                        run_id = con.execute(
-                            """
-                            INSERT INTO forecast_runs (model, location_id, init_time_utc, retrieved_at)
-                            VALUES (?, ?, ?, ?)
-                            ON CONFLICT (model, location_id, init_time_utc) DO UPDATE SET retrieved_at = excluded.retrieved_at
-                            RETURNING run_id
-                            """,
-                            [NDA_MODEL_NAME, location_id, init_time_utc, init_time_utc],
-                        ).fetchone()[0]
-                        total_runs_written += 1
+                    # Group this init_time's valid_times by their exact
+                    # active-model-set (point 5) -- same logic as
+                    # ingest_nda.py's live main().
+                    groups = {}
+                    for vt in all_valid_times:
+                        active = tuple(m for m in REAL_MODELS if per_model_forecasts[m].get(vt) is not None)
+                        if not active:
+                            continue
+                        groups.setdefault(active, []).append(vt)
 
                     points_this_var = 0
-                    for vt in all_valid_times:
-                        model_values = [per_model_forecasts[m].get(vt) for m in REAL_MODELS]
+                    for active_models, vts in groups.items():
+                        # WALK-FORWARD training rows: every historical
+                        # valid_time STRICTLY BEFORE this init_time
+                        # (training_entries, already sliced above) where
+                        # every model in active_models had real data
+                        # (regardless of what OTHER models did at that
+                        # historical moment -- mirrors ingest_nda.py's
+                        # live fetch_bucket_training_rows).
                         if variable == "wind_dir_deg":
-                            pred = predict_direction(beta_sin, beta_cos, model_values)
+                            train_rows = []
+                            for entry in training_entries:
+                                if not all(m in entry["models"] for m in active_models):
+                                    continue
+                                leads = [entry["models"][m][1] for m in active_models]
+                                degs = [entry["models"][m][0] for m in active_models]
+                                train_rows.append([sum(leads) / len(leads)] + degs + [entry["obs"]])
+                            beta_sin, beta_cos = fit_direction(train_rows)
+                            fitted = (beta_sin, beta_cos)
+                            is_missing = beta_sin is None
                         else:
-                            pred = predict_ensemble(beta, model_values, variable)
-                        if pred is None:
+                            train_rows = []
+                            for entry in training_entries:
+                                if not all(m in entry["models"] for m in active_models):
+                                    continue
+                                leads = [entry["models"][m][1] for m in active_models]
+                                vals = [entry["models"][m][0] for m in active_models]
+                                train_rows.append([sum(leads) / len(leads)] + vals + [entry["obs"]])
+                            fitted = fit_linear(train_rows, len(active_models))
+                            is_missing = fitted is None
+
+                        if is_missing:
                             continue
-                        pending_run_values.append((run_id, vt, variable, pred))
-                        points_this_var += 1
+
+                        if run_id is None:
+                            # FIXED 2026-10-24 (found via direct testing
+                            # on courageous_sailing): the previous
+                            # ON CONFLICT ... DO UPDATE ... RETURNING
+                            # run_id pattern raised a ConstraintException
+                            # ("still referenced by a foreign key in a
+                            # different table") whenever the conflicting
+                            # row ALREADY had forecast_values children --
+                            # a real DuckDB 1.5.5 limitation around
+                            # UPSERT-into-a-row-with-FK-referencing-
+                            # children, not a logic bug in this script.
+                            # Query-then-branch instead: look up an
+                            # existing run first, and only fall back to
+                            # a plain INSERT if none exists -- avoids
+                            # the UPSERT path (and its RETURNING clause)
+                            # entirely for the conflict case.
+                            existing_run = con.execute(
+                                "SELECT run_id FROM forecast_runs WHERE model = ? AND location_id = ? AND init_time_utc = ?",
+                                [NDA_MODEL_NAME, location_id, init_time_utc],
+                            ).fetchone()
+                            if existing_run:
+                                run_id = existing_run[0]
+                                con.execute(
+                                    "UPDATE forecast_runs SET retrieved_at = ? WHERE run_id = ?",
+                                    [init_time_utc, run_id],
+                                )
+                            else:
+                                run_id = con.execute(
+                                    """
+                                    INSERT INTO forecast_runs (model, location_id, init_time_utc, retrieved_at)
+                                    VALUES (?, ?, ?, ?)
+                                    RETURNING run_id
+                                    """,
+                                    [NDA_MODEL_NAME, location_id, init_time_utc, init_time_utc],
+                                ).fetchone()[0]
+                                total_runs_written += 1
+
+                        for vt in vts:
+                            lead_hours = (vt - init_time_utc).total_seconds() / 3600.0
+                            model_values = [per_model_forecasts[m][vt] for m in active_models]
+                            if variable == "wind_dir_deg":
+                                pred = predict_direction(fitted[0], fitted[1], lead_hours, model_values)
+                            else:
+                                clamp = WIND_SANITY_RANGE_KT if variable in WIND_SPEED_VARS else None
+                                pred = predict_linear(fitted, lead_hours, model_values, clamp_range=clamp)
+                            if pred is None:
+                                continue
+                            pending_run_values.append((run_id, vt, variable, pred))
+                            points_this_var += 1
                     total_points_written += points_this_var
 
-                # Flush this init_time's inserts in one batched executemany
-                # instead of one INSERT per point -- the real bottleneck
-                # once the DB-query count above was fixed.
                 if pending_run_values:
                     con.executemany(
                         """
@@ -370,4 +411,8 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # Optional CLI override for a quick single/few-location smoke test
+    # before committing to a full run: `python3 backfill_nda.py
+    # courageous_sailing`.
+    override = sys.argv[1:] or None
+    sys.exit(main(locations=override))
