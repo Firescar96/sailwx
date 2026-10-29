@@ -132,11 +132,36 @@ predicted_cos).
 
 MINIMUM DATA BAR: MIN_TRAINING_ROWS=20 (mirrors
 website/wind_regression_model.py's threshold), applied PER
-ACTIVE-MODEL-SET -- a lead-time range/model-combination with too few
-historical examples is skipped entirely (no prediction written for
-those hours) rather than falling back to a less-specific fit, which
-would reintroduce exactly the kind of implicit substitution point (5)
-was meant to eliminate.
+(ACTIVE-MODEL-SET, LEAD-TIME-BUCKET) -- a model-combination/lead-range
+with too few historical examples is skipped entirely (no prediction
+written for those hours) rather than falling back to a less-specific
+fit, which would reintroduce exactly the kind of implicit substitution
+point (5) was meant to eliminate.
+
+LEAD-TIME BUCKETS -- ADDED 2026-10-27 (user: "NDA model should extend
+out as far as other models go, but over time eg. 10 days out if there
+is only one model to do the regression with only use that model...
+there should be a lead time parameter of sorts in NDA so that it can
+use different weights when predicting today from 10 days from now").
+lead_hours was already a continuous regression FEATURE (2026-10-22),
+but a real bug meant NDA could never actually reach GFS/ECMWF's full
+~384h range: fetch_bucket_training_rows's "freshest run wins" dedup
+kept only each (model, valid_time)'s SHORTEST ever-seen lead_hours,
+which structurally starves long-lead training examples (confirmed:
+GFS alone has 45,000+ real rows with lead_hours in 264-500h sitting in
+this database, essentially none of which survived that dedup). Fixed
+by fitting a genuinely SEPARATE regression per (active-model-set,
+LEAD_BUCKETS range) rather than per active-model-set alone -- each
+bucket's fit is trained ONLY on real examples whose lead_hours
+genuinely falls in that bucket, so e.g. the 168h+ bucket for a 1-model
+(GFS-only) active set is trained on real 168h+ GFS-vs-observed
+examples, not short-lead data mislabeled with a long lead_hours value.
+This simultaneously implements "extend as far as other models go" (an
+hour only gets a prediction if SOME real model + enough matching
+training data exists for its exact active-set+bucket, same as always,
+but the training data itself is no longer artificially capped) and
+"only use that one model at 10 days out" (point 5's no-averaging
+principle, now correctly paired with genuine long-lead training data).
 
 CADENCE: run on the SAME cron cadence as the main Forecast Ingester
 (see sw_ingest_nda.sh), right after it.
@@ -170,20 +195,79 @@ def ground_truth_location(location_id, variable):
     return GROUND_TRUTH_OVERRIDE.get((location_id, variable), location_id)
 
 
-def fetch_bucket_training_rows(con, location_id, variable, gt_location, active_models):
+# Lead-time buckets NDA fits a SEPARATE regression per (active-model-
+# set, bucket) combination within -- ADDED 2026-10-27 (user: "NDA model
+# should extend out as far as other models go, but over time eg. 10
+# days out if there is only one model to do the regression with only
+# use that model... there should be a lead time parameter of sorts in
+# NDA so that it can use different weights when predicting today from
+# 10 days from now").
+#
+# ROOT CAUSE this fixes: lead_hours was already a continuous regression
+# FEATURE (added 2026-10-22), but fetch_bucket_training_rows's old
+# "freshest run wins" dedup (row_number() partitioned by model+
+# valid_time, keeping only rn=1, i.e. the SHORTEST lead_hours any run
+# ever forecast that hour at) meant a GFS-only fit's training set was
+# starved down to ~29h max lead -- even though GFS alone has 45,000+
+# real (model, valid_time) rows with lead_hours in the 264-500h range
+# in this database (confirmed via direct query). The dedup was
+# discarding nearly all of that real long-lead data in favor of a
+# LATER run's short-lead re-forecast of the exact same hour, which is
+# correct behavior for "what's our best current estimate of this
+# specific hour" but wrong for "how does the GFS-alone relationship
+# behave at long lead times" -- it needs its OWN lead-matched examples,
+# not short-lead ones mislabeled with a long lead_hours value.
+#
+# FIX: bucket both training AND prediction by lead_hours range, and
+# scope the "freshest within this range" dedup to each bucket
+# separately -- so the 168h+ bucket's fit is trained on real, genuine
+# 168h+ examples (of which there are tens of thousands for GFS/ECMWF),
+# not whatever happened to survive a global freshest-run filter.
+# FIX 2026-10-27 (found via direct testing after first implementing
+# LEAD_BUCKETS): an open-ended final bucket (168, None) still clustered
+# its training data near 168h, because the "freshest run wins" dedup
+# (shortest lead_hours survives) picks rows closest to the bucket's OWN
+# lower edge first -- confirmed live: the (gfs,)/(168, None) fit's
+# training data range was only 168-179h even though GFS has real rows
+# out to ~500h, so predictions at 250h+ were wild extrapolations from a
+# fit that had never actually seen anything past 179h. Fixed by closing
+# off every bucket (no open-ended tail) so each one's dedup pulls from
+# a representative, bounded spread of real training examples
+# throughout its own range, matching GFS/ECMWF's real ~384h ceiling.
+LEAD_BUCKETS = [(0, 24), (24, 48), (48, 96), (96, 168), (168, 264), (264, 400)]
+
+
+def lead_bucket_for(lead_hours):
+    """Which LEAD_BUCKETS entry a given lead_hours falls into."""
+    for lo, hi in LEAD_BUCKETS:
+        if lead_hours >= lo and (hi is None or lead_hours < hi):
+            return (lo, hi)
+    return LEAD_BUCKETS[-1]
+
+
+def fetch_bucket_training_rows(con, location_id, variable, gt_location, active_models, lead_bucket):
     """Training data for a SPECIFIC set of active models (point 5: a
     regression is only ever fit/applied using models that genuinely
     have data for the hours in question -- never a fabricated
-    substitute for a missing one).
+    substitute for a missing one) AND a SPECIFIC lead-time bucket (see
+    LEAD_BUCKETS module comment for why this is essential, not optional
+    -- without it, long-lead fits are starved of real long-lead data).
 
     Returns a list of (lead_hours, [value for m in active_models],
     observed_value) tuples. A historical valid_time is included as
-    long as EVERY model in active_models has a real value there --
-    other real models not in active_models are ignored entirely for
-    this fit (their presence/absence doesn't matter), which is exactly
-    why this naturally reuses near-term rows (where all 6 models are
-    present) as training data for every active-set, not just the
-    smaller active-sets that only ever occur at long lead times.
+    long as EVERY model in active_models has a real value there, AT A
+    LEAD TIME WITHIN lead_bucket -- other real models not in
+    active_models are ignored entirely for this fit (their presence/
+    absence doesn't matter), which is exactly why this naturally reuses
+    near-term rows (where all 6 models are present) as training data
+    for every active-set, not just the smaller active-sets that only
+    ever occur at long lead times.
+
+    Within the bucket, "freshest run" dedup still applies (keeps the
+    shortest-lead example WITHIN this bucket, not globally) -- this
+    keeps each training row representative of "a real forecast made at
+    roughly this distance out" rather than letting multiple re-issued
+    runs for the same hour all count as separate rows.
 
     lead_hours is computed PER ROW as the average, across the active
     models, of (valid_time - that model's own init_time) -- i.e. "how
@@ -191,6 +275,7 @@ def fetch_bucket_training_rows(con, location_id, variable, gt_location, active_m
     is computed for a live prediction (see predict-time call sites
     below, which use "now" as the reference init_time since NDA's own
     run represents the current moment)."""
+    lo, hi = lead_bucket
     model_list_sql = ", ".join("?" for _ in active_models)
     value_cols = ", ".join(
         f"max(CASE WHEN model = ? THEN value END) AS m{i}" for i in range(len(active_models))
@@ -201,6 +286,11 @@ def fetch_bucket_training_rows(con, location_id, variable, gt_location, active_m
     not_null_clause = " AND ".join(f"p.m{i} IS NOT NULL" for i in range(len(active_models)))
     avg_lead_expr = "(" + " + ".join(f"p.l{i}" for i in range(len(active_models))) + f") / {len(active_models)}.0"
     value_select = ", ".join(f"p.m{i}" for i in range(len(active_models)))
+    lead_filter = "epoch(fv.valid_time_utc - fr.init_time_utc) / 3600.0 >= ?"
+    lead_params = [lo]
+    if hi is not None:
+        lead_filter += " AND epoch(fv.valid_time_utc - fr.init_time_utc) / 3600.0 < ?"
+        lead_params.append(hi)
 
     query = f"""
         WITH per_model AS (
@@ -215,6 +305,7 @@ def fetch_bucket_training_rows(con, location_id, variable, gt_location, active_m
             WHERE fr.location_id = ? AND fv.variable = ?
               AND fr.model IN ({model_list_sql})
               AND fv.valid_time_utc >= fr.init_time_utc
+              AND {lead_filter}
         ),
         pivoted AS (
             SELECT valid_time_utc, {value_cols}, {lead_cols}
@@ -233,6 +324,7 @@ def fetch_bucket_training_rows(con, location_id, variable, gt_location, active_m
     params = (
         [location_id, variable]
         + list(active_models)
+        + lead_params
         + list(active_models)
         + list(active_models)
         + [gt_location, variable]
@@ -295,14 +387,16 @@ def fit_linear(rows, n_active_models):
     return beta, max_train_lead
 
 
-# Physically-sane output range for wind variables -- kept as a LAST-
-# LINE-OF-DEFENSE only (narrowed 2026-10-24 now that the real fix is
-# predict_linear()'s lead_hours-range check below; this should rarely
-# if ever fire now, unlike before when it was silently absorbing
-# routine extrapolation failures). Real gusts at this project's
-# locations have been observed up to the high 30s kt (see the
-# NE-direction gust analysis elsewhere in this project).
-WIND_SANITY_RANGE_KT = (0.0, 60.0)
+# Floor-only sanity guard for wind variables -- REMOVED the upper
+# bound 2026-10-24 (user: "remove your wind clamps at the top end").
+# The real defense against nonsense high values is predict_linear()'s
+# lead_hours-extrapolation-range check below (MAX_EXTRAPOLATION_FACTOR),
+# not an arbitrary output ceiling -- a ceiling can never distinguish a
+# genuinely high but real wind/gust value from a regression artifact,
+# it just chops off anything above the line regardless of cause. Only
+# the 0 floor remains, since negative wind speed/gust is never
+# physically meaningful under any circumstance.
+WIND_SANITY_RANGE_KT = (0.0, None)
 
 # How far beyond a fit's own training lead_hours range it's allowed to
 # extrapolate before predict_linear() refuses outright (returns None)
@@ -339,16 +433,19 @@ def predict_linear(beta_and_range, lead_hours, model_values, clamp_range=None):
     row = np.array([1.0, lead_hours] + list(model_values))
     pred = float(row @ beta)
     if clamp_range is not None:
-        pred = max(clamp_range[0], min(clamp_range[1], pred))
+        lo, hi = clamp_range
+        pred = max(lo, pred)
+        if hi is not None:
+            pred = min(hi, pred)
     return pred
 
 
-def fetch_bucket_direction_rows(con, location_id, gt_location, active_models):
+def fetch_bucket_direction_rows(con, location_id, gt_location, active_models, lead_bucket):
     """Same shape as fetch_bucket_training_rows but for wind_dir_deg --
     returns raw (not yet sin/cos-transformed) rows so the caller can
     build the sin and cos training sets separately. See module
     docstring's "DIRECTION IS CIRCULAR" section."""
-    return fetch_bucket_training_rows(con, location_id, "wind_dir_deg", gt_location, active_models)
+    return fetch_bucket_training_rows(con, location_id, "wind_dir_deg", gt_location, active_models, lead_bucket)
 
 
 def fit_direction(rows):
@@ -454,33 +551,39 @@ def main():
                     continue
 
                 # Group valid_times by their EXACT active-model-set
-                # (point 5) -- a given hour's active set is whichever
-                # real models genuinely have a value there, nothing
-                # more. Most hours within a model's real coverage share
-                # the same active set (all 6), so this naturally
-                # collapses to very few distinct fits per location/
-                # variable (one per "how many/which models have
-                # dropped out by this point"), not one fit per hour.
+                # (point 5) AND lead-time bucket (see LEAD_BUCKETS
+                # module comment -- "different weights when predicting
+                # today from 10 days from now") -- a given hour's
+                # active set is whichever real models genuinely have a
+                # value there, nothing more; its bucket is which
+                # LEAD_BUCKETS range its own lead_hours (relative to
+                # THIS run's "now") falls into. Most hours within a
+                # model's real coverage share the same (active-set,
+                # bucket) pair, so this naturally collapses to a
+                # manageable number of distinct fits per location/
+                # variable, not one fit per hour.
                 groups = {}
                 for vt in all_valid_times:
                     active = tuple(m for m in REAL_MODELS if per_model_forecasts[m].get(vt) is not None)
                     if not active:
                         continue
-                    groups.setdefault(active, []).append(vt)
+                    lead_hours_for_vt = (vt - now.replace(tzinfo=None)).total_seconds() / 3600.0
+                    bucket = lead_bucket_for(lead_hours_for_vt)
+                    groups.setdefault((active, bucket), []).append(vt)
 
                 rows_written = 0
                 skipped_insufficient_data = 0
-                fit_cache = {}  # active_models tuple -> beta (or (beta_sin, beta_cos) for direction)
-                for active_models, vts in groups.items():
-                    if active_models not in fit_cache:
+                fit_cache = {}  # (active_models, bucket) tuple -> beta (or (beta_sin, beta_cos) for direction)
+                for (active_models, bucket), vts in groups.items():
+                    if (active_models, bucket) not in fit_cache:
                         if variable == "wind_dir_deg":
-                            train_rows = fetch_bucket_direction_rows(con, location_id, gt_loc, active_models)
-                            fit_cache[active_models] = fit_direction(train_rows)
+                            train_rows = fetch_bucket_direction_rows(con, location_id, gt_loc, active_models, bucket)
+                            fit_cache[(active_models, bucket)] = fit_direction(train_rows)
                         else:
-                            train_rows = fetch_bucket_training_rows(con, location_id, variable, gt_loc, active_models)
-                            fit_cache[active_models] = fit_linear(train_rows, len(active_models))
+                            train_rows = fetch_bucket_training_rows(con, location_id, variable, gt_loc, active_models, bucket)
+                            fit_cache[(active_models, bucket)] = fit_linear(train_rows, len(active_models))
 
-                    fitted = fit_cache[active_models]
+                    fitted = fit_cache[(active_models, bucket)]
                     is_missing = (fitted is None) if variable != "wind_dir_deg" else (fitted[0] is None)
                     if is_missing:
                         skipped_insufficient_data += len(vts)

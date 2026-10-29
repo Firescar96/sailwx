@@ -16,13 +16,24 @@ data whose valid_time_utc is STRICTLY BEFORE that init_time. Refitting
 once on ALL available history and applying it retroactively would give
 NDA artificially inflated historical "accuracy" via look-ahead bias.
 
-PER-ACTIVE-MODEL-SET, PER-INIT-TIME -- mirrors ingest_nda.py's "point
-5" design exactly: at a given historical init_time, whichever of the 6
-real models actually had data for a given valid_time_utc determines
-that hour's active set; a SEPARATE regression (with lead_hours as a
-feature -- "point 4") is fit per active set, trained only on rows
-STRICTLY BEFORE this init_time where that same active set held. No
-missing model is ever backfilled with a substitute/average value.
+PER-ACTIVE-MODEL-SET, PER-LEAD-BUCKET, PER-INIT-TIME -- mirrors
+ingest_nda.py's design exactly: at a given historical init_time,
+whichever of the 6 real models actually had data for a given
+valid_time_utc determines that hour's active set; which LEAD_BUCKETS
+range its own lead_hours falls into determines its bucket; a SEPARATE
+regression (with lead_hours as a feature) is fit per (active set,
+bucket) pair, trained only on rows STRICTLY BEFORE this init_time where
+that same active set AND lead-time bucket both held. No missing model
+is ever backfilled with a substitute/average value. ADDED 2026-10-27
+(user: "NDA model should extend out as far as other models go, but
+over time eg. 10 days out if there is only one model to do the
+regression with only use that model... there should be a lead time
+parameter of sorts in NDA so that it can use different weights when
+predicting today from 10 days from now") -- see ingest_nda.py's module
+docstring for the full root-cause investigation (the old per-active-
+-model-set-only design's "freshest run wins" dedup starved long-lead
+training data, capping NDA's real reach to ~35h even when GFS/ECMWF
+reach ~380h).
 
 PERFORMANCE: fitting is now per (init_time, active-model-set) rather
 than per (init_time, variable) -- more total fits than the old design,
@@ -48,6 +59,8 @@ from ingest_nda import (
     MIN_TRAINING_ROWS,
     LOCATIONS,
     VARIABLES,
+    LEAD_BUCKETS,
+    lead_bucket_for,
     ground_truth_location,
 )
 
@@ -103,7 +116,7 @@ def fetch_full_direction_rows(con, location_id, gt_location):
 
 
 WIND_SPEED_VARS = {"wind_speed_kt", "wind_gust_kt"}  # mirrors ingest_nda.py's WIND_SPEED_VARS -- which variables get the WIND_SANITY_RANGE_KT output clamp
-WIND_SANITY_RANGE_KT = (0.0, 60.0)  # narrowed 2026-10-24, mirrors ingest_nda.py's WIND_SANITY_RANGE_KT -- see that module's predict_linear() docstring for the full rationale
+WIND_SANITY_RANGE_KT = (0.0, None)  # upper bound removed 2026-10-24 (user: "remove your wind clamps at the top end"); mirrors ingest_nda.py's WIND_SANITY_RANGE_KT -- see that module's predict_linear() docstring for the full rationale
 
 
 def fit_linear(rows, n_active_models):
@@ -148,7 +161,10 @@ def predict_linear(beta_and_range, lead_hours, model_values, clamp_range=None):
     row = np.array([1.0, lead_hours] + list(model_values))
     pred = float(row @ beta)
     if clamp_range is not None:
-        pred = max(clamp_range[0], min(clamp_range[1], pred))
+        lo, hi = clamp_range
+        pred = max(lo, pred)
+        if hi is not None:
+            pred = min(hi, pred)
     return pred
 
 
@@ -294,32 +310,47 @@ def main(locations=None):
                         continue
 
                     # Group this init_time's valid_times by their exact
-                    # active-model-set (point 5) -- same logic as
-                    # ingest_nda.py's live main().
+                    # active-model-set (point 5) AND lead-time bucket
+                    # (see ingest_nda.py's LEAD_BUCKETS module comment
+                    # -- "different weights when predicting today from
+                    # 10 days from now") -- same logic as ingest_nda.py's
+                    # live main(), just using init_time_utc as the
+                    # reference point instead of "now" (this IS "now"
+                    # for a historical walk-forward backfill run).
                     groups = {}
                     for vt in all_valid_times:
                         active = tuple(m for m in REAL_MODELS if per_model_forecasts[m].get(vt) is not None)
                         if not active:
                             continue
-                        groups.setdefault(active, []).append(vt)
+                        lead_hours_for_vt = (vt - init_time_utc).total_seconds() / 3600.0
+                        bucket = lead_bucket_for(lead_hours_for_vt)
+                        groups.setdefault((active, bucket), []).append(vt)
 
                     points_this_var = 0
-                    for active_models, vts in groups.items():
+                    for (active_models, bucket), vts in groups.items():
                         # WALK-FORWARD training rows: every historical
                         # valid_time STRICTLY BEFORE this init_time
                         # (training_entries, already sliced above) where
-                        # every model in active_models had real data
-                        # (regardless of what OTHER models did at that
-                        # historical moment -- mirrors ingest_nda.py's
-                        # live fetch_bucket_training_rows).
+                        # every model in active_models had real data,
+                        # AND whose own lead_hours falls in this SAME
+                        # bucket (mirrors ingest_nda.py's live
+                        # fetch_bucket_training_rows's lead_filter --
+                        # without this, a bucket's fit would be trained
+                        # on whatever lead_hours its "strictly before"
+                        # training rows happened to have, not genuinely
+                        # lead-matched examples).
+                        lo, hi = bucket
                         if variable == "wind_dir_deg":
                             train_rows = []
                             for entry in training_entries:
                                 if not all(m in entry["models"] for m in active_models):
                                     continue
                                 leads = [entry["models"][m][1] for m in active_models]
+                                avg_lead = sum(leads) / len(leads)
+                                if avg_lead < lo or (hi is not None and avg_lead >= hi):
+                                    continue
                                 degs = [entry["models"][m][0] for m in active_models]
-                                train_rows.append([sum(leads) / len(leads)] + degs + [entry["obs"]])
+                                train_rows.append([avg_lead] + degs + [entry["obs"]])
                             beta_sin, beta_cos = fit_direction(train_rows)
                             fitted = (beta_sin, beta_cos)
                             is_missing = beta_sin is None
@@ -329,8 +360,11 @@ def main(locations=None):
                                 if not all(m in entry["models"] for m in active_models):
                                     continue
                                 leads = [entry["models"][m][1] for m in active_models]
+                                avg_lead = sum(leads) / len(leads)
+                                if avg_lead < lo or (hi is not None and avg_lead >= hi):
+                                    continue
                                 vals = [entry["models"][m][0] for m in active_models]
-                                train_rows.append([sum(leads) / len(leads)] + vals + [entry["obs"]])
+                                train_rows.append([avg_lead] + vals + [entry["obs"]])
                             fitted = fit_linear(train_rows, len(active_models))
                             is_missing = fitted is None
 
