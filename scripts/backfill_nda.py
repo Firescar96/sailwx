@@ -231,7 +231,7 @@ def prefetch_all_runs(con, location_id):
     return out
 
 
-def main(locations=None):
+def main(locations=None, last_n=None):
     con = get_connection()
     total_runs_written = 0
     total_points_written = 0
@@ -248,6 +248,17 @@ def main(locations=None):
                     [location_id],
                 ).fetchall()
             ]
+            if last_n is not None:
+                # ADDED 2026-10-29 (user: "can you retroactively go back
+                # in time and calculate the last 5 runs with available
+                # data at that time for nda") -- recompute only the N
+                # most recent real init_times rather than the whole
+                # location's history, so a targeted retroactive ask like
+                # this doesn't require re-running hundreds of unrelated
+                # older init_times. Walk-forward correctness (each
+                # recomputed run only sees data strictly before its own
+                # init_time) is unaffected -- same fit logic either way.
+                all_init_times = all_init_times[-last_n:]
             if not all_init_times:
                 continue
             print(f"=== {location_id}: {len(all_init_times)} historical init times to backfill ===")
@@ -445,8 +456,17 @@ def main(locations=None):
 
 
 if __name__ == "__main__":
-    # Optional CLI override for a quick single/few-location smoke test
-    # before committing to a full run: `python3 backfill_nda.py
-    # courageous_sailing`.
-    override = sys.argv[1:] or None
-    sys.exit(main(locations=override))
+    # Optional CLI overrides:
+    #   `python3 backfill_nda.py courageous_sailing` -- single/few-
+    #     location smoke test before committing to a full run.
+    #   `python3 backfill_nda.py --last-n 5` -- only recompute the N
+    #     most recent real init_times (all locations, or combine with
+    #     location args: `backfill_nda.py cbi_dockhouse --last-n 5`).
+    args = sys.argv[1:]
+    last_n = None
+    if "--last-n" in args:
+        idx = args.index("--last-n")
+        last_n = int(args[idx + 1])
+        args = args[:idx] + args[idx + 2:]
+    override = args or None
+    sys.exit(main(locations=override, last_n=last_n))
